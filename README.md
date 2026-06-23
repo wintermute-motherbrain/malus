@@ -1,7 +1,7 @@
 # malus
 
 <p align="center">
-  <img src="assets/malus_mascot.jpg" alt="malus mascot" width="300"/>
+  <img src="assets/malus_mascot.png" alt="malus mascot" width="300"/>
 </p>
 
 A lightweight, high-performance domain-specific language for machine learning workloads on Apple Silicon (M-series) hardware. `malus` uses Python-like syntax with a dual-pipeline compilation model that cleanly separates CPU host orchestration from GPU device execution.

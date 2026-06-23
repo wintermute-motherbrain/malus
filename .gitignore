@@ -3,4 +3,5 @@
 *.swp
 *.swo
 .agents/
+.claude/
 skills-lock.json
