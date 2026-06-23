@@ -1,0 +1,15 @@
+[package]
+name = "malus-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "malus"
+path = "src/main.rs"
+
+[dependencies]
+malus-syntax = { path = "../malus-syntax" }
+malus-sema = { path = "../malus-sema" }
+malus-codegen-cpu = { path = "../malus-codegen-cpu" }
+malus-codegen-gpu = { path = "../malus-codegen-gpu" }
+malus-runtime = { path = "../malus-runtime" }

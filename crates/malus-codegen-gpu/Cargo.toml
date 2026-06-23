@@ -1,0 +1,7 @@
+[package]
+name = "malus-codegen-gpu"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+malus-sema = { path = "../malus-sema" }
