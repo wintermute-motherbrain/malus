@@ -1,7 +1,7 @@
 # M2 — Semantics
 
 **Crate:** `malus-sema`
-**Done when:** `malus-sema` type-checks the M1 AST for `add_tensors.malus` without errors, annotates every expression with its resolved type and placement, produces a typed IR with Lobster last-use free-point annotations, and the CLI prints the typed IR.
+**Done when:** `malus-sema` type-checks the M1 AST for `add_tensors.malus` without errors, annotates every expression with its resolved type and placement, produces a typed IR with CTMM last-use free-point annotations, and the CLI prints the typed IR.
 
 ## Design decisions
 
@@ -13,7 +13,7 @@
 | Type representation | Separate `ResolvedTy` enum in malus-sema (not the AST's `Ty`) |
 | Tensor placement in types | NOT in the type — tracked as `Option<Placement>` on bindings and `TypedExpr` |
 | Mixed placement in binary exprs | Type error |
-| Lobster scope for v0.1 | Last-use analysis only (see [lobster-v1-gaps.md](lobster-v1-gaps.md)) |
+| CTMM scope for v0.1 | Last-use analysis only (see [ctmm-v1-gaps.md](ctmm-v1-gaps.md)) |
 | Free-point representation | Explicit `TypedStmt::Drop` nodes injected at last-use points |
 | GPU barrier representation | Explicit `TypedStmt::GpuBarrier` nodes before first `Drop` of any in-flight group |
 | Kernel call distinction | Separate `TypedExprKind::KernelCall` variant (distinct from `Call`) |
@@ -45,7 +45,7 @@ Two-pass structure:
 - Tensor literals: check elements against declared dtype; int→float widening allowed, float→int rejected
 - Qualified calls (`ops.add`): resolve via module aliases
 
-### Lobster last-use analysis (`crates/malus-sema/src/lobster.rs`)
+### CTMM last-use analysis (`crates/malus-sema/src/ctmm.rs`)
 
 Runs on `TypedFn` bodies after type checking:
 
@@ -84,7 +84,7 @@ ResolvedTy:
 
 See `crates/malus-sema/src/tests.rs`. All 12 tests pass:
 
-- MVP round-trip: `add_tensors.malus` type-checks, `c` resolves to `Tensor<f32>`, Lobster inserts correct Drop/GpuBarrier nodes
+- MVP round-trip: `add_tensors.malus` type-checks, `c` resolves to `Tensor<f32>`, CTMM inserts correct Drop/GpuBarrier nodes
 - Escaped tensor gets no Drop
 - Int literal in `Tensor<f32>` → coerced (ok)
 - Float literal in `Tensor<i32>` → LossyCoercion error
@@ -100,7 +100,7 @@ See `crates/malus-sema/src/tests.rs`. All 12 tests pass:
 ## Out of scope for M2
 
 - Struct/enum type checking (M7a)
-- RC fallback for structurally ambiguous lifetimes (M7c — see [lobster-v1-gaps.md](lobster-v1-gaps.md))
+- RC fallback for structurally ambiguous lifetimes (M7c — see [ctmm-v1-gaps.md](ctmm-v1-gaps.md))
 - Borrow checking for `inout` parameters (M7f)
 - `@` matmul dtype compatibility
 - Branching/liveness analysis for if/else

@@ -10,7 +10,7 @@ A lightweight, high-performance domain-specific language for machine learning wo
 
 - **`fn` / `kernel` split** — `fn` defines a CPU host function; `kernel` defines a GPU device kernel
 - **Dual backends** — CPU code is JIT-compiled via [Cranelift](https://cranelift.dev/); GPU code is compiled to Metal Shading Language (MSL) and JIT-compiled by the Apple Metal driver
-- **Lobster memory model** — automatic compile-time memory management via escape analysis; reference counting fallback only when lifetimes are structurally ambiguous
+- **CTMM memory model** — automatic compile-time memory management via escape analysis; reference counting fallback only when lifetimes are structurally ambiguous
 - **Unified memory aware** — explicit placement semantics (`Tensor.cpu(...)` / `Tensor.gpu(...)`) with zero-copy transfers on Apple Silicon
 
 ## Example
@@ -32,7 +32,7 @@ The v0.1 MVP proves the core dual-pipeline model end-to-end:
 
 - [ ] Lexer, parser, AST
 - [ ] Type checker (`Tensor<dtype>`, scalars, `bool`, tuples)
-- [ ] Lobster escape analysis (linear flows)
+- [ ] CTMM escape analysis (linear flows)
 - [ ] Cranelift JIT for `fn` bodies
 - [ ] MSL codegen for `kernel` bodies (element-wise ops)
 - [ ] Metal runtime (shared buffers, sync barriers, kernel dispatch)
@@ -44,7 +44,7 @@ The v0.1 MVP proves the core dual-pipeline model end-to-end:
 ```
 crates/
   malus-syntax/       # lexer, parser, AST
-  malus-sema/         # type checking, escape analysis, Lobster
+  malus-sema/         # type checking, escape analysis, CTMM
   malus-codegen-cpu/  # Cranelift JIT for fn bodies
   malus-codegen-gpu/  # MSL generation for kernel bodies
   malus-runtime/      # Metal API bindings, tensor ops, memory management

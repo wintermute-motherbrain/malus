@@ -47,4 +47,4 @@ The JIT pipeline is designed with a future C ABI in mind: `fn` and `kernel` func
 
 malus has no `String` type. String *literals* are valid in source code but only as arguments to specific stdlib functions (`print`, `load`, `save`). They are not first-class values and cannot be assigned to `let` bindings or passed to user-defined functions.
 
-This is intentional: malus is an ML DSL, not a general-purpose language. Adding a heap-allocated string type would require integrating it with Lobster's escape analysis and RC for minimal practical benefit.
+This is intentional: malus is an ML DSL, not a general-purpose language. Adding a heap-allocated string type would require integrating it with CTMM's escape analysis and RC for minimal practical benefit.

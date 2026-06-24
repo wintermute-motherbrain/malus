@@ -25,7 +25,7 @@ struct LinearConfig:
 - Constructed with keyword arguments: `LinearConfig(in_features=128, out_features=64, bias=true)`
 - Field access: `cfg.in_features`
 - Fields are immutable after construction
-- Structs containing `Tensor` fields trigger Lobster RC (by design — model parameter storage)
+- Structs containing `Tensor` fields trigger CTMM RC (by design — model parameter storage)
 
 ### Enums
 
@@ -71,7 +71,7 @@ Implement the numpy-equivalent core defined in [spec 06](../spec/06-stdlib.md).
 
 ---
 
-## M7c — Lobster RC fallback
+## M7c — CTMM RC fallback
 
 **Crate:** `malus-sema`, `malus-runtime`
 
@@ -172,7 +172,7 @@ kernel relu(inout a: Tensor<f32>):
 ```
 
 - `inout` tensors are mutated in-place; no output buffer is allocated
-- Lobster does not insert a free for the `inout` input
+- CTMM does not insert a free for the `inout` input
 
 ---
 

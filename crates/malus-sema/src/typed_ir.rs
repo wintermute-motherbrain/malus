@@ -50,9 +50,9 @@ pub enum TypedStmt {
     Let { name: String, expr: TypedExpr },
     Return { expr: TypedExpr },
     Expr(TypedExpr),
-    /// Lobster: free this binding's tensor allocation.
+    /// CTMM: free this binding's tensor allocation.
     Drop { name: String },
-    /// Lobster: CPU barrier — wait for in-flight GPU work before freeing.
+    /// CTMM: CPU barrier — wait for in-flight GPU work before freeing.
     GpuBarrier,
 }
 

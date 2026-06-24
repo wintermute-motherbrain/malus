@@ -18,7 +18,7 @@ malus is not a general-purpose language. It is not designed for web servers, GUI
 
 **Explicit over implicit for performance-critical decisions.** Tensor placement (CPU vs GPU) is explicit at creation. Device transfers, memory barriers, and thread dispatch are handled by the compiler but their effects are visible and predictable.
 
-**Compile-time memory management on the fast path.** The Lobster memory model eliminates runtime allocation overhead for the common case (linear tensor flows). Reference counting is a fallback, not the default.
+**Compile-time memory management on the fast path.** CTMM (Compile-Time Memory Management) eliminates runtime allocation overhead for the common case (linear tensor flows). Reference counting is a fallback, not the default.
 
 **The `fn`/`kernel` split is the architecture.** Every function in malus is either a CPU host function (`fn`) or a GPU device kernel (`kernel`). This distinction drives the entire compilation model.
 

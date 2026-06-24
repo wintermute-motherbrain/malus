@@ -1,8 +1,10 @@
-# Lobster Memory Model — v0.1 vs v1 Gaps
+# CTMM — v0.1 vs v1 Gaps
+
+CTMM (Compile-Time Memory Management) is malus's automatic memory model: escape analysis inserts static `free` calls for tensor bindings at compile time, with reference counting as a fallback for structurally ambiguous lifetimes.
 
 ## What v0.1 implements
 
-`malus-sema` implements **last-use analysis** — the simplest correct subset of the Lobster model:
+`malus-sema` implements **last-use analysis** — the simplest correct subset of CTMM:
 
 1. Walk each `fn` body's statements, tracking where each local tensor binding (`let`) is last used.
 2. If a binding does not escape the function (not returned), inject a `Drop` node immediately after its last-use statement.
@@ -14,7 +16,7 @@ This covers the MVP's `add_tensors.malus` perfectly: all tensor flows are linear
 
 ### 1. RC fallback for structurally ambiguous lifetimes
 
-**Gap:** When a tensor is stored in a struct field, a dynamic array, or any heap-allocated container, its lifetime cannot be determined statically. Lobster's full model falls back to reference counting in these cases.
+**Gap:** When a tensor is stored in a struct field, a dynamic array, or any heap-allocated container, its lifetime cannot be determined statically. CTMM's full model falls back to reference counting in these cases.
 
 **Current behavior:** Struct types are not supported in v0.1, so this case cannot arise. When structs are added in v1, tensors stored in struct fields will need RC insertion.
 
@@ -37,7 +39,7 @@ This covers the MVP's `add_tensors.malus` perfectly: all tensor flows are linear
 
 ### 4. `inout` parameter tracking
 
-**Gap:** `inout` kernel parameters (v1 feature) mutate tensors in-place. Lobster should not insert a `Drop` for the input buffer in this case — it is the same buffer as the output. v0.1 does not handle `inout` because it is not in the MVP language.
+**Gap:** `inout` kernel parameters (v1 feature) mutate tensors in-place. CTMM should not insert a `Drop` for the input buffer in this case — it is the same buffer as the output. v0.1 does not handle `inout` because it is not in the MVP language.
 
 **What's needed for v1:** When a tensor is passed as `inout` to a kernel, mark it as "reused" — suppress `Drop` for that binding.
 

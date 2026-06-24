@@ -20,9 +20,9 @@ _Avoid_: Split compilation, two-stage compilation
 
 ### Memory
 
-**Lobster**:
-malus's automatic compile-time memory management system. Uses escape analysis to insert static `free` calls for tensors. Falls back to reference counting only when lifetimes are structurally ambiguous (heap-stored or closure-captured tensors).
-_Avoid_: GC, garbage collector, allocator
+**CTMM** (Compile-Time Memory Management):
+malus's automatic compile-time memory management system. Uses escape analysis to insert static `free` calls for tensors. Falls back to reference counting only when lifetimes are structurally ambiguous (heap-stored or closure-captured tensors). Inspired by the Lobster language's ownership model.
+_Avoid_: GC, garbage collector, allocator, Lobster
 
 **Escape analysis**:
 The compiler pass that determines whether a tensor's lifetime can be fully resolved at compile time by tracking where it is created, used, and last referenced.

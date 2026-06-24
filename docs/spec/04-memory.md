@@ -1,8 +1,8 @@
-# 04 — Memory Model (Lobster)
+# 04 — Memory Model (CTMM)
 
 ## Overview
 
-malus uses **Lobster** — Automatic Compile-Time Memory Management (CTMM) — as its memory model. Lobster uses escape analysis to insert static `free` calls for tensors at compile time. It falls back to reference counting (RC) only when a tensor's lifetime is structurally ambiguous.
+malus uses **CTMM** (Compile-Time Memory Management) as its memory model. CTMM uses escape analysis to insert static `free` calls for tensors at compile time. It falls back to reference counting (RC) only when a tensor's lifetime is structurally ambiguous.
 
 The goal: the fast path (linear tensor flows through `fn` and `kernel` calls) is allocation-free at runtime. RC is a correctness fallback for cold-path patterns like model parameter storage.
 
@@ -30,7 +30,7 @@ fn compute(x: Tensor<f32>) -> Tensor<f32>:
 
 ## RC fallback
 
-When a tensor's lifetime cannot be resolved statically, Lobster falls back to reference counting. The RC boundary is triggered when a tensor is:
+When a tensor's lifetime cannot be resolved statically, CTMM falls back to reference counting. The RC boundary is triggered when a tensor is:
 
 1. **Stored in a heap-allocated container** — a struct field, or an element of a dynamic array
 2. **Captured by a closure** — when closures are added in a future version
@@ -43,14 +43,14 @@ struct Model:
     bias: Tensor<f32>      # same
 ```
 
-The programmer does not choose between static and RC — Lobster selects automatically based on the structural analysis.
+The programmer does not choose between static and RC — CTMM selects automatically based on the structural analysis.
 
 ## GPU boundary
 
 Kernels execute asynchronously. A tensor passed to a `kernel` call is **in-flight** until the GPU completes execution. The compiler handles this as follows:
 
 1. At the `kernel` call site, the tensor is marked **in-flight**
-2. Its Lobster-determined free point is preserved
+2. Its CTMM-determined free point is preserved
 3. Before the `free` call is emitted, the compiler inserts a **GPU barrier** (`gpu_barrier()`)
 4. The barrier blocks the CPU until the Metal command buffer completes
 5. Only then is `free` emitted
@@ -72,8 +72,8 @@ fn main():
 ## Kernel ownership semantics
 
 - **Inputs** are borrowed immutably by default — the caller retains ownership, and the compiler knows the tensor is still alive after the kernel returns
-- **Outputs** are new owned tensors — the caller receives ownership and Lobster tracks the new tensor from that point
-- **`inout` parameters** `[v1]` — the tensor is mutated in-place; the same buffer is reused. Lobster knows no new allocation occurs and no free is needed for the input buffer
+- **Outputs** are new owned tensors — the caller receives ownership and CTMM tracks the new tensor from that point
+- **`inout` parameters** `[v1]` — the tensor is mutated in-place; the same buffer is reused. CTMM knows no new allocation occurs and no free is needed for the input buffer
 
 ```malus
 kernel scale(inout a: Tensor<f32>, factor: f32) -> None:
@@ -82,7 +82,7 @@ kernel scale(inout a: Tensor<f32>, factor: f32) -> None:
 
 ## Summary of free-point rules
 
-| Situation | Lobster action |
+| Situation | CTMM action |
 |---|---|
 | Tensor not escaped, last use in `fn` body | `free` after last use |
 | Tensor passed to kernel (in-flight) | `gpu_barrier()` then `free` after last use |

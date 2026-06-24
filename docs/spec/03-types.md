@@ -77,7 +77,7 @@ let lr = cfg.lr
 
 Structs are nominal types. Two structs with identical fields are distinct types.
 
-Structs cannot contain tensors directly in v1 — a struct field of type `Tensor<f32>` triggers the Lobster RC fallback (see section 04). This is correct and expected; model weight containers will naturally use RC.
+Structs cannot contain tensors directly in v1 — a struct field of type `Tensor<f32>` triggers the CTMM RC fallback (see section 04). This is correct and expected; model weight containers will naturally use RC.
 
 ### Enum `[v1]`
 

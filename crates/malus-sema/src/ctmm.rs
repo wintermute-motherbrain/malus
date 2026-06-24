@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use crate::typed_ir::{TypedExprKind, TypedFn, TypedStmt};
 
-/// Run last-use analysis on all fn bodies, injecting Drop and GpuBarrier nodes.
+/// CTMM: run last-use analysis on all fn bodies, injecting Drop and GpuBarrier nodes.
 /// Kernel bodies are skipped — kernels borrow their inputs and return new owned tensors;
 /// there is no local allocation to free inside a kernel body in v0.1.
 pub fn annotate_fns(fns: &mut Vec<TypedFn>) {

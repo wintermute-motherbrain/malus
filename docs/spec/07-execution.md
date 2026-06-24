@@ -15,7 +15,7 @@ malus-syntax::parse()
   ▼
 malus-sema::check()
   Type checker annotates every expression with its resolved type.
-  Lobster escape analysis annotates tensor bindings with free points
+  CTMM escape analysis annotates tensor bindings with free points
   and marks in-flight tensors at kernel call sites.
   Produces: TypedProgram
   │

@@ -5,4 +5,4 @@ Errors in malus crash the program with a contextual message. Shape mismatches, d
 ## Considered Options
 
 - **Result types**: Add friction to every function call in exploratory ML code where the user is iterating rapidly. PyTorch researchers are accustomed to panics, not monadic error propagation.
-- **Exceptions**: Exception unwinding interacts poorly with Lobster's escape analysis — the compiler inserts `free` points based on static control flow, and exceptions create non-local exits that break that model.
+- **Exceptions**: Exception unwinding interacts poorly with CTMM's escape analysis — the compiler inserts `free` points based on static control flow, and exceptions create non-local exits that break that model.

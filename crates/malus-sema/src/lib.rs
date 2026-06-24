@@ -5,7 +5,7 @@ mod builtins;
 mod check;
 mod env;
 mod error;
-mod lobster;
+mod ctmm;
 mod ty;
 mod typed_ir;
 
@@ -20,7 +20,7 @@ pub use typed_ir::{
 use std::collections::{HashMap, HashSet};
 use malus_syntax::ast::Program;
 
-/// Type-check and run Lobster last-use analysis on a loaded program.
+/// Type-check and run CTMM last-use analysis on a loaded program.
 ///
 /// Returns a fully annotated `TypedProgram` on success, or all errors found.
 pub fn check(
@@ -28,6 +28,6 @@ pub fn check(
     module_aliases: &HashMap<String, HashSet<String>>,
 ) -> Result<TypedProgram, Vec<SemaError>> {
     let mut typed = check_program(program, module_aliases)?;
-    lobster::annotate_fns(&mut typed.fns);
+    ctmm::annotate_fns(&mut typed.fns);
     Ok(typed)
 }

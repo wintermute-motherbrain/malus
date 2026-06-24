@@ -105,7 +105,7 @@ kernel relu(inout a: Tensor<f32>):
     a = max(a, 0.0)
 ```
 
-Lobster does not insert a `free` for an `inout` parameter — the same buffer is reused. The caller retains ownership; the buffer is freed according to the caller's escape analysis.
+CTMM does not insert a `free` for an `inout` parameter — the same buffer is reused. The caller retains ownership; the buffer is freed according to the caller's escape analysis.
 
 ## Entry point
 

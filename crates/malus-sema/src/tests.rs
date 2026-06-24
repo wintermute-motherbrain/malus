@@ -35,7 +35,7 @@ kernel add(a: Tensor<f32>, b: Tensor<f32>) -> Tensor<f32>:
         assert!(matches!(expr.ty, crate::ResolvedTy::Tensor { .. }));
     }
 
-    // Lobster: GpuBarrier + Drop a + Drop b present
+    // CTMM: GpuBarrier + Drop a + Drop b present
     let has_barrier = main.body.iter().any(|s| matches!(s, TypedStmt::GpuBarrier));
     assert!(has_barrier, "GpuBarrier should be present for in-flight a and b");
 

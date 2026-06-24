@@ -14,7 +14,7 @@ source file
 malus-syntax::parse()          → Program (AST)
     │
     ▼
-malus-sema::check()            → TypedProgram (with Lobster free-point annotations)
+malus-sema::check()            → TypedProgram (with CTMM free-point annotations)
     │
     ├──► malus-codegen-gpu::compile_kernels()  → KernelRegistry (MSL strings)
     │         │
@@ -52,9 +52,9 @@ error: dtype mismatch
 3. `malus-runtime::load_kernels(registry)` — compile MSL pipelines
 4. `malus-codegen-cpu::compile_and_run(typed_program)` — JIT and execute `fn main`
 
-### Lobster free-point wiring
+### CTMM free-point wiring
 
-The Cranelift-compiled `fn main` calls into the runtime's C ABI. Lobster's annotations in the typed IR drive the code generator to emit:
+The Cranelift-compiled `fn main` calls into the runtime's C ABI. CTMM's annotations in the typed IR drive the code generator to emit:
 - `gpu_barrier()` before freeing any in-flight tensor
 - `tensor_free(handle)` at each free-point site
 

@@ -9,7 +9,7 @@ This directory contains the authoritative specification for the malus programmin
 | [01-overview.md](./01-overview.md) | Goals, non-goals, target user, design philosophy |
 | [02-syntax.md](./02-syntax.md) | Lexical structure, INDENT/DEDENT, grammar, operators |
 | [03-types.md](./03-types.md) | Type system: tensors, scalars, tuples, structs, enums, Option |
-| [04-memory.md](./04-memory.md) | Lobster memory model: escape analysis, RC fallback, GPU boundary |
+| [04-memory.md](./04-memory.md) | CTMM memory model: escape analysis, RC fallback, GPU boundary |
 | [05-functions.md](./05-functions.md) | `fn` and `kernel` declarations, ownership, device placement |
 | [06-stdlib.md](./06-stdlib.md) | Built-in tensor operations, dtypes, broadcasting, RNG |
 | [07-execution.md](./07-execution.md) | Compilation pipeline, script execution, REPL |
