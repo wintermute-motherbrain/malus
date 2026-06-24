@@ -7,8 +7,10 @@ pub mod token;
 pub mod lexer;
 pub mod ast;
 pub mod parser;
+pub mod print;
 
 pub use span::{FileId, Span};
 pub use token::{Token, TokenKind};
 pub use lexer::{lex, LexError, LexErrorKind};
 pub use parser::{parse, ParseError};
+pub use print::print_program;
