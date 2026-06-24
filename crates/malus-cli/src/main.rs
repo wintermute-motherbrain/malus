@@ -12,8 +12,14 @@ fn main() {
 }
 
 fn run_script(path: &str) {
-    eprintln!("malus: script execution not yet implemented (path: {path})");
-    std::process::exit(1);
+    let abs = std::path::Path::new(path);
+    match malus_loader::ModuleLoader::new().load(abs) {
+        Ok(loaded) => println!("{:#?}", loaded.program),
+        Err(e) => {
+            eprintln!("malus: {}", e);
+            std::process::exit(1);
+        }
+    }
 }
 
 fn run_repl() {

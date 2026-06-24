@@ -8,6 +8,7 @@ malus source files are UTF-8 encoded. Comments begin with `#` and run to end of 
 
 ```
 fn  kernel  let  return  if  else  for  in  while  struct  enum  inout  true  false
+and  or  not  import  from
 ```
 
 ### Identifiers
@@ -68,7 +69,12 @@ let a = Tensor.gpu<f32>([
 ## Grammar (informal)
 
 ```
-program       := item*
+program       := import_decl* item*
+
+import_decl   := import_stmt | from_import_stmt
+import_stmt   := 'import' module_path NEWLINE
+from_import_stmt := 'from' module_path 'import' ident (',' ident)* NEWLINE
+module_path   := ident ('.' ident)*
 
 item          := fn_def | kernel_def
 

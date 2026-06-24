@@ -8,6 +8,7 @@ version = "0.1.0"
 dependencies = [
  "malus-codegen-cpu",
  "malus-codegen-gpu",
+ "malus-loader",
  "malus-runtime",
  "malus-sema",
  "malus-syntax",
@@ -25,6 +26,13 @@ name = "malus-codegen-gpu"
 version = "0.1.0"
 dependencies = [
  "malus-sema",
+]
+
+[[package]]
+name = "malus-loader"
+version = "0.1.0"
+dependencies = [
+ "malus-syntax",
 ]
 
 [[package]]

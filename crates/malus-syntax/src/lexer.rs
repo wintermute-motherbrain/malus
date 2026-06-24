@@ -371,6 +371,8 @@ impl<'src> Lexer<'src> {
         let text = &self.source[start..self.pos];
         let kind = match text {
             "fn"     => TokenKind::Fn,
+            "from"   => TokenKind::From,
+            "import" => TokenKind::Import,
             "kernel" => TokenKind::Kernel,
             "let"    => TokenKind::Let,
             "return" => TokenKind::Return,
@@ -1074,6 +1076,39 @@ mod tests {
 
     #[test]
     fn kw_inout() { assert_eq!(kinds("inout"), vec![Inout, Newline, Eof]); }
+
+    #[test]
+    fn kw_import() { assert_eq!(kinds("import"), vec![Import, Newline, Eof]); }
+
+    #[test]
+    fn kw_from() { assert_eq!(kinds("from"), vec![From, Newline, Eof]); }
+
+    #[test]
+    fn import_prefix_not_keyword() {
+        assert_eq!(kinds("imports"),   vec![Ident("imports".into()),   Newline, Eof]);
+        assert_eq!(kinds("from_path"), vec![Ident("from_path".into()), Newline, Eof]);
+    }
+
+    #[test]
+    fn import_statement_tokens() {
+        assert_eq!(kinds("import ops"), vec![Import, Ident("ops".into()), Newline, Eof]);
+    }
+
+    #[test]
+    fn from_import_tokens() {
+        assert_eq!(
+            kinds("from ops import add"),
+            vec![From, Ident("ops".into()), Import, Ident("add".into()), Newline, Eof]
+        );
+    }
+
+    #[test]
+    fn dotted_import_tokens() {
+        assert_eq!(
+            kinds("import models.transformer"),
+            vec![Import, Ident("models".into()), Dot, Ident("transformer".into()), Newline, Eof]
+        );
+    }
 
     #[test]
     fn kw_and() { assert_eq!(kinds("and"), vec![And, Newline, Eof]); }

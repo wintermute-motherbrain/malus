@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/malus-syntax",
+    "crates/malus-loader",
     "crates/malus-sema",
     "crates/malus-codegen-cpu",
     "crates/malus-codegen-gpu",

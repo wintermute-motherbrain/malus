@@ -70,6 +70,7 @@ pub enum ExprKind {
     Call { callee: Box<Expr>, args: Vec<Expr> },
     Index { base: Box<Expr>, indices: Vec<Expr> },
     TensorLiteral { placement: Placement, dtype: ScalarTy, elements: Vec<Expr> },
+    FieldAccess { base: Box<Expr>, field: String },
 }
 
 // ── Statements ────────────────────────────────────────────────────────────────
@@ -104,6 +105,22 @@ pub struct KernelParam {
     pub span: Span,
 }
 
+// ── Module paths ──────────────────────────────────────────────────────────────
+
+/// A dot-separated module path, e.g. `models.transformer`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModulePath {
+    pub segments: Vec<String>,
+    pub span: Span,
+}
+
+impl ModulePath {
+    /// The module's short name — the last segment.
+    pub fn name(&self) -> &str {
+        self.segments.last().map(String::as_str).unwrap_or("")
+    }
+}
+
 // ── Top-level items ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]
@@ -125,6 +142,15 @@ pub enum ItemKind {
         params: Vec<KernelParam>,
         return_ty: Ty,
         body: Vec<Stmt>,
+    },
+    /// `import models.transformer`
+    Import {
+        path: ModulePath,
+    },
+    /// `from ops import add, mul`
+    FromImport {
+        path: ModulePath,
+        names: Vec<(String, Span)>,
     },
 }
 

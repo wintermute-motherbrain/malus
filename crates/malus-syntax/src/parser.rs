@@ -457,13 +457,8 @@ impl Parser {
                         }
                     }
 
-                    // Plain field access — represent as a Call on a dot-chained ident for now.
-                    // The parser models `a.b` as ident "b" accessed via postfix; we represent
-                    // it as a call with zero args using a synthetic callee for field access.
-                    // For M1 this is sufficient — only Tensor.gpu<...>([...]) needs special handling.
-                    let field_expr = Expr { kind: ExprKind::Ident(name), span: name_span };
                     base = Expr {
-                        kind: ExprKind::Call { callee: Box::new(field_expr), args: vec![base] },
+                        kind: ExprKind::FieldAccess { base: Box::new(base), field: name },
                         span,
                     };
                 }
@@ -521,6 +516,58 @@ impl Parser {
         }
     }
 
+    // ── Import declarations ───────────────────────────────────────────────────
+
+    fn parse_module_path(&mut self) -> Result<ModulePath, ParseError> {
+        let start = self.current_span();
+        let (first, _) = self.expect_ident()?;
+        let mut segments = vec![first];
+        while matches!(self.current_kind(), TokenKind::Dot) {
+            self.advance(); // consume '.'
+            let (seg, _) = self.expect_ident()?;
+            segments.push(seg);
+        }
+        let end = self.current_span();
+        Ok(ModulePath {
+            segments,
+            span: Span::new(start.file, start.start as usize, end.start as usize),
+        })
+    }
+
+    fn parse_import(&mut self) -> Result<Item, ParseError> {
+        let start = self.current_span();
+        self.expect(&TokenKind::Import)?;
+        let path = self.parse_module_path()?;
+        let end = path.span;
+        self.expect_newline_or_eof()?;
+        Ok(Item {
+            kind: ItemKind::Import { path },
+            span: Span::new(start.file, start.start as usize, end.end as usize),
+        })
+    }
+
+    fn parse_from_import(&mut self) -> Result<Item, ParseError> {
+        let start = self.current_span();
+        self.expect(&TokenKind::From)?;
+        let path = self.parse_module_path()?;
+        self.expect(&TokenKind::Import)?;
+        // Parse `ident (',' ident)*`
+        let mut names: Vec<(String, Span)> = Vec::new();
+        let (first_name, first_span) = self.expect_ident()?;
+        names.push((first_name, first_span));
+        while matches!(self.current_kind(), TokenKind::Comma) {
+            self.advance();
+            let (name, span) = self.expect_ident()?;
+            names.push((name, span));
+        }
+        let end = names.last().map(|(_, s)| *s).unwrap_or(path.span);
+        self.expect_newline_or_eof()?;
+        Ok(Item {
+            kind: ItemKind::FromImport { path, names },
+            span: Span::new(start.file, start.start as usize, end.end as usize),
+        })
+    }
+
     // ── Top-level items ───────────────────────────────────────────────────────
 
     fn parse_fn(&mut self) -> Result<Item, ParseError> {
@@ -562,10 +609,26 @@ impl Parser {
     fn parse_program(&mut self) -> Result<Program, ParseError> {
         let mut items = Vec::new();
         self.skip_newlines();
+
+        // Phase 1: import declarations (must precede all fn/kernel definitions).
         while !self.at_end() {
             match self.current_kind() {
-                TokenKind::Fn => items.push(self.parse_fn()?),
+                TokenKind::Import => items.push(self.parse_import()?),
+                TokenKind::From   => items.push(self.parse_from_import()?),
+                _ => break,
+            }
+            self.skip_newlines();
+        }
+
+        // Phase 2: fn and kernel definitions.
+        while !self.at_end() {
+            match self.current_kind() {
+                TokenKind::Fn     => items.push(self.parse_fn()?),
                 TokenKind::Kernel => items.push(self.parse_kernel()?),
+                TokenKind::Import | TokenKind::From => return Err(ParseError::new(
+                    "import declarations must appear before function and kernel definitions",
+                    self.current_span(),
+                )),
                 _ => return Err(ParseError::new(
                     format!("expected 'fn' or 'kernel', got {:?}", self.current_kind()),
                     self.current_span(),
@@ -573,6 +636,7 @@ impl Parser {
             }
             self.skip_newlines();
         }
+
         Ok(Program { items })
     }
 }
@@ -786,5 +850,112 @@ mod tests {
         let prog = parse_ok(src);
         let ItemKind::Kernel { params, .. } = &prog.items[0].kind else { panic!() };
         assert!(params[0].inout);
+    }
+
+    #[test]
+    fn field_access_node() {
+        let src = "fn f():\n    return a.b\n";
+        let prog = parse_ok(src);
+        let ItemKind::Fn { body, .. } = &prog.items[0].kind else { panic!() };
+        let StmtKind::Return { expr } = &body[0].kind else { panic!() };
+        assert!(matches!(&expr.kind, ExprKind::FieldAccess { field, .. } if field == "b"));
+    }
+
+    // ── Import parsing ────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_simple_import() {
+        let src = "import ops\n\nfn main():\n    return 0\n";
+        let prog = parse_ok(src);
+        assert_eq!(prog.items.len(), 2);
+        match &prog.items[0].kind {
+            ItemKind::Import { path } => assert_eq!(path.segments, vec!["ops"]),
+            _ => panic!("expected Import"),
+        }
+        assert!(matches!(prog.items[1].kind, ItemKind::Fn { .. }));
+    }
+
+    #[test]
+    fn parse_from_import_single() {
+        let src = "from ops import add\n\nfn main():\n    return 0\n";
+        let prog = parse_ok(src);
+        match &prog.items[0].kind {
+            ItemKind::FromImport { path, names } => {
+                assert_eq!(path.segments, vec!["ops"]);
+                assert_eq!(names.len(), 1);
+                assert_eq!(names[0].0, "add");
+            }
+            _ => panic!("expected FromImport"),
+        }
+    }
+
+    #[test]
+    fn parse_from_import_multiple_names() {
+        let src = "from ops import add, mul, sub\n\nfn main():\n    return 0\n";
+        let prog = parse_ok(src);
+        match &prog.items[0].kind {
+            ItemKind::FromImport { names, .. } => {
+                assert_eq!(names.len(), 3);
+                assert_eq!(names[0].0, "add");
+                assert_eq!(names[1].0, "mul");
+                assert_eq!(names[2].0, "sub");
+            }
+            _ => panic!("expected FromImport"),
+        }
+    }
+
+    #[test]
+    fn parse_dotted_import() {
+        let src = "import models.transformer\n\nfn main():\n    return 0\n";
+        let prog = parse_ok(src);
+        match &prog.items[0].kind {
+            ItemKind::Import { path } => {
+                assert_eq!(path.segments, vec!["models", "transformer"]);
+                assert_eq!(path.name(), "transformer");
+            }
+            _ => panic!("expected Import"),
+        }
+    }
+
+    #[test]
+    fn parse_multiple_imports() {
+        let src = "import ops\nfrom utils import helper\n\nfn main():\n    return 0\n";
+        let prog = parse_ok(src);
+        assert_eq!(prog.items.len(), 3);
+        assert!(matches!(prog.items[0].kind, ItemKind::Import { .. }));
+        assert!(matches!(prog.items[1].kind, ItemKind::FromImport { .. }));
+        assert!(matches!(prog.items[2].kind, ItemKind::Fn { .. }));
+    }
+
+    #[test]
+    fn parse_import_only_file() {
+        let src = "import ops\n";
+        let prog = parse_ok(src);
+        assert_eq!(prog.items.len(), 1);
+        assert!(matches!(prog.items[0].kind, ItemKind::Import { .. }));
+    }
+
+    #[test]
+    fn parse_deep_dotted_import() {
+        let src = "import a.b.c.d\n";
+        let prog = parse_ok(src);
+        match &prog.items[0].kind {
+            ItemKind::Import { path } => assert_eq!(path.segments, vec!["a", "b", "c", "d"]),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn import_after_fn_is_error() {
+        let src = "fn f():\n    return 0\n\nimport ops\n";
+        let err = parse(FileId(0), src).unwrap_err();
+        assert!(err.message.contains("import declarations must appear before"));
+    }
+
+    #[test]
+    fn from_import_after_fn_is_error() {
+        let src = "fn f():\n    return 0\n\nfrom ops import add\n";
+        let err = parse(FileId(0), src).unwrap_err();
+        assert!(err.message.contains("import declarations must appear before"));
     }
 }
