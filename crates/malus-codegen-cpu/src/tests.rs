@@ -119,6 +119,53 @@ kernel dispatch(a: Tensor<f32>, b: Tensor<f32>) -> Tensor<f32>:
     run_src(src).expect("CTMM drop and barrier should execute without panic");
 }
 
+// ── print / println format string codegen ────────────────────────────────────
+
+#[test]
+fn test_print_string_literal() {
+    let src = r#"
+fn main():
+    print("hello")
+"#;
+    run_src(src).expect("print(string) should compile and run");
+}
+
+#[test]
+fn test_println_string_literal() {
+    let src = r#"
+fn main():
+    println("hello")
+"#;
+    run_src(src).expect("println(string) should compile and run");
+}
+
+#[test]
+fn test_println_format_string() {
+    let src = r#"
+fn main():
+    println("{} + {} = {}", 1.0, 2.0, 3.0)
+"#;
+    run_src(src).expect("format string println should compile and run");
+}
+
+#[test]
+fn test_println_single_value() {
+    let src = r#"
+fn main():
+    println(42)
+"#;
+    run_src(src).expect("println(scalar) should compile and run");
+}
+
+#[test]
+fn test_println_no_args() {
+    let src = r#"
+fn main():
+    println()
+"#;
+    run_src(src).expect("println() bare newline should compile and run");
+}
+
 // ── No main → CodegenError::NoMainFunction ───────────────────────────────────
 
 #[test]

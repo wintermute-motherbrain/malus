@@ -216,6 +216,84 @@ fn main():
     );
 }
 
+// ── print / println format string validation ──────────────────────────────────
+
+#[test]
+fn test_println_builtin_exists() {
+    let src = r#"
+fn main():
+    let x = 1.0
+    println(x)
+"#;
+    assert!(check_src(src).is_ok(), "println(x) should pass sema");
+}
+
+#[test]
+fn test_print_bare_string_ok() {
+    let src = r#"
+fn main():
+    print("hello world")
+"#;
+    assert!(check_src(src).is_ok(), "print with bare string (0 placeholders, 0 value args) should pass");
+}
+
+#[test]
+fn test_println_no_args_ok() {
+    let src = r#"
+fn main():
+    println()
+"#;
+    assert!(check_src(src).is_ok(), "println() with no args should pass");
+}
+
+#[test]
+fn test_print_format_string_ok() {
+    let src = r#"
+fn main():
+    println("{} + {} = {}", 1.0, 2.0, 3.0)
+"#;
+    assert!(check_src(src).is_ok(), "format string with matching placeholder count should pass");
+}
+
+#[test]
+fn test_print_format_too_few_args() {
+    let src = r#"
+fn main():
+    println("{} {}", 1.0)
+"#;
+    let errors = check_src(src).expect_err("too few args should fail");
+    assert!(
+        errors.iter().any(|e| matches!(e, SemaError::FormatArgCountMismatch { placeholders: 2, args: 1, .. })),
+        "expected FormatArgCountMismatch(2 placeholders, 1 arg), got: {:?}", errors
+    );
+}
+
+#[test]
+fn test_print_format_too_many_args() {
+    let src = r#"
+fn main():
+    println("{}", 1.0, 2.0)
+"#;
+    let errors = check_src(src).expect_err("too many args should fail");
+    assert!(
+        errors.iter().any(|e| matches!(e, SemaError::FormatArgCountMismatch { placeholders: 1, args: 2, .. })),
+        "expected FormatArgCountMismatch(1 placeholder, 2 args), got: {:?}", errors
+    );
+}
+
+#[test]
+fn test_string_literal_not_first_arg_rejected() {
+    let src = r#"
+fn main():
+    print(1.0, "oops")
+"#;
+    let errors = check_src(src).expect_err("string literal as non-first arg should fail");
+    assert!(
+        errors.iter().any(|e| matches!(e, SemaError::StringLiteralOutsidePrint { .. })),
+        "expected StringLiteralOutsidePrint, got: {:?}", errors
+    );
+}
+
 // ── Module aliases ────────────────────────────────────────────────────────────
 
 #[test]

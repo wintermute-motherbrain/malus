@@ -458,11 +458,22 @@ fn check_call(
             ))
         }
         ResolvedCallee::Builtin(sig) => {
+            let is_print_call = callee_name == "print" || callee_name == "println";
             let typed_args: Vec<TypedExpr> = match &sig.kind {
                 BuiltinKind::Variadic => {
                     let mut out = Vec::new();
-                    for arg in args {
-                        out.push(check_expr(arg, None, ctx)?);
+                    for (i, arg) in args.iter().enumerate() {
+                        let checked = check_expr(arg, None, ctx)?;
+                        // String literals are only valid as the first arg of print/println.
+                        if checked.ty == ResolvedTy::Unit {
+                            if let TypedExprKind::Lit(Lit::Str(_)) = &checked.kind {
+                                if !is_print_call || i > 0 {
+                                    ctx.errors.push(SemaError::StringLiteralOutsidePrint { span: arg.span });
+                                    return None;
+                                }
+                            }
+                        }
+                        out.push(checked);
                     }
                     out
                 }
@@ -490,6 +501,24 @@ fn check_call(
                     out
                 }
             };
+            // Validate format string arg count for print/println.
+            if is_print_call {
+                if let Some(first) = typed_args.first() {
+                    if let TypedExprKind::Lit(Lit::Str(fmt)) = &first.kind {
+                        let placeholders = fmt.matches("{}").count();
+                        let value_args = typed_args.len() - 1;
+                        if placeholders != value_args {
+                            ctx.errors.push(SemaError::FormatArgCountMismatch {
+                                callee: callee_name.clone(),
+                                placeholders,
+                                args: value_args,
+                                span,
+                            });
+                            return None;
+                        }
+                    }
+                }
+            }
             let placement = sig.return_placement;
             let return_ty = sig.return_ty.clone();
             Some(typed_expr(

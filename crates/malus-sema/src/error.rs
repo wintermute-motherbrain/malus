@@ -16,6 +16,8 @@ pub enum SemaError {
     LossyCoercion { from: String, to: String, span: Span },
     KernelCalledFromKernel { name: String, span: Span },
     UnknownType { name: String, span: Span },
+    FormatArgCountMismatch { callee: String, placeholders: usize, args: usize, span: Span },
+    StringLiteralOutsidePrint { span: Span },
 }
 
 impl fmt::Display for SemaError {
@@ -45,6 +47,10 @@ impl fmt::Display for SemaError {
                 write!(f, "kernel '{}' cannot be called from inside another kernel", name),
             SemaError::UnknownType { name, .. } =>
                 write!(f, "unknown type '{}'", name),
+            SemaError::FormatArgCountMismatch { callee, placeholders, args, .. } =>
+                write!(f, "'{}' format string has {} placeholder(s) but {} value arg(s) provided", callee, placeholders, args),
+            SemaError::StringLiteralOutsidePrint { .. } =>
+                write!(f, "string literals are only valid as the first argument of print/println"),
         }
     }
 }

@@ -83,7 +83,7 @@ extern "C" fn tensor_print(handle: i64) {
         if i > 0 { print!(", "); }
         print!("{v}");
     }
-    println!("]");
+    print!("]");
 }
 
 extern "C" fn tensor_free(handle: i64) {
@@ -96,9 +96,14 @@ extern "C" fn kernel_dispatch(_name: *const u8, _handles: *const i64, _n: i32) -
 
 extern "C" fn gpu_barrier() {}
 
-extern "C" fn print_f32(v: f32)  { println!("{v}"); }
-extern "C" fn print_i64(v: i64)  { println!("{v}"); }
-extern "C" fn print_bool(v: i8)  { println!("{}", if v != 0 { "true" } else { "false" }); }
+extern "C" fn print_cstr(ptr: *const u8) {
+    let s = unsafe { std::ffi::CStr::from_ptr(ptr as *const i8) };
+    print!("{}", s.to_str().unwrap_or("<invalid utf-8>"));
+}
+
+extern "C" fn print_f32(v: f32)  { print!("{v}"); }
+extern "C" fn print_i64(v: i64)  { print!("{v}"); }
+extern "C" fn print_bool(v: i8)  { print!("{}", if v != 0 { "true" } else { "false" }); }
 
 // ── dtype_tag — ScalarTy enum discriminant order ──────────────────────────────
 
@@ -116,6 +121,29 @@ fn dtype_tag(s: &ScalarTy) -> i32 {
         ScalarTy::U32  => 9,
         ScalarTy::U64  => 10,
     }
+}
+
+// ── Format string helpers ─────────────────────────────────────────────────────
+
+enum FormatSegment {
+    Literal(String),
+    Placeholder,
+}
+
+fn parse_format_string(s: &str) -> Vec<FormatSegment> {
+    let mut segments = Vec::new();
+    let mut rest = s;
+    while let Some(idx) = rest.find("{}") {
+        if idx > 0 {
+            segments.push(FormatSegment::Literal(rest[..idx].to_string()));
+        }
+        segments.push(FormatSegment::Placeholder);
+        rest = &rest[idx + 2..];
+    }
+    if !rest.is_empty() {
+        segments.push(FormatSegment::Literal(rest.to_string()));
+    }
+    segments
 }
 
 // ── Type mapping ──────────────────────────────────────────────────────────────
@@ -154,6 +182,7 @@ struct Codegen<'m> {
     rt_tensor_free: FuncId,
     rt_kernel_dispatch: FuncId,
     rt_gpu_barrier: FuncId,
+    rt_print_cstr: FuncId,
     rt_print_f32: FuncId,
     rt_print_i64: FuncId,
     rt_print_bool: FuncId,
@@ -337,33 +366,47 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
             }
 
             TypedExprKind::Call { callee, args } => {
-                if callee == "print" {
-                    for arg in args {
-                        let val = self.lower_expr(arg)?;
-                        match &arg.ty {
-                            ResolvedTy::Tensor { .. } => self.call_runtime_print(val),
-                            ResolvedTy::Scalar(s) if is_float_scalar(s) => {
-                                let func_ref = self.import_func(self.codegen.rt_print_f32);
-                                self.builder.ins().call(func_ref, &[val]);
+                if callee == "print" || callee == "println" {
+                    let is_println = callee == "println";
+
+                    if args.is_empty() {
+                        // println() with no args → just a newline
+                        if is_println {
+                            let ptr = self.emit_static_cstr("\n");
+                            self.call_print_cstr(ptr);
+                        }
+                    } else if let TypedExprKind::Lit(Lit::Str(fmt)) = &args[0].kind {
+                        // Format string mode: compile-time expand
+                        let segments = parse_format_string(fmt);
+                        let mut val_idx = 0usize;
+                        for seg in &segments {
+                            match seg {
+                                FormatSegment::Literal(text) => {
+                                    let ptr = self.emit_static_cstr(text);
+                                    self.call_print_cstr(ptr);
+                                }
+                                FormatSegment::Placeholder => {
+                                    let arg = &args[1 + val_idx];
+                                    self.emit_print_value(arg)?;
+                                    val_idx += 1;
+                                }
                             }
-                            ResolvedTy::Scalar(s) => {
-                                // Widen narrower ints to i64 for the print stub.
-                                let wide = match scalar_cranelift_type(s) {
-                                    I64 => val,
-                                    _ => self.builder.ins().sextend(I64, val),
-                                };
-                                let func_ref = self.import_func(self.codegen.rt_print_i64);
-                                self.builder.ins().call(func_ref, &[wide]);
-                            }
-                            ResolvedTy::Bool => {
-                                let func_ref = self.import_func(self.codegen.rt_print_bool);
-                                self.builder.ins().call(func_ref, &[val]);
-                            }
-                            _ => return Err(CodegenError::UnsupportedExpr(
-                                format!("print of {} not supported", arg.ty)
-                            )),
+                        }
+                        if is_println {
+                            let ptr = self.emit_static_cstr("\n");
+                            self.call_print_cstr(ptr);
+                        }
+                    } else {
+                        // Legacy: print each arg by type, no separator
+                        for arg in args {
+                            self.emit_print_value(arg)?;
+                        }
+                        if is_println {
+                            let ptr = self.emit_static_cstr("\n");
+                            self.call_print_cstr(ptr);
                         }
                     }
+
                     Ok(self.builder.ins().iconst(I64, 0))
                 } else {
                     let func_id = self.codegen.func_ids.get(callee)
@@ -546,6 +589,38 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
         self.builder.ins().global_value(self.codegen.ptr_type(), global)
     }
 
+    fn call_print_cstr(&mut self, ptr: cranelift_codegen::ir::Value) {
+        let func_ref = self.import_func(self.codegen.rt_print_cstr);
+        self.builder.ins().call(func_ref, &[ptr]);
+    }
+
+    fn emit_print_value(&mut self, arg: &malus_sema::TypedExpr) -> Result<(), CodegenError> {
+        let val = self.lower_expr(arg)?;
+        match &arg.ty {
+            ResolvedTy::Tensor { .. } => self.call_runtime_print(val),
+            ResolvedTy::Scalar(s) if is_float_scalar(s) => {
+                let func_ref = self.import_func(self.codegen.rt_print_f32);
+                self.builder.ins().call(func_ref, &[val]);
+            }
+            ResolvedTy::Scalar(s) => {
+                let wide = match scalar_cranelift_type(s) {
+                    I64 => val,
+                    _ => self.builder.ins().sextend(I64, val),
+                };
+                let func_ref = self.import_func(self.codegen.rt_print_i64);
+                self.builder.ins().call(func_ref, &[wide]);
+            }
+            ResolvedTy::Bool => {
+                let func_ref = self.import_func(self.codegen.rt_print_bool);
+                self.builder.ins().call(func_ref, &[val]);
+            }
+            _ => return Err(CodegenError::UnsupportedExpr(
+                format!("print of {} not supported", arg.ty)
+            )),
+        }
+        Ok(())
+    }
+
     fn call_runtime_print(&mut self, handle: cranelift_codegen::ir::Value) {
         let func_ref = self.import_func(self.codegen.rt_tensor_print);
         self.builder.ins().call(func_ref, &[handle]);
@@ -587,6 +662,7 @@ pub fn compile_and_run(program: &TypedProgram) -> Result<(), CodegenError> {
     jit_builder.symbol("tensor_free",      tensor_free      as *const u8);
     jit_builder.symbol("kernel_dispatch",  kernel_dispatch  as *const u8);
     jit_builder.symbol("gpu_barrier",      gpu_barrier      as *const u8);
+    jit_builder.symbol("print_cstr",       print_cstr       as *const u8);
     jit_builder.symbol("print_f32",        print_f32        as *const u8);
     jit_builder.symbol("print_i64",        print_i64        as *const u8);
     jit_builder.symbol("print_bool",       print_bool       as *const u8);
@@ -623,6 +699,11 @@ pub fn compile_and_run(program: &TypedProgram) -> Result<(), CodegenError> {
         s
     };
     let sig_barrier = Signature::new(call_conv);
+    let sig_print_cstr = {
+        let mut s = Signature::new(call_conv);
+        s.params.push(AbiParam::new(ptr));
+        s
+    };
     let sig_print_f32 = {
         let mut s = Signature::new(call_conv);
         s.params.push(AbiParam::new(F32));
@@ -648,6 +729,8 @@ pub fn compile_and_run(program: &TypedProgram) -> Result<(), CodegenError> {
     let rt_kernel_dispatch = module.declare_function("kernel_dispatch", Linkage::Import, &sig_dispatch)
         .map_err(|e| CodegenError::JitError(e.to_string()))?;
     let rt_gpu_barrier = module.declare_function("gpu_barrier", Linkage::Import, &sig_barrier)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
+    let rt_print_cstr = module.declare_function("print_cstr", Linkage::Import, &sig_print_cstr)
         .map_err(|e| CodegenError::JitError(e.to_string()))?;
     let rt_print_f32 = module.declare_function("print_f32", Linkage::Import, &sig_print_f32)
         .map_err(|e| CodegenError::JitError(e.to_string()))?;
@@ -681,6 +764,7 @@ pub fn compile_and_run(program: &TypedProgram) -> Result<(), CodegenError> {
         rt_tensor_free,
         rt_kernel_dispatch,
         rt_gpu_barrier,
+        rt_print_cstr,
         rt_print_f32,
         rt_print_i64,
         rt_print_bool,

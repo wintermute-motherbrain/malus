@@ -23,8 +23,15 @@ pub struct BuiltinSig {
 pub fn register_builtins() -> HashMap<String, BuiltinSig> {
     let mut m = HashMap::new();
 
-    // print(a, ...) — variadic, returns Unit
+    // print(a, ...) — variadic, returns Unit; no trailing newline
     m.insert("print".to_string(), BuiltinSig {
+        kind: BuiltinKind::Variadic,
+        return_ty: ResolvedTy::Unit,
+        return_placement: None,
+    });
+
+    // println(a, ...) — like print but appends a newline
+    m.insert("println".to_string(), BuiltinSig {
         kind: BuiltinKind::Variadic,
         return_ty: ResolvedTy::Unit,
         return_placement: None,
