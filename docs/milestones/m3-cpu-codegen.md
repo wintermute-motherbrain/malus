@@ -26,7 +26,30 @@ Tensors are represented as opaque `i64` handles throughout Cranelift IR — the 
 
 ### ABI
 
-All runtime calls use the C ABI. Define an `extern "C"` interface in `malus-runtime` that this crate calls into. The interface is declared as Cranelift external function signatures here; the implementations live in M4.
+All runtime calls use the C ABI. Declare as Cranelift external functions in `malus-codegen-cpu`; implement (or stub) in `malus-runtime`. For M3 the implementations can be no-ops or simple print-and-return stubs — the goal is a working Cranelift pipeline, not a working Metal stack.
+
+```c
+// Allocate a GPU tensor from a flat data array.
+// dtype_tag: 0=f32, 1=f16, 2=i32, ... (match ScalarTy order)
+// data: pointer to len floats (callee copies before returning)
+// returns: opaque i64 handle
+i64  tensor_alloc_gpu(i32 dtype_tag, i64 len, const float* data);
+
+// Dispatch a named kernel over a list of tensor handles.
+// name: null-terminated UTF-8 kernel name
+// handles: array of nhandles opaque i64 tensor handles (inputs)
+// returns: output tensor handle
+i64  kernel_dispatch(const char* name, const i64* handles, i32 nhandles);
+
+// Block until all in-flight GPU work completes.
+void gpu_barrier(void);
+
+// Print tensor contents to stdout.
+void tensor_print(i64 handle);
+
+// Free a tensor handle and its backing buffer.
+void tensor_free(i64 handle);
+```
 
 ### Script execution entry point
 
@@ -40,11 +63,16 @@ This is what `malus-cli` calls for script execution.
 
 ## Dependencies
 
-- `cranelift-codegen`
-- `cranelift-jit`
-- `cranelift-frontend`
-- `cranelift-native` (for host ISA detection)
-- `malus-sema` (typed IR)
+Add to `crates/malus-codegen-cpu/Cargo.toml`:
+
+```toml
+cranelift-codegen  = "0.113"
+cranelift-frontend = "0.113"
+cranelift-jit      = "0.113"
+cranelift-native   = "0.113"
+cranelift-module   = "0.113"
+malus-sema         = { path = "../malus-sema" }
+```
 
 ## Tests
 
