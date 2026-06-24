@@ -96,6 +96,10 @@ extern "C" fn kernel_dispatch(_name: *const u8, _handles: *const i64, _n: i32) -
 
 extern "C" fn gpu_barrier() {}
 
+extern "C" fn print_f32(v: f32)  { println!("{v}"); }
+extern "C" fn print_i64(v: i64)  { println!("{v}"); }
+extern "C" fn print_bool(v: i8)  { println!("{}", if v != 0 { "true" } else { "false" }); }
+
 // ── dtype_tag — ScalarTy enum discriminant order ──────────────────────────────
 
 fn dtype_tag(s: &ScalarTy) -> i32 {
@@ -150,6 +154,9 @@ struct Codegen<'m> {
     rt_tensor_free: FuncId,
     rt_kernel_dispatch: FuncId,
     rt_gpu_barrier: FuncId,
+    rt_print_f32: FuncId,
+    rt_print_i64: FuncId,
+    rt_print_bool: FuncId,
 }
 
 impl<'m> Codegen<'m> {
@@ -332,8 +339,30 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
             TypedExprKind::Call { callee, args } => {
                 if callee == "print" {
                     for arg in args {
-                        let handle = self.lower_expr(arg)?;
-                        self.call_runtime_print(handle);
+                        let val = self.lower_expr(arg)?;
+                        match &arg.ty {
+                            ResolvedTy::Tensor { .. } => self.call_runtime_print(val),
+                            ResolvedTy::Scalar(s) if is_float_scalar(s) => {
+                                let func_ref = self.import_func(self.codegen.rt_print_f32);
+                                self.builder.ins().call(func_ref, &[val]);
+                            }
+                            ResolvedTy::Scalar(s) => {
+                                // Widen narrower ints to i64 for the print stub.
+                                let wide = match scalar_cranelift_type(s) {
+                                    I64 => val,
+                                    _ => self.builder.ins().sextend(I64, val),
+                                };
+                                let func_ref = self.import_func(self.codegen.rt_print_i64);
+                                self.builder.ins().call(func_ref, &[wide]);
+                            }
+                            ResolvedTy::Bool => {
+                                let func_ref = self.import_func(self.codegen.rt_print_bool);
+                                self.builder.ins().call(func_ref, &[val]);
+                            }
+                            _ => return Err(CodegenError::UnsupportedExpr(
+                                format!("print of {} not supported", arg.ty)
+                            )),
+                        }
                     }
                     Ok(self.builder.ins().iconst(I64, 0))
                 } else {
@@ -558,6 +587,9 @@ pub fn compile_and_run(program: &TypedProgram) -> Result<(), CodegenError> {
     jit_builder.symbol("tensor_free",      tensor_free      as *const u8);
     jit_builder.symbol("kernel_dispatch",  kernel_dispatch  as *const u8);
     jit_builder.symbol("gpu_barrier",      gpu_barrier      as *const u8);
+    jit_builder.symbol("print_f32",        print_f32        as *const u8);
+    jit_builder.symbol("print_i64",        print_i64        as *const u8);
+    jit_builder.symbol("print_bool",       print_bool       as *const u8);
 
     let mut module = JITModule::new(jit_builder);
     let ptr = module.target_config().pointer_type();
@@ -591,6 +623,21 @@ pub fn compile_and_run(program: &TypedProgram) -> Result<(), CodegenError> {
         s
     };
     let sig_barrier = Signature::new(call_conv);
+    let sig_print_f32 = {
+        let mut s = Signature::new(call_conv);
+        s.params.push(AbiParam::new(F32));
+        s
+    };
+    let sig_print_i64 = {
+        let mut s = Signature::new(call_conv);
+        s.params.push(AbiParam::new(I64));
+        s
+    };
+    let sig_print_bool = {
+        let mut s = Signature::new(call_conv);
+        s.params.push(AbiParam::new(I8));
+        s
+    };
 
     let rt_tensor_alloc_gpu = module.declare_function("tensor_alloc_gpu", Linkage::Import, &sig_alloc)
         .map_err(|e| CodegenError::JitError(e.to_string()))?;
@@ -601,6 +648,12 @@ pub fn compile_and_run(program: &TypedProgram) -> Result<(), CodegenError> {
     let rt_kernel_dispatch = module.declare_function("kernel_dispatch", Linkage::Import, &sig_dispatch)
         .map_err(|e| CodegenError::JitError(e.to_string()))?;
     let rt_gpu_barrier = module.declare_function("gpu_barrier", Linkage::Import, &sig_barrier)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
+    let rt_print_f32 = module.declare_function("print_f32", Linkage::Import, &sig_print_f32)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
+    let rt_print_i64 = module.declare_function("print_i64", Linkage::Import, &sig_print_i64)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
+    let rt_print_bool = module.declare_function("print_bool", Linkage::Import, &sig_print_bool)
         .map_err(|e| CodegenError::JitError(e.to_string()))?;
 
     // First pass: declare all user fn signatures.
@@ -628,6 +681,9 @@ pub fn compile_and_run(program: &TypedProgram) -> Result<(), CodegenError> {
         rt_tensor_free,
         rt_kernel_dispatch,
         rt_gpu_barrier,
+        rt_print_f32,
+        rt_print_i64,
+        rt_print_bool,
     };
 
     // Second pass: compile each fn body.
