@@ -26,18 +26,16 @@ kernel add(a: Tensor<f32>, b: Tensor<f32>) -> Tensor<f32>:
     return a + b
 ```
 
-## Status: pre-alpha (v0.1 MVP in progress)
+## Status: pre-alpha (v0.1 MVP in progress — next: M3 CPU Codegen)
 
 The v0.1 MVP proves the core dual-pipeline model end-to-end:
 
-- [ ] Lexer, parser, AST
-- [ ] Type checker (`Tensor<dtype>`, scalars, `bool`, tuples)
-- [ ] CTMM escape analysis (linear flows)
-- [ ] Cranelift JIT for `fn` bodies
-- [ ] MSL codegen for `kernel` bodies (element-wise ops)
-- [ ] Metal runtime (shared buffers, sync barriers, kernel dispatch)
-- [ ] Three stdlib ops: `zeros`, `ones`, `add`
-- [ ] Script execution: `malus <script.malus>`
+- [x] M1 — Lexer, parser, AST, pretty-printer, module loader
+- [x] M2 — Type checker (`Tensor<dtype>`, scalars, `bool`, tuples), CTMM last-use analysis
+- [ ] **M3** — Cranelift JIT for `fn` bodies ← next
+- [ ] M4 — Metal runtime (shared buffers, sync barriers, kernel dispatch)
+- [ ] M5 — MSL codegen for `kernel` bodies (element-wise ops)
+- [ ] M6 — End-to-end: `malus examples/add_tensors.malus` prints result
 
 ## Project structure
 
