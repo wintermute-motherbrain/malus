@@ -176,7 +176,28 @@ kernel relu(inout a: Tensor<f32>):
 
 ---
 
-## M7g — Terminal REPL
+## M7g — Import aliasing (`as` syntax)
+
+**Crate:** `malus-syntax`, `malus-loader`, `malus-sema`
+
+Add `as` aliasing to resolve naming conflicts between imported modules or names.
+
+```malus
+import ops as o          # qualified: o.add(...)
+from ops import add as my_add   # unqualified: my_add(...)
+```
+
+**Context:** v0.1 detects naming conflicts (two imports exporting the same name) as errors and requires the user to use qualified imports instead. Aliasing is the ergonomic solution.
+
+**What's needed:**
+- Lexer: add `as` keyword
+- Parser/AST: extend `import_stmt` and `from_import_stmt` grammar with optional `as ident`
+- Loader: store alias in `LoadedProgram.module_aliases` under the alias name instead of the module name
+- Sema: resolve qualified calls using the alias
+
+---
+
+## M7h — Terminal REPL
 
 **Crate:** `malus-cli`
 

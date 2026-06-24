@@ -1,0 +1,121 @@
+use std::collections::{HashMap, HashSet};
+use malus_syntax::ast::Placement;
+use malus_syntax::Span;
+use crate::builtins::BuiltinSig;
+use crate::ty::ResolvedTy;
+
+// ── Signatures ────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct ParamSig {
+    pub name: String,
+    pub ty: ResolvedTy,
+}
+
+#[derive(Debug, Clone)]
+pub struct KernelParamSig {
+    #[allow(dead_code)]
+    pub inout: bool,
+    pub name: String,
+    pub ty: ResolvedTy,
+}
+
+#[derive(Debug, Clone)]
+pub struct FnSig {
+    pub params: Vec<ParamSig>,
+    pub return_ty: ResolvedTy,
+    pub defined_at: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct KernelSig {
+    pub params: Vec<KernelParamSig>,
+    pub return_ty: ResolvedTy,
+    pub defined_at: Span,
+}
+
+// ── Callee resolution result ──────────────────────────────────────────────────
+
+pub enum Callee<'a> {
+    Fn(&'a FnSig),
+    Kernel(&'a KernelSig),
+    Builtin(&'a BuiltinSig),
+}
+
+// ── Environment ───────────────────────────────────────────────────────────────
+
+pub struct Env {
+    /// Local variable bindings: name → (type, optional placement).
+    bindings: Vec<HashMap<String, (ResolvedTy, Option<Placement>)>>,
+    pub functions: HashMap<String, FnSig>,
+    pub kernels: HashMap<String, KernelSig>,
+    pub builtins: HashMap<String, BuiltinSig>,
+    /// Qualified import aliases: module name → set of exported names.
+    pub module_aliases: HashMap<String, HashSet<String>>,
+}
+
+impl Env {
+    pub fn new(
+        builtins: HashMap<String, BuiltinSig>,
+        module_aliases: HashMap<String, HashSet<String>>,
+    ) -> Self {
+        Env {
+            bindings: vec![HashMap::new()],
+            functions: HashMap::new(),
+            kernels: HashMap::new(),
+            builtins,
+            module_aliases,
+        }
+    }
+
+    // ── Scope management ──────────────────────────────────────────────────────
+
+    pub fn push_scope(&mut self) {
+        self.bindings.push(HashMap::new());
+    }
+
+    pub fn pop_scope(&mut self) {
+        self.bindings.pop();
+    }
+
+    pub fn bind(&mut self, name: String, ty: ResolvedTy, placement: Option<Placement>) {
+        if let Some(scope) = self.bindings.last_mut() {
+            scope.insert(name, (ty, placement));
+        }
+    }
+
+    pub fn lookup_binding(&self, name: &str) -> Option<&(ResolvedTy, Option<Placement>)> {
+        for scope in self.bindings.iter().rev() {
+            if let Some(b) = scope.get(name) {
+                return Some(b);
+            }
+        }
+        None
+    }
+
+    // ── Callee resolution ─────────────────────────────────────────────────────
+
+    pub fn resolve_callee(&self, name: &str) -> Option<Callee<'_>> {
+        if let Some(sig) = self.functions.get(name) {
+            return Some(Callee::Fn(sig));
+        }
+        if let Some(sig) = self.kernels.get(name) {
+            return Some(Callee::Kernel(sig));
+        }
+        if let Some(sig) = self.builtins.get(name) {
+            return Some(Callee::Builtin(sig));
+        }
+        None
+    }
+
+    /// Resolve a qualified call like `ops.add` — looks up the module alias then
+    /// returns the callee for the bare name.
+    pub fn resolve_qualified(&self, module: &str, name: &str) -> Option<Callee<'_>> {
+        let exports = self.module_aliases.get(module)?;
+        if exports.contains(name) {
+            self.resolve_callee(name)
+        } else {
+            None
+        }
+    }
+}

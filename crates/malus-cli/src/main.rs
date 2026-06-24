@@ -13,10 +13,19 @@ fn main() {
 
 fn run_script(path: &str) {
     let abs = std::path::Path::new(path);
-    match malus_loader::ModuleLoader::new().load(abs) {
-        Ok(loaded) => println!("{:#?}", loaded.program),
+    let loaded = match malus_loader::ModuleLoader::new().load(abs) {
+        Ok(l) => l,
         Err(e) => {
             eprintln!("malus: {}", e);
+            std::process::exit(1);
+        }
+    };
+    match malus_sema::check(&loaded.program, &loaded.module_aliases) {
+        Ok(typed) => println!("{:#?}", typed),
+        Err(errors) => {
+            for e in &errors {
+                eprintln!("malus: {}", e);
+            }
             std::process::exit(1);
         }
     }

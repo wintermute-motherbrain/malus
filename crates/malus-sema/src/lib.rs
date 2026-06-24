@@ -1,3 +1,33 @@
-// Type checking, escape analysis, and the Lobster memory model.
-// Determines tensor lifetimes, inserts free points, and identifies
-// structurally ambiguous lifetimes that require RC fallback.
+#[cfg(test)]
+mod tests;
+
+mod builtins;
+mod check;
+mod env;
+mod error;
+mod lobster;
+mod ty;
+mod typed_ir;
+
+pub use check::check as check_program;
+pub use error::SemaError;
+pub use ty::ResolvedTy;
+pub use typed_ir::{
+    TypedExpr, TypedExprKind, TypedFn, TypedKernel, TypedKernelParam, TypedParam, TypedProgram,
+    TypedStmt,
+};
+
+use std::collections::{HashMap, HashSet};
+use malus_syntax::ast::Program;
+
+/// Type-check and run Lobster last-use analysis on a loaded program.
+///
+/// Returns a fully annotated `TypedProgram` on success, or all errors found.
+pub fn check(
+    program: &Program,
+    module_aliases: &HashMap<String, HashSet<String>>,
+) -> Result<TypedProgram, Vec<SemaError>> {
+    let mut typed = check_program(program, module_aliases)?;
+    lobster::annotate_fns(&mut typed.fns);
+    Ok(typed)
+}
