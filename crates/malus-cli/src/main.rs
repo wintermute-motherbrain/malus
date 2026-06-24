@@ -1,6 +1,6 @@
 // Entry point for the `malus` CLI.
 // Usage:
-//   malus <script.malus>   — JIT-compile and run a script
+//   malus <script.ml>   — JIT-compile and run a script
 //   malus               — drop into the interactive REPL (v1)
 
 fn main() {

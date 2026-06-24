@@ -42,7 +42,7 @@ There is no ahead-of-time compilation mode in v1. The full pipeline runs on ever
 ## Script execution `[MVP]`
 
 ```sh
-malus script.malus
+malus script.ml
 ```
 
 Runs the full pipeline and calls `fn main()`. Exit code 0 on success; 1 on any error (parse, type, runtime panic).
@@ -51,7 +51,7 @@ Errors are printed to stderr:
 
 ```
 error: dtype mismatch in binary op
-  --> script.malus:5:13
+  --> script.ml:5:13
    |
  5 |     let c = a + b
    |             ^~~~^ left is Tensor<f32>, right is Tensor<f16>

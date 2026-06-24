@@ -1,7 +1,7 @@
 # M2 — Semantics
 
 **Crate:** `malus-sema`
-**Done when:** `malus-sema` type-checks the M1 AST for `add_tensors.malus` without errors, annotates every expression with its resolved type and placement, produces a typed IR with CTMM last-use free-point annotations, and the CLI prints the typed IR.
+**Done when:** `malus-sema` type-checks the M1 AST for `add_tensors.ml` without errors, annotates every expression with its resolved type and placement, produces a typed IR with CTMM last-use free-point annotations, and the CLI prints the typed IR.
 
 ## Design decisions
 
@@ -55,7 +55,7 @@ Runs on `TypedFn` bodies after type checking:
 4. Group bindings by their last-use index
 5. Inject `GpuBarrier` (if any binding in the group is in-flight) + `Drop` nodes after the last-use statement
 
-**For `add_tensors.malus`:**
+**For `add_tensors.ml`:**
 - `a`, `b` last used at the `KernelCall` → `GpuBarrier` + `Drop(a)` + `Drop(b)` after it
 - `c` last used in `print(c)` → `Drop(c)` after that statement (no barrier — `print` is not a kernel)
 
@@ -84,7 +84,7 @@ ResolvedTy:
 
 See `crates/malus-sema/src/tests.rs`. All 12 tests pass:
 
-- MVP round-trip: `add_tensors.malus` type-checks, `c` resolves to `Tensor<f32>`, CTMM inserts correct Drop/GpuBarrier nodes
+- MVP round-trip: `add_tensors.ml` type-checks, `c` resolves to `Tensor<f32>`, CTMM inserts correct Drop/GpuBarrier nodes
 - Escaped tensor gets no Drop
 - Int literal in `Tensor<f32>` → coerced (ok)
 - Float literal in `Tensor<i32>` → LossyCoercion error

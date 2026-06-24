@@ -1,7 +1,7 @@
 # M6 — Integration
 
 **Crate:** `malus-cli`
-**Done when:** Running `malus examples/add_tensors.malus` on an M-series Mac prints `[6.0, 8.0, 10.0, 12.0]` and exits cleanly.
+**Done when:** Running `malus examples/add_tensors.ml` on an M-series Mac prints `[6.0, 8.0, 10.0, 12.0]` and exits cleanly.
 
 ## Scope
 
@@ -39,7 +39,7 @@ Error handling at each stage: if any stage returns an error, print the diagnosti
 
 ```
 error: dtype mismatch
-  --> examples/add_tensors.malus:7:12
+  --> examples/add_tensors.ml:7:12
    |
  7 |     let c = add(a, b)
    |             ^^^ expected Tensor<f32>, got Tensor<f16>
@@ -64,7 +64,7 @@ Verify with Metal's validation layer (`MTL_DEBUG_LAYER=1`) that no buffer is acc
 
 ```sh
 cargo build --release
-./target/release/malus examples/add_tensors.malus
+./target/release/malus examples/add_tensors.ml
 ```
 
 Expected output:
@@ -75,8 +75,8 @@ Expected output:
 Additional checks:
 - Exit code 0
 - No output to stderr
-- No Metal validation errors (`MTL_DEBUG_LAYER=1 ./target/release/malus examples/add_tensors.malus`)
-- No memory leaks (run under `leaks --atExit -- ./target/release/malus examples/add_tensors.malus`)
+- No Metal validation errors (`MTL_DEBUG_LAYER=1 ./target/release/malus examples/add_tensors.ml`)
+- No memory leaks (run under `leaks --atExit -- ./target/release/malus examples/add_tensors.ml`)
 
 ## Out of scope for M6
 

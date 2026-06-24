@@ -174,7 +174,7 @@ impl ModuleLoader {
             if i < n - 1 {
                 result.push(seg);
             } else {
-                result.push(format!("{}.malus", seg));
+                result.push(format!("{}.ml", seg));
             }
         }
         result
@@ -262,7 +262,7 @@ mod tests {
     #[test]
     fn single_file_no_imports() {
         let dir = tmp_dir("single");
-        let main = write(&dir, "main.malus", "fn main():\n    return 0\n");
+        let main = write(&dir, "main.ml", "fn main():\n    return 0\n");
         let loaded = ModuleLoader::new().load(&main).unwrap();
         assert_eq!(fn_names(&loaded.program), vec!["main"]);
     }
@@ -270,8 +270,8 @@ mod tests {
     #[test]
     fn simple_import() {
         let dir = tmp_dir("simple_import");
-        write(&dir, "ops.malus", "fn add():\n    return 0\n");
-        let main = write(&dir, "main.malus",
+        write(&dir, "ops.ml", "fn add():\n    return 0\n");
+        let main = write(&dir, "main.ml",
             "import ops\n\nfn main():\n    return 0\n");
         let loaded = ModuleLoader::new().load(&main).unwrap();
         let names = fn_names(&loaded.program);
@@ -282,8 +282,8 @@ mod tests {
     #[test]
     fn from_import() {
         let dir = tmp_dir("from_import");
-        write(&dir, "ops.malus", "fn add():\n    return 0\nfn mul():\n    return 0\n");
-        let main = write(&dir, "main.malus",
+        write(&dir, "ops.ml", "fn add():\n    return 0\nfn mul():\n    return 0\n");
+        let main = write(&dir, "main.ml",
             "from ops import add\n\nfn main():\n    return 0\n");
         let loaded = ModuleLoader::new().load(&main).unwrap();
         let names = fn_names(&loaded.program);
@@ -296,8 +296,8 @@ mod tests {
     #[test]
     fn dotted_path() {
         let dir = tmp_dir("dotted_path");
-        write(&dir, "models/net.malus", "fn forward():\n    return 0\n");
-        let main = write(&dir, "main.malus",
+        write(&dir, "models/net.ml", "fn forward():\n    return 0\n");
+        let main = write(&dir, "main.ml",
             "import models.net\n\nfn main():\n    return 0\n");
         let loaded = ModuleLoader::new().load(&main).unwrap();
         let names = fn_names(&loaded.program);
@@ -307,9 +307,9 @@ mod tests {
     #[test]
     fn transitive_imports() {
         let dir = tmp_dir("transitive");
-        write(&dir, "base.malus", "fn base_fn():\n    return 0\n");
-        write(&dir, "mid.malus", "import base\n\nfn mid_fn():\n    return 0\n");
-        let main = write(&dir, "main.malus",
+        write(&dir, "base.ml", "fn base_fn():\n    return 0\n");
+        write(&dir, "mid.ml", "import base\n\nfn mid_fn():\n    return 0\n");
+        let main = write(&dir, "main.ml",
             "import mid\n\nfn main():\n    return 0\n");
         let loaded = ModuleLoader::new().load(&main).unwrap();
         let names = fn_names(&loaded.program);
@@ -321,10 +321,10 @@ mod tests {
     #[test]
     fn diamond_deduplication() {
         let dir = tmp_dir("diamond");
-        write(&dir, "common.malus", "fn shared():\n    return 0\n");
-        write(&dir, "a.malus", "import common\n\nfn a_fn():\n    return 0\n");
-        write(&dir, "b.malus", "import common\n\nfn b_fn():\n    return 0\n");
-        let main = write(&dir, "main.malus",
+        write(&dir, "common.ml", "fn shared():\n    return 0\n");
+        write(&dir, "a.ml", "import common\n\nfn a_fn():\n    return 0\n");
+        write(&dir, "b.ml", "import common\n\nfn b_fn():\n    return 0\n");
+        let main = write(&dir, "main.ml",
             "import a\nimport b\n\nfn main():\n    return 0\n");
         let loaded = ModuleLoader::new().load(&main).unwrap();
         let names = fn_names(&loaded.program);
@@ -336,9 +336,9 @@ mod tests {
     #[test]
     fn circular_import_detected() {
         let dir = tmp_dir("circular");
-        write(&dir, "b.malus", "import a\n\nfn b_fn():\n    return 0\n");
-        write(&dir, "a.malus", "import b\n\nfn a_fn():\n    return 0\n");
-        let main = write(&dir, "main.malus",
+        write(&dir, "b.ml", "import a\n\nfn b_fn():\n    return 0\n");
+        write(&dir, "a.ml", "import b\n\nfn a_fn():\n    return 0\n");
+        let main = write(&dir, "main.ml",
             "import a\n\nfn main():\n    return 0\n");
         let err = ModuleLoader::new().load(&main).unwrap_err();
         assert!(matches!(err, LoadError::CircularImport { .. }),
@@ -348,7 +348,7 @@ mod tests {
     #[test]
     fn missing_file_error() {
         let dir = tmp_dir("missing");
-        let main = write(&dir, "main.malus",
+        let main = write(&dir, "main.ml",
             "import nonexistent\n\nfn main():\n    return 0\n");
         let err = ModuleLoader::new().load(&main).unwrap_err();
         assert!(matches!(err, LoadError::FileNotFound { .. }),
@@ -358,8 +358,8 @@ mod tests {
     #[test]
     fn unresolved_name_error() {
         let dir = tmp_dir("unresolved");
-        write(&dir, "ops.malus", "fn add():\n    return 0\n");
-        let main = write(&dir, "main.malus",
+        write(&dir, "ops.ml", "fn add():\n    return 0\n");
+        let main = write(&dir, "main.ml",
             "from ops import nonexistent\n\nfn main():\n    return 0\n");
         let err = ModuleLoader::new().load(&main).unwrap_err();
         assert!(matches!(err, LoadError::UnresolvedName { ref name, .. } if name == "nonexistent"),
@@ -369,8 +369,8 @@ mod tests {
     #[test]
     fn module_alias_recorded() {
         let dir = tmp_dir("alias");
-        write(&dir, "ops.malus", "fn add():\n    return 0\nfn mul():\n    return 0\n");
-        let main = write(&dir, "main.malus",
+        write(&dir, "ops.ml", "fn add():\n    return 0\nfn mul():\n    return 0\n");
+        let main = write(&dir, "main.ml",
             "import ops\n\nfn main():\n    return 0\n");
         let loaded = ModuleLoader::new().load(&main).unwrap();
         let aliases = &loaded.module_aliases;
@@ -383,8 +383,8 @@ mod tests {
     #[test]
     fn deps_come_before_entry_in_flat_program() {
         let dir = tmp_dir("dep_order");
-        write(&dir, "ops.malus", "fn helper():\n    return 0\n");
-        let main = write(&dir, "main.malus",
+        write(&dir, "ops.ml", "fn helper():\n    return 0\n");
+        let main = write(&dir, "main.ml",
             "import ops\n\nfn main():\n    return 0\n");
         let loaded = ModuleLoader::new().load(&main).unwrap();
         let names = fn_names(&loaded.program);

@@ -4,7 +4,7 @@
 
 malus is a lightweight, high-performance domain-specific language for machine learning workloads on Apple Silicon (M-series) hardware. It provides Python-like syntax with a dual-pipeline compilation model that cleanly separates CPU host orchestration from GPU device execution.
 
-malus is compiled, not interpreted. CPU code is JIT-compiled via Cranelift; GPU code is compiled to Metal Shading Language (MSL) and JIT-compiled by the Apple Metal driver. There is no separate build step — running `malus script.malus` compiles and executes immediately.
+malus is compiled, not interpreted. CPU code is JIT-compiled via Cranelift; GPU code is compiled to Metal Shading Language (MSL) and JIT-compiled by the Apple Metal driver. There is no separate build step — running `malus script.ml` compiles and executes immediately.
 
 ## Target user
 

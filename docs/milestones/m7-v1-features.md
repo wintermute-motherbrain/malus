@@ -2,7 +2,7 @@
 
 This milestone covers everything deferred from the v0.1 MVP. It is intentionally a collection of parallel workstreams rather than a single sequential milestone — each section below can be worked independently after M6 passes.
 
-**Done when:** `malus examples/train_step.malus` — a forward pass through a two-layer MLP using custom kernels, structs for model config, and SafeTensors weight loading — runs correctly on an M-series Mac.
+**Done when:** `malus examples/train_step.ml` — a forward pass through a two-layer MLP using custom kernels, structs for model config, and SafeTensors weight loading — runs correctly on an M-series Mac.
 
 ---
 
@@ -91,7 +91,7 @@ Upgrade error reporting to Rust/Elm-style rich diagnostics:
 
 ```
 error: dtype mismatch in binary op
-  --> script.malus:5:13
+  --> script.ml:5:13
    |
  5 |     let c = a + b
    |             ^~~~^ left is Tensor<f32>, right is Tensor<f16>

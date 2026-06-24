@@ -1,7 +1,7 @@
 # M1 — Syntax
 
 **Crate:** `malus-syntax`
-**Done when:** `malus-syntax` parses `examples/add_tensors.malus` without errors and produces a correct AST that can be pretty-printed back to equivalent source.
+**Done when:** `malus-syntax` parses `examples/add_tensors.ml` without errors and produces a correct AST that can be pretty-printed back to equivalent source.
 
 ## Scope
 
@@ -69,7 +69,7 @@ Every AST node carries a `Span { file, start, end }` for error reporting. Do not
 
 ## Tests
 
-- Lex and parse `examples/add_tensors.malus` → no errors
+- Lex and parse `examples/add_tensors.ml` → no errors
 - Parse a `fn` with no body → error at correct span
 - Parse `Tensor.gpu<f32>([1.0])` → correct `TensorLiteral` node
 - Parse `a + b` → `BinOp { op: Add, lhs: Ident("a"), rhs: Ident("b") }`

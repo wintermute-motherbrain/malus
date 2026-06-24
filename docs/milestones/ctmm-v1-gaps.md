@@ -10,7 +10,7 @@ CTMM (Compile-Time Memory Management) is malus's automatic memory model: escape 
 2. If a binding does not escape the function (not returned), inject a `Drop` node immediately after its last-use statement.
 3. If the binding was passed to a `KernelCall`, it is **in-flight** — inject a `GpuBarrier` node before the first `Drop` in that in-flight group, so codegen can emit the Metal sync before freeing.
 
-This covers the MVP's `add_tensors.malus` perfectly: all tensor flows are linear (no heap, no closures, no non-trivial escapes).
+This covers the MVP's `add_tensors.ml` perfectly: all tensor flows are linear (no heap, no closures, no non-trivial escapes).
 
 ## What is NOT implemented (v1 gaps)
 

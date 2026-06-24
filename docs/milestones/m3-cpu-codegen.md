@@ -49,7 +49,7 @@ This is what `malus-cli` calls for script execution.
 ## Tests
 
 - Compile a minimal `fn` that calls `tensor_print` with a mock runtime stub → executes without panic
-- Compile `add_tensors.malus`'s `fn main` with all runtime calls stubbed → correct call sequence: alloc, alloc, dispatch, barrier, print, free, free, free
+- Compile `add_tensors.ml`'s `fn main` with all runtime calls stubbed → correct call sequence: alloc, alloc, dispatch, barrier, print, free, free, free
 - Free points appear in the correct order (barrier before free for in-flight tensors)
 
 ## Out of scope for M3

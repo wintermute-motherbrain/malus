@@ -35,7 +35,7 @@ The v0.1 MVP proves the core dual-pipeline model end-to-end:
 - [ ] **M3** — Cranelift JIT for `fn` bodies ← next
 - [ ] M4 — Metal runtime (shared buffers, sync barriers, kernel dispatch)
 - [ ] M5 — MSL codegen for `kernel` bodies (element-wise ops)
-- [ ] M6 — End-to-end: `malus examples/add_tensors.malus` prints result
+- [ ] M6 — End-to-end: `malus examples/add_tensors.ml` prints result
 
 ## Project structure
 

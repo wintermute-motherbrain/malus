@@ -29,15 +29,15 @@ from utils.math import clamp
 
 Resolution is always relative to the **importing file's directory**:
 - Each segment except the last is a directory component.
-- The last segment is the filename, with `.malus` appended.
+- The last segment is the filename, with `.ml` appended.
 
 Examples (given that the importing file is in `src/`):
 
 | Import statement | File resolved |
 |---|---|
-| `import ops` | `src/ops.malus` |
-| `import models.net` | `src/models/net.malus` |
-| `from utils.math import clamp` | `src/utils/math.malus` |
+| `import ops` | `src/ops.ml` |
+| `import models.net` | `src/models/net.ml` |
+| `from utils.math import clamp` | `src/utils/math.ml` |
 
 Paths are always relative — there are no absolute imports and no search path. The standard library is always available without an import.
 
@@ -61,7 +61,7 @@ Circular imports are a compile-time hard error:
 
 ```
 error: circular import
-  a.malus → b.malus → a.malus
+  a.ml → b.ml → a.ml
 ```
 
 The full cycle is reported so the dependency can be broken.
@@ -91,7 +91,7 @@ At compile time, `malus-loader` resolves all imports before semantic analysis:
 | Condition | Error |
 |---|---|
 | Import after fn/kernel definition | Parse error |
-| File not found | `module not found: path/to/mod.malus` |
-| Circular dependency | `circular import: a.malus → b.malus → a.malus` |
+| File not found | `module not found: path/to/mod.ml` |
+| Circular dependency | `circular import: a.ml → b.ml → a.ml` |
 | Name not defined in target module | `cannot import 'name' from 'module': name not defined` |
 | Cannot read file | I/O error with path |
