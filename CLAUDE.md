@@ -4,14 +4,14 @@
 
 malus is a compiled ML DSL for Apple Silicon. Python-like syntax, dual compilation pipeline: `fn` bodies → Cranelift JIT (CPU), `kernel` bodies → Metal Shading Language (GPU). The CTMM memory model inserts static `free`/barrier calls at compile time; no GC, no RC on the fast path.
 
-## Current state: M2 done, **M3 is next**
+## Current state: M3 done, **M4 is next**
 
 | Milestone | Status | Crate |
 |---|---|---|
 | M1 — Syntax (lexer, parser, AST, loader) | ✅ done | `malus-syntax`, `malus-loader` |
 | M2 — Semantics (type checker + CTMM last-use) | ✅ done | `malus-sema` |
-| M3 — CPU Codegen (Cranelift JIT for `fn` bodies) | **← start here** | `malus-codegen-cpu` |
-| M4 — Metal Runtime | not started | `malus-runtime` |
+| M3 — CPU Codegen (Cranelift JIT for `fn` bodies) | ✅ done | `malus-codegen-cpu` |
+| M4 — Metal Runtime | **← start here** | `malus-runtime` |
 | M5 — GPU Codegen (MSL for `kernel` bodies) | not started | `malus-codegen-gpu` |
 | M6 — Integration (end-to-end CLI) | not started | `malus-cli` |
 
@@ -24,7 +24,7 @@ crates/
   malus-syntax/        # lexer, parser, AST  (src/lexer.rs, src/parser.rs, src/ast.rs)
   malus-loader/        # module resolution + flattening  (src/lib.rs)
   malus-sema/          # type checker + CTMM  (src/{check,ctmm,env,builtins,ty,typed_ir,error}.rs)
-  malus-codegen-cpu/   # Cranelift JIT  — STUB, start here for M3
+  malus-codegen-cpu/   # Cranelift JIT  — M3 complete (src/lib.rs, src/tests.rs)
   malus-codegen-gpu/   # MSL codegen    — STUB
   malus-runtime/       # Metal API      — STUB
   malus-cli/           # entry point    (src/main.rs)
@@ -36,7 +36,7 @@ docs/spec/             # language spec (01-overview … 09-modules)
 docs/adr/              # architecture decision records
 ```
 
-## The pipeline (M1 + M2 complete)
+## The pipeline (M1 + M2 + M3 complete)
 
 ```
 .ml source file
@@ -47,97 +47,47 @@ LoadedProgram { program: Program, module_aliases, sources }
   ▼  malus_sema::check(&program, &module_aliases)
 TypedProgram { fns: Vec<TypedFn>, kernels: Vec<TypedKernel> }
   │
-  ▼  (M3) malus_codegen_cpu::compile_and_run(&typed_program)
+  ▼  malus_codegen_cpu::compile_and_run(&typed_program)
      execute fn main()
 ```
 
-`malus-cli/src/main.rs` already calls the first two stages and debug-prints the `TypedProgram`. M3's job is to replace that debug print with actual Cranelift compilation and execution.
+`malus-cli/src/main.rs` runs all three stages. `compile_and_run` is fully implemented; `fn main()` is JIT-compiled and executed via Cranelift.
 
-## What M2 produces (what M3 consumes)
+## What M3 built (what M4 replaces)
 
-The typed IR lives in `crates/malus-sema/src/typed_ir.rs`. Key types:
+M3 is fully implemented. The Cranelift JIT pipeline compiles and runs `fn` bodies. All five runtime functions are **currently stubbed in `crates/malus-codegen-cpu/src/lib.rs`** behind a `HashMap<i64, Vec<f32>>` backed by a global `Mutex<TensorStore>`. M4's job is to replace those stubs with real Metal implementations in `malus-runtime`.
 
-```rust
-TypedProgram { fns: Vec<TypedFn>, kernels: Vec<TypedKernel> }
-
-TypedFn {
-    name: String,
-    params: Vec<TypedParam>,      // TypedParam { name, ty: ResolvedTy }
-    return_ty: ResolvedTy,
-    body: Vec<TypedStmt>,
-    span: Span,
-}
-
-// ResolvedTy (crates/malus-sema/src/ty.rs):
-//   Tensor { dtype: ScalarTy } | Scalar(ScalarTy) | Bool | Tuple(Vec<ResolvedTy>) | Unit
-
-TypedStmt:
-  Let { name: String, expr: TypedExpr }
-  Return { expr: TypedExpr }
-  Expr(TypedExpr)
-  Drop { name: String }       // CTMM: free this tensor binding
-  GpuBarrier                  // CTMM: wait for in-flight GPU work
-
-TypedExpr { kind: TypedExprKind, ty: ResolvedTy, placement: Option<Placement>, span }
-
-TypedExprKind:
-  Lit(Lit)
-  Ident(String)
-  BinOp { op: BinOp, lhs: Box<TypedExpr>, rhs: Box<TypedExpr> }
-  Unary { op: UnaryOp, operand: Box<TypedExpr> }
-  Call { callee: String, args: Vec<TypedExpr> }          // fn or builtin
-  KernelCall { callee: String, args: Vec<TypedExpr>,
-               in_flight: Vec<String> }                  // GPU dispatch
-  TensorLiteral { placement: Placement, dtype: ScalarTy, elements: Vec<TypedExpr> }
-  Index { base, indices }
-  FieldAccess { base, field }
-```
-
-CTMM guarantees that every non-returning tensor binding gets a `Drop` at its last-use point, preceded by a `GpuBarrier` if any binding in that group was passed to a `KernelCall`. M3 codegen pattern-matches these statements directly — no ownership analysis required.
-
-## M3 implementation guide
-
-See `docs/milestones/m3-cpu-codegen.md` for full spec. Key points:
-
-**Entry point to implement:**
-```rust
-// crates/malus-codegen-cpu/src/lib.rs
-pub fn compile_and_run(program: &TypedProgram) -> Result<(), CodegenError>
-```
-
-**Tensors are opaque `i64` handles** in Cranelift IR. The runtime owns the actual `MTLBuffer`. Codegen never touches Metal.
-
-**Runtime C ABI** (define in `malus-runtime`, declare as Cranelift externals in `malus-codegen-cpu`):
+**Runtime C ABI** — currently stubbed in `malus-codegen-cpu`, moving to `malus-runtime` in M4:
 ```c
-i64  tensor_alloc_gpu(i32 dtype_tag, i64 len, ptr data)   // data = null-terminated f32 array
-i64  kernel_dispatch(ptr name, i64* handles, i32 nhandles) // returns output handle
+i64  tensor_alloc_gpu(i32 dtype_tag, i64 len, const float* data)
+i64  kernel_dispatch(const char* name, const i64* handles, i32 nhandles)
 void gpu_barrier()
 void tensor_print(i64 handle)
 void tensor_free(i64 handle)
 ```
 
-**Cranelift deps to add** to `crates/malus-codegen-cpu/Cargo.toml`:
+The `i64` handle is an opaque token. In M3 it is a HashMap key (incrementing integer). In M4 it becomes a raw pointer to a heap-allocated `TensorBuffer` wrapping a real `MTLBuffer`.
+
+**dtype_tag** uses `ScalarTy` enum discriminant order: F32=0, F16=1, Bf16=2, I8=3, I16=4, I32=5, I64=6, U8=7, U16=8, U32=9, U64=10.
+
+**Known M3 limitations / deferred work:**
+- `BinOp` on tensor types in host `fn` bodies returns `UnsupportedExpr` — the semantics (CPU compute vs. implicit MPS dispatch) are unresolved; see `docs/adr/0007-tensor-binop-in-fn-bodies.md`
+- `kernel_dispatch` returns an empty dummy tensor — real GPU execution is M5
+- `zeros` / `ones` builtins return `UnsupportedExpr` — not needed for the golden example
+
+## M4 implementation guide
+
+See `docs/milestones/m4-metal-runtime.md` for full spec. Key points:
+
+**Goal:** Replace the five `extern "C"` stub functions in `malus-codegen-cpu/src/lib.rs` with real Metal implementations in `malus-runtime/src/lib.rs`. Wire `malus-codegen-cpu` to link against `malus-runtime` instead of defining the stubs itself.
+
+**The JIT already finds these symbols by name** via `JITBuilder::symbol()` in `compile_and_run`. Swapping the implementation is purely a matter of pointing those symbol registrations at the new `malus-runtime` function pointers.
+
+**Metal dep to add** to `crates/malus-runtime/Cargo.toml`:
 ```toml
-cranelift-codegen  = "0.113"
-cranelift-frontend = "0.113"
-cranelift-jit      = "0.113"
-cranelift-native   = "0.113"
-cranelift-module   = "0.113"
+metal = "0.29"
 ```
-
-**Lowering table:**
-
-| TypedStmt / TypedExprKind | Cranelift lowering |
-|---|---|
-| `TensorLiteral { placement: Gpu, dtype, elements }` | Emit data as static constant; call `tensor_alloc_gpu` |
-| `Call { callee: "print", .. }` | Call `tensor_print(handle)` |
-| `KernelCall { callee, args, .. }` | Call `kernel_dispatch(name_ptr, handles_array, len)` |
-| `GpuBarrier` | Call `gpu_barrier()` |
-| `Drop { name }` | Call `tensor_free(lookup(name))` |
-| `BinOp` on scalars | Cranelift `iadd` / `fadd` / etc. |
-| `Return` | Cranelift `return` |
-
-**For M3, `kernel_dispatch` and `gpu_barrier` can be no-op stubs** — the goal is to prove the Cranelift pipeline end-to-end with `tensor_alloc_gpu`, `tensor_print`, and `tensor_free` wired to real (or mock) implementations.
+Gate the entire crate: `#[cfg(target_os = "macos")]`.
 
 ## Coding conventions
 

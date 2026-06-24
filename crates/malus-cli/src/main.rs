@@ -20,14 +20,18 @@ fn run_script(path: &str) {
             std::process::exit(1);
         }
     };
-    match malus_sema::check(&loaded.program, &loaded.module_aliases) {
-        Ok(typed) => println!("{:#?}", typed),
+    let typed = match malus_sema::check(&loaded.program, &loaded.module_aliases) {
+        Ok(t) => t,
         Err(errors) => {
             for e in &errors {
                 eprintln!("malus: {}", e);
             }
             std::process::exit(1);
         }
+    };
+    if let Err(e) = malus_codegen_cpu::compile_and_run(&typed) {
+        eprintln!("malus: {}", e);
+        std::process::exit(1);
     }
 }
 

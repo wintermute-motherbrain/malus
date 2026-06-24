@@ -4,4 +4,11 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-malus-sema = { path = "../malus-sema" }
+malus-sema   = { path = "../malus-sema" }
+malus-syntax = { path = "../malus-syntax" }
+
+cranelift-codegen  = "0.113"
+cranelift-frontend = "0.113"
+cranelift-jit      = "0.113"
+cranelift-native   = "0.113"
+cranelift-module   = "0.113"

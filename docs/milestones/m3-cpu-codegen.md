@@ -30,7 +30,7 @@ All runtime calls use the C ABI. Declare as Cranelift external functions in `mal
 
 ```c
 // Allocate a GPU tensor from a flat data array.
-// dtype_tag: 0=f32, 1=f16, 2=i32, ... (match ScalarTy order)
+// dtype_tag: 0=f32, 1=f16, 2=bf16, 3=i8, 4=i16, 5=i32, 6=i64, 7=u8, 8=u16, 9=u32, 10=u64 (ScalarTy enum order)
 // data: pointer to len floats (callee copies before returning)
 // returns: opaque i64 handle
 i64  tensor_alloc_gpu(i32 dtype_tag, i64 len, const float* data);

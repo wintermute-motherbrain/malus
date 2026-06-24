@@ -3,6 +3,12 @@
 **Crate:** `malus-runtime`
 **Done when:** A Rust test allocates a `f32` GPU tensor via the runtime, writes values from the CPU, reads them back, and frees the buffer — with no Metal validation errors.
 
+## Starting point
+
+The five C ABI functions (`tensor_alloc_gpu`, `tensor_print`, `tensor_free`, `gpu_barrier`, `kernel_dispatch`) are currently **stubbed in `crates/malus-codegen-cpu/src/lib.rs`** using a `HashMap<i64, Vec<f32>>` store. M4's job is to implement these functions for real in `malus-runtime/src/lib.rs` and update `malus-codegen-cpu` to register the `malus-runtime` function pointers instead of its own stubs.
+
+The JIT resolves these symbols by name via `JITBuilder::symbol()` in `compile_and_run`. No changes to the Cranelift IR are needed — only the symbol targets change.
+
 ## Scope
 
 ### Metal device setup
