@@ -53,11 +53,11 @@ TypedProgram { fns: Vec<TypedFn>, kernels: Vec<TypedKernel> }
 
 `malus-cli/src/main.rs` runs all three stages. `compile_and_run` is fully implemented; `fn main()` is JIT-compiled and executed via Cranelift. The `RuntimeSymbols` struct of five `extern "C" fn` pointers is injected by the CLI (real Metal fns from `malus-runtime` on macOS); tests inject mock fns.
 
-## What M3 built (what M4 replaces)
+## What M4 built (what M5 extends)
 
-M3 is fully implemented. The Cranelift JIT pipeline compiles and runs `fn` bodies. All five runtime functions are **currently stubbed in `crates/malus-codegen-cpu/src/lib.rs`** behind a `HashMap<i64, Vec<f32>>` backed by a global `Mutex<TensorStore>`. M4's job is to replace those stubs with real Metal implementations in `malus-runtime`.
+M4 is fully implemented. The five runtime functions are real Metal implementations in `malus-runtime/src/metal.rs`, injected into the JIT via a `RuntimeSymbols` struct. `compile_and_run` accepts `&RuntimeSymbols`; the CLI constructs it from `malus-runtime`'s exported fns on macOS, tests construct mock fns. codegen-cpu stays platform-agnostic and Metal-unaware (ADR-0008).
 
-**Runtime C ABI** — preserved from M3; M4 only swaps implementations. M5 migrates `kernel_dispatch` to `kernel_id: u64` / `usize`:
+**Runtime C ABI** — preserved from M3; M5 migrates `kernel_dispatch` to `kernel_id: u64` / `usize` when the `KernelRegistry` is introduced:
 ```c
 i64  tensor_alloc_gpu(i32 dtype_tag, i64 len, const float* data)
 i64  kernel_dispatch(const char* name, const i64* handles, i32 nhandles)
@@ -66,29 +66,36 @@ void tensor_print(i64 handle)
 void tensor_free(i64 handle)
 ```
 
-The `i64` handle is an opaque token. In M3 it is a HashMap key (incrementing integer). In M4 it becomes a raw pointer to a heap-allocated `TensorBuffer` wrapping a real `MTLBuffer`.
+The `i64` handle is a raw pointer to a heap-allocated `TensorBuffer { buffer: metal::Buffer, dtype: Dtype, len: usize }` wrapping a real `MTLBuffer` (`StorageModeShared`). The runtime owns it; `tensor_free` drops the box.
 
-**dtype_tag** uses `ScalarTy` enum discriminant order: F32=0, F16=1, Bf16=2, I8=3, I16=4, I32=5, I64=6, U8=7, U16=8, U32=9, U64=10.
+**dtype_tag** uses `ScalarTy` enum discriminant order: F32=0, F16=1, Bf16=2, I8=3, I16=4, I32=5, I64=6, U8=7, U16=8, U32=9, U64=10. `malus-runtime` defines an independent `Dtype` enum with `from_tag(i32)`; a drift-detection test asserts all 11 mappings. **M4 supports f32 only** — non-f32 panics per ADR-0006.
 
-**Known M3 limitations / deferred work:**
-- `BinOp` on tensor types in host `fn` bodies returns `UnsupportedExpr` — the semantics (CPU compute vs. implicit MPS dispatch) are unresolved; see `docs/adr/0007-tensor-binop-in-fn-bodies.md`
-- `kernel_dispatch` returns an empty dummy tensor — real GPU execution is M5
-- `zeros` / `ones` builtins return `UnsupportedExpr` — not needed for the golden example
+**Device/queue:** lazy `OnceLock<MetalContext { device, command_queue }>`; first Metal fn call triggers `Device::system_default()` (panics if absent). No explicit init API.
 
-## M4 implementation guide
+**gpu_barrier:** creates+commits+waits an empty command buffer. No persistent command buffer state — M5 adds a `current_command_buffer` when `kernel_dispatch` encodes real compute passes.
 
-See `docs/milestones/m4-metal-runtime.md` for full spec. Key points:
+**Known M4 limitations / deferred work:**
+- `BinOp` on tensor types in host `fn` bodies returns `UnsupportedExpr` — the semantics (CPU compute vs. implicit MPS dispatch) are unresolved; see `docs/adr/0007-tensor-binop-in-fn-bodies.md`. M5 should resolve this by lowering to `kernel_dispatch` calls to built-in element-wise kernels.
+- `kernel_dispatch` returns a zeroed output buffer matching the first input's dtype/len — real GPU execution is M5. The stub is **replaced wholesale**, not extended.
+- `zeros` / `ones` builtins return `UnsupportedExpr` — not needed for the golden example.
+- Non-f32 dtypes panic — the `Dtype` enum exists but only `F32` is functional.
+- Zero-length tensors crash Metal's `new_buffer(0, ...)` — not needed for the golden example.
 
-**Goal:** Replace the five `extern "C"` stub functions in `malus-codegen-cpu/src/lib.rs` with real Metal implementations in `malus-runtime/src/metal.rs`. `compile_and_run` now accepts a `&RuntimeSymbols` struct (defined in `malus-codegen-cpu`) of five `extern "C" fn` pointers; the CLI constructs this from `malus-runtime`'s exported functions. This keeps `malus-codegen-cpu` platform-agnostic and Metal-unaware (see ADR-0008).
+## M5 implementation guide
 
-**The JIT finds these symbols by name** via `JITBuilder::symbol()` in `compile_and_run`, using the injected pointers. Swapping the implementation is purely a matter of passing a different `RuntimeSymbols` to `compile_and_run`.
+See `docs/milestones/m5-gpu-codegen.md` for full spec. Key points:
 
-**Metal dep** (target-gated) in `crates/malus-runtime/Cargo.toml`:
-```toml
-[target.'cfg(target_os = "macos")'.dependencies]
-metal = "0.29"
-```
-The entire crate is gated: `#[cfg(target_os = "macos")]`. On non-macOS, `malus-runtime` compiles to an empty crate; the CLI prints "Metal runtime requires macOS" and exits.
+**Goal:** Compile malus `kernel` bodies to MSL, register them in a `KernelRegistry` (`kernel_id: u64` → `msl_source: String`), and replace the `kernel_dispatch` stub with real compute dispatch. `malus examples/add_tensors.ml` should print `[6, 8, 10, 12]`.
+
+**Two crates involved:**
+- `malus-codegen-gpu` — walks `TypedProgram`'s `kernel` items, emits MSL source as a `String`, produces a `KernelRegistry`. Currently a STUB.
+- `malus-runtime` — compiles each MSL entry to a `MTLComputePipelineState` at startup (cached by `kernel_id`), and implements real `kernel_dispatch`.
+
+**ABI migration (M5):** `kernel_dispatch` changes from `(name: *const u8, handles: *const i64, n: i32)` to `(kernel_id: u64, handles: *const i64, count: usize)`. This requires updating the `RuntimeSymbols` struct in `malus-codegen-cpu`, the `KernelCall` IR emission, and the CLI wiring. The `KernelRegistry` makes the `u64` id meaningful.
+
+**`kernel_dispatch` (M5 real impl):** allocate output buffer via `tensor_alloc_gpu`, encode a compute pass (`setComputePipelineState`, `setBuffer` per input + output, `dispatchThreads:threadsPerThreadgroup:`), do NOT commit (commit happens in `gpu_barrier`). Introduce a persistent `current_command_buffer` in `MetalContext`.
+
+**Element-wise detection rule:** a binary op on two tensors of the same shape with no explicit thread indexing lowers as element-wise. Output buffer is the same size as inputs. Thread ID is implicit (`thread_position_in_grid`).
 
 ## Coding conventions
 
