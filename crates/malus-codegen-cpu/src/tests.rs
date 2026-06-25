@@ -2,24 +2,92 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use malus_syntax::parse;
 use malus_sema::check;
-use crate::{compile_and_run, CodegenError};
+use crate::{compile_and_run, CodegenError, RuntimeSymbols};
 
-// Tests share TENSOR_STORE global state, so they must not run in parallel.
+// Tests share MOCK_STORE global state, so they must not run in parallel.
 static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+// ── Mock runtime (HashMap-backed, replicates the M3 stubs) ────────────────────
+
+struct MockStore {
+    data: HashMap<i64, Vec<f32>>,
+    next_id: i64,
+}
+
+impl MockStore {
+    fn new() -> Self {
+        Self { data: HashMap::new(), next_id: 1 }
+    }
+
+    fn insert(&mut self, elements: Vec<f32>) -> i64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.data.insert(id, elements);
+        id
+    }
+}
+
+static MOCK_STORE: Mutex<Option<MockStore>> = Mutex::new(None);
+
+fn with_store<R>(f: impl FnOnce(&mut MockStore) -> R) -> R {
+    let mut guard = MOCK_STORE.lock().unwrap_or_else(|e| e.into_inner());
+    f(guard.as_mut().expect("mock store not initialized"))
+}
+
+extern "C" fn mock_tensor_alloc_gpu(dtype: i32, len: i64, data: *const f32) -> i64 {
+    let _ = dtype;
+    let elements = if data.is_null() || len == 0 {
+        vec![]
+    } else {
+        unsafe { std::slice::from_raw_parts(data, len as usize).to_vec() }
+    };
+    with_store(|s| s.insert(elements))
+}
+
+extern "C" fn mock_tensor_print(handle: i64) {
+    let elems = with_store(|s| s.data.get(&handle).cloned().unwrap_or_default());
+    print!("[");
+    for (i, v) in elems.iter().enumerate() {
+        if i > 0 { print!(", "); }
+        print!("{v}");
+    }
+    print!("]");
+}
+
+extern "C" fn mock_tensor_free(handle: i64) {
+    with_store(|s| { s.data.remove(&handle); });
+}
+
+extern "C" fn mock_kernel_dispatch(_name: *const u8, _handles: *const i64, _n: i32) -> i64 {
+    with_store(|s| s.insert(vec![]))
+}
+
+extern "C" fn mock_gpu_barrier() {}
+
+fn mock_symbols() -> RuntimeSymbols {
+    RuntimeSymbols {
+        tensor_alloc_gpu: mock_tensor_alloc_gpu,
+        tensor_free:      mock_tensor_free,
+        tensor_print:     mock_tensor_print,
+        kernel_dispatch:  mock_kernel_dispatch,
+        gpu_barrier:      mock_gpu_barrier,
+    }
+}
 
 fn run_src(src: &str) -> Result<(), CodegenError> {
     let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    *MOCK_STORE.lock().unwrap() = Some(MockStore::new());
     let program = parse(malus_syntax::FileId(0), src).expect("parse failed");
     let aliases = HashMap::new();
     let typed = check(&program, &aliases).expect("type check failed");
-    compile_and_run(&typed)
+    let symbols = mock_symbols();
+    compile_and_run(&typed, &symbols)
 }
 
 // ── Tensor alloc, print, and free ────────────────────────────────────────────
 
 #[test]
 fn test_tensor_alloc_and_free() {
-    // Allocates, prints, and frees a tensor. CTMM inserts Drop(a) after print(a).
     let src = r#"
 fn main():
     let a = Tensor.gpu<f32>([1.0, 2.0, 3.0])
@@ -32,7 +100,6 @@ fn main():
 
 #[test]
 fn test_tensor_alloc_stores_data() {
-    // Verify the pipeline round-trips: alloc with known values, print without panic.
     let src = r#"
 fn make() -> Tensor<f32>:
     let a = Tensor.gpu<f32>([10.0, 20.0, 30.0])
@@ -42,8 +109,6 @@ fn main():
     let x = make()
     print(x)
 "#;
-    // After run, CTMM drops x (last use is print(x)), so store is empty.
-    // We just verify the run completes without panic.
     run_src(src).expect("should compile and run");
 }
 
@@ -61,7 +126,6 @@ fn main():
 kernel add(a: Tensor<f32>, b: Tensor<f32>) -> Tensor<f32>:
     return a + b
 "#;
-    // kernel_dispatch stub returns an empty tensor — should not panic.
     run_src(src).expect("add_tensors.ml flow should compile and run without panic");
 }
 
@@ -69,9 +133,6 @@ kernel add(a: Tensor<f32>, b: Tensor<f32>) -> Tensor<f32>:
 
 #[test]
 fn test_scalar_add() {
-    // Verify scalar BinOp works by checking a fn computes and calls print on a tensor.
-    // We can't inspect integer scalar return values directly (main returns void),
-    // but we can verify the JIT compiles and executes without error.
     let src = r#"
 fn double(x: i32) -> i32:
     return x + x
@@ -96,7 +157,6 @@ fn main():
     let t = make_tensor()
     print(t)
 "#;
-    // After run, CTMM drops t (last use is print(t)).
     run_src(src).expect("fn-to-fn call should compile and run");
 }
 
@@ -114,8 +174,6 @@ fn main():
 kernel dispatch(a: Tensor<f32>, b: Tensor<f32>) -> Tensor<f32>:
     return a + b
 "#;
-    // CTMM inserts GpuBarrier + Drop(a) + Drop(b) after the kernel call.
-    // This tests that the barrier and free stubs execute without panic.
     run_src(src).expect("CTMM drop and barrier should execute without panic");
 }
 
@@ -185,7 +243,8 @@ fn test_no_main_returns_error() {
         kernels: vec![],
     };
 
-    let result = compile_and_run(&typed);
+    let symbols = mock_symbols();
+    let result = compile_and_run(&typed, &symbols);
     assert!(
         matches!(result, Err(CodegenError::NoMainFunction)),
         "expected NoMainFunction, got: {:?}", result

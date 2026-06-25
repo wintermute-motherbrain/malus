@@ -29,8 +29,26 @@ fn run_script(path: &str) {
             std::process::exit(1);
         }
     };
-    if let Err(e) = malus_codegen_cpu::compile_and_run(&typed) {
-        eprintln!("malus: {}", e);
+
+    #[cfg(target_os = "macos")]
+    {
+        let symbols = malus_codegen_cpu::RuntimeSymbols {
+            tensor_alloc_gpu: malus_runtime::tensor_alloc_gpu,
+            tensor_free: malus_runtime::tensor_free,
+            tensor_print: malus_runtime::tensor_print,
+            kernel_dispatch: malus_runtime::kernel_dispatch,
+            gpu_barrier: malus_runtime::gpu_barrier,
+        };
+        if let Err(e) = malus_codegen_cpu::compile_and_run(&typed, &symbols) {
+            eprintln!("malus: {}", e);
+            std::process::exit(1);
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = &typed;
+        eprintln!("malus: Metal runtime requires macOS");
         std::process::exit(1);
     }
 }

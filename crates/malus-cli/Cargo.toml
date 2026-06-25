@@ -13,4 +13,6 @@ malus-loader = { path = "../malus-loader" }
 malus-sema = { path = "../malus-sema" }
 malus-codegen-cpu = { path = "../malus-codegen-cpu" }
 malus-codegen-gpu = { path = "../malus-codegen-gpu" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
 malus-runtime = { path = "../malus-runtime" }

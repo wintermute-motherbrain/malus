@@ -5,7 +5,6 @@
 mod tests;
 
 use std::collections::HashMap;
-use std::sync::Mutex;
 
 use cranelift_codegen::ir::{AbiParam, Function, InstBuilder, Signature, UserFuncName};
 use cranelift_codegen::ir::types::{F32, I8, I16, I32, I64};
@@ -17,6 +16,17 @@ use cranelift_module::{DataDescription, FuncId, Linkage, Module};
 
 use malus_sema::{ResolvedTy, TypedExprKind, TypedFn, TypedProgram, TypedStmt};
 use malus_syntax::ast::{BinOp, Lit, ScalarTy, UnaryOp};
+
+// ── Runtime symbol injection ─────────────────────────────────────────────────
+
+#[repr(C)]
+pub struct RuntimeSymbols {
+    pub tensor_alloc_gpu: extern "C" fn(i32, i64, *const f32) -> i64,
+    pub tensor_free:      extern "C" fn(i64),
+    pub tensor_print:     extern "C" fn(i64),
+    pub kernel_dispatch:  extern "C" fn(*const u8, *const i64, i32) -> i64,
+    pub gpu_barrier:      extern "C" fn(),
+}
 
 // ── Error ─────────────────────────────────────────────────────────────────────
 
@@ -39,62 +49,7 @@ impl std::fmt::Display for CodegenError {
     }
 }
 
-// ── Runtime stubs ─────────────────────────────────────────────────────────────
-
-struct TensorStore {
-    data: HashMap<i64, Vec<f32>>,
-    next_id: i64,
-}
-
-impl TensorStore {
-    fn new() -> Self {
-        Self { data: HashMap::new(), next_id: 1 }
-    }
-
-    fn insert(&mut self, elements: Vec<f32>) -> i64 {
-        let id = self.next_id;
-        self.next_id += 1;
-        self.data.insert(id, elements);
-        id
-    }
-}
-
-static TENSOR_STORE: Mutex<Option<TensorStore>> = Mutex::new(None);
-
-fn with_store<R>(f: impl FnOnce(&mut TensorStore) -> R) -> R {
-    let mut guard = TENSOR_STORE.lock().unwrap_or_else(|e| e.into_inner());
-    f(guard.as_mut().expect("tensor store not initialized"))
-}
-
-extern "C" fn tensor_alloc_gpu(dtype: i32, len: i64, data: *const f32) -> i64 {
-    let _ = dtype;
-    let elements = if data.is_null() || len == 0 {
-        vec![]
-    } else {
-        unsafe { std::slice::from_raw_parts(data, len as usize).to_vec() }
-    };
-    with_store(|s| s.insert(elements))
-}
-
-extern "C" fn tensor_print(handle: i64) {
-    let elems = with_store(|s| s.data.get(&handle).cloned().unwrap_or_default());
-    print!("[");
-    for (i, v) in elems.iter().enumerate() {
-        if i > 0 { print!(", "); }
-        print!("{v}");
-    }
-    print!("]");
-}
-
-extern "C" fn tensor_free(handle: i64) {
-    with_store(|s| { s.data.remove(&handle); });
-}
-
-extern "C" fn kernel_dispatch(_name: *const u8, _handles: *const i64, _n: i32) -> i64 {
-    with_store(|s| s.insert(vec![]))
-}
-
-extern "C" fn gpu_barrier() {}
+// ── Host print helpers ───────────────────────────────────────────────────────
 
 extern "C" fn print_cstr(ptr: *const u8) {
     let s = unsafe { std::ffi::CStr::from_ptr(ptr as *const i8) };
@@ -639,12 +594,10 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
-pub fn compile_and_run(program: &TypedProgram) -> Result<(), CodegenError> {
+pub fn compile_and_run(program: &TypedProgram, symbols: &RuntimeSymbols) -> Result<(), CodegenError> {
     if !program.fns.iter().any(|f| f.name == "main") {
         return Err(CodegenError::NoMainFunction);
     }
-
-    *TENSOR_STORE.lock().unwrap() = Some(TensorStore::new());
 
     let mut flag_builder = settings::builder();
     flag_builder.set("use_colocated_libcalls", "false").unwrap();
@@ -657,11 +610,11 @@ pub fn compile_and_run(program: &TypedProgram) -> Result<(), CodegenError> {
         .map_err(|e| CodegenError::JitError(e.to_string()))?;
 
     let mut jit_builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
-    jit_builder.symbol("tensor_alloc_gpu", tensor_alloc_gpu as *const u8);
-    jit_builder.symbol("tensor_print",     tensor_print     as *const u8);
-    jit_builder.symbol("tensor_free",      tensor_free      as *const u8);
-    jit_builder.symbol("kernel_dispatch",  kernel_dispatch  as *const u8);
-    jit_builder.symbol("gpu_barrier",      gpu_barrier      as *const u8);
+    jit_builder.symbol("tensor_alloc_gpu", symbols.tensor_alloc_gpu as *const u8);
+    jit_builder.symbol("tensor_print",     symbols.tensor_print     as *const u8);
+    jit_builder.symbol("tensor_free",      symbols.tensor_free      as *const u8);
+    jit_builder.symbol("kernel_dispatch",  symbols.kernel_dispatch  as *const u8);
+    jit_builder.symbol("gpu_barrier",      symbols.gpu_barrier      as *const u8);
     jit_builder.symbol("print_cstr",       print_cstr       as *const u8);
     jit_builder.symbol("print_f32",        print_f32        as *const u8);
     jit_builder.symbol("print_i64",        print_i64        as *const u8);

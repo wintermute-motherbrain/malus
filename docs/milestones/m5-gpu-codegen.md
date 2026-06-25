@@ -52,7 +52,8 @@ Extend `malus-runtime` to:
    - `[device newComputePipelineStateWithFunction:error:]` → `MTLComputePipelineState`
    - Cache `MTLComputePipelineState` by `kernel_id`
 
-2. **Implement `kernel_dispatch`** (replaces the M4 stub):
+2. **Implement `kernel_dispatch`** (replaces the M4 stub wholesale):
+   - **ABI migration:** M4 preserved the M3 ABI (`name: *const u8, handles: *const i64, n: i32`). M5 migrates to `kernel_id: u64, handles: *const i64, count: usize` now that the `KernelRegistry` makes a `u64` id meaningful. This requires updating `malus-codegen-cpu`'s `RuntimeSymbols` struct and the `KernelCall` IR emission.
    - Allocate output buffer: `tensor_alloc_gpu(dtype, len, null)`
    - Encode a compute pass:
      - `[commandBuffer computeCommandEncoder]`
