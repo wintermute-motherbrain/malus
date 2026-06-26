@@ -12,59 +12,54 @@ CTMM (Compile-Time Memory Management) is malus's automatic memory model: escape 
 
 This covers the MVP's `add_tensors.ml` perfectly: all tensor flows are linear (no heap, no closures, no non-trivial escapes).
 
-## What is NOT implemented (v1 gaps)
+## Gap Summary
 
-### 1. RC fallback for structurally ambiguous lifetimes
-
-**Gap:** When a tensor is stored in a struct field, a dynamic array, or any heap-allocated container, its lifetime cannot be determined statically. CTMM's full model falls back to reference counting in these cases.
-
-**Current behavior:** Struct types are not supported in v0.1, so this case cannot arise. When structs are added in v1, tensors stored in struct fields will need RC insertion.
-
-**What's needed for v1:**
-- After type checking, classify each tensor binding: `Static` (last-use deterministic) or `Rc` (stored in a struct/container).
-- For `Rc` bindings, emit `rc_retain()` / `rc_release()` calls instead of `Drop`.
-- Runtime (`malus-runtime`) must implement a lightweight RC mechanism for tensor buffers.
-
-### 2. Escape through function return (cross-function analysis)
-
-**Gap:** v0.1 only tracks escapes within a single function body. A tensor returned from `make()` and used in `main()` is correctly not dropped in `make()` — but its lifetime in `main()` is tracked independently. This is correct for v0.1 (the caller receives ownership and last-use analysis runs on `main()`'s body separately). However, it will not correctly handle cases where ownership chains across more than two frames.
-
-**What's needed for v1:** Interprocedural escape analysis to track tensor ownership across call boundaries. In practice, this is only needed if a tensor is passed into a function that may or may not store it.
-
-### 3. Closure captures
-
-**Gap:** If malus adds closures or higher-order functions in v1, a tensor captured by a closure escapes its lexical scope. The current last-use analysis does not detect this.
-
-**What's needed for v1:** Closure capture analysis — any binding referenced in a closure body is treated as escaped.
-
-### 4. `inout` parameter tracking
-
-**Gap:** `inout` kernel parameters (v1 feature) mutate tensors in-place. CTMM should not insert a `Drop` for the input buffer in this case — it is the same buffer as the output. v0.1 does not handle `inout` because it is not in the MVP language.
-
-**What's needed for v1:** When a tensor is passed as `inout` to a kernel, mark it as "reused" — suppress `Drop` for that binding.
-
-### 5. Conditional last-use (branching)
-
-**Gap:** If/else branches are parsed but not yet exercised in the MVP. If a binding is used in one branch but not another, its true last-use may depend on the branch taken. v0.1's linear last-use analysis does not account for this.
-
-**What's needed for v1:** A proper liveness analysis (dataflow) that computes last-use per-branch and inserts `Drop` at join points where liveness drops to zero.
-
-### 6. Unbound temporaries from nested GPU-producing expressions
-
-**Gap:** When a nested expression like `a + b * c` is lowered in a `fn` body, the inner `b * c` dispatches `kernel_dispatch` and returns a handle that is never bound to a name (it's a temporary `Value` in Cranelift). CTMM's `find_last_uses` and `insert_drops` only track named bindings, so this intermediate tensor is never freed. This is pre-existing behavior — nested user kernel calls (e.g. `add(scale(a), b)`) leak the same way.
-
-**What's needed for v1:** Either desugar nested GPU-producing expressions into named `Let` bindings before CTMM (so the intermediate gets a `Drop`), or track raw `Value` lifetimes in codegen-cpu and emit `tensor_free` for temporaries.
-
-## Summary table
-
-| Scenario | v0.1 | v1 needed |
+| Gap | v0.1 behavior | V1 fix |
 |---|---|---|
-| Linear tensor flows in `fn main()` | Correct | — |
-| Tensor escapes via `return` | Correctly suppressed | — |
-| In-flight tensors via kernel dispatch | GpuBarrier + Drop | — |
-| Tensor stored in struct field | Not possible (structs are v1) | RC fallback |
-| Closure captures | Not possible (closures are v1) | Capture analysis |
-| `inout` kernel parameters | Not possible (inout is v1) | Suppress Drop |
-| Branching / if-else liveness | Unsound (last-use may be wrong) | Dataflow liveness |
-| Unbound temporaries (nested BinOps) | Leaked (no Drop inserted) | Desugar to `Let` or track `Value` lifetimes |
-| Cross-function ownership chains | Correct for simple cases | Interprocedural analysis |
+| Conditional last-use (if/else) | Unsound — last-use may be wrong per branch | M9: RC fallback for ambiguous paths |
+| Loop-carried tensor lifetimes | Not possible (no loops in v0.1) | M9: loop-body tensors dropped each iteration |
+| RC fallback for struct-stored tensors | Not possible (no structs in v0.1) | M10: tensor_retain on store, tensor_release on struct drop |
+| Unbound temporaries from nested BinOps | Leaked — no Drop inserted | M11: fix during integration testing |
+| Cross-function ownership chains | Correct for simple cases | Post-V1: interprocedural analysis |
+| Closure captures | Not possible (closures not planned) | Post-V1 if closures added |
+| `inout` parameter tracking | Not possible (inout is post-V1) | Post-V1: suppress Drop for inout inputs |
+
+## Gap Detail
+
+### 1. Conditional Last-Use (Branching) → M9
+
+**Problem:** The linear scan sees one last-use per binding across the entire function. With `if`/`else`, the "last use" might be inside one branch but not the other.
+
+**V1 fix (M9):** RC fallback for conditional paths. When a tensor binding's last use is ambiguous due to branching, CTMM emits `Retain` at the branch entry and `Release` at the end of each branch that is done with the binding. Static `Drop` is preserved for bindings whose last use is unambiguously in the linear part of the code. Full dataflow liveness analysis (which would reduce how often RC is needed) is a V2 optimization.
+
+### 2. Loop-Carried Tensor Lifetimes → M9
+
+**Problem:** Not possible in v0.1 (no loops), but: tensors created inside a loop body must be freed at the end of each iteration, not just at the end of the function.
+
+**V1 fix (M9):** Treat each loop body as a scope. Tensors created inside (`Let` statements in the body) are `Static`-dropped at the end of each iteration. Tensors created outside and used inside use RC fallback if their use inside the loop is ambiguous.
+
+### 3. RC Fallback for Struct-Stored Tensors → M10
+
+**Problem:** When a tensor is stored in a struct field, its lifetime is structurally ambiguous — the struct controls when it dies. CTMM cannot statically determine the drop point.
+
+**V1 fix (M10):** When a tensor binding is stored into a struct field during construction, emit `Retain`. When a struct binding goes out of scope, emit `Release` for each tensor field. Nested structs recurse. This uses the `tensor_retain`/`tensor_release` C ABI added in M9.
+
+### 4. Unbound Temporaries from Nested GPU Expressions → M11
+
+**Problem:** When `a + b * c` is lowered in a `fn` body, the inner `b * c` result is a temporary tensor that CTMM never frees (it's not a named binding). The `hoist_gpu_subexprs` pass creates synthetic `let __tmp_N = ...` bindings, but `find_last_uses` may not insert `Drop` for all of them correctly.
+
+**V1 fix (M11):** During integration testing of the backward pass expressions (many chained matmuls and transposes), trace all hoisted temporaries and verify `Drop` is inserted. Fix any remaining leaks before the done-when is considered passing.
+
+### 5. Cross-Function Ownership Chains → Post-V1
+
+**Problem:** v0.1 analyzes each function body independently. Ownership tracking across more than two call frames may be incorrect in edge cases.
+
+**V1 mitigation:** Tensors that flow through struct fields (cross-function via struct parameters) use RC, which handles the cross-frame case correctly. Post-V1: interprocedural escape analysis to reduce RC usage for non-struct cross-function flows.
+
+### 6. Closure Captures → Post-V1
+
+Closures are not planned for V1. When added, a tensor captured by a closure must be treated as escaped.
+
+### 7. `inout` Parameter Tracking → Post-V1
+
+`inout` is post-V1. When implemented, CTMM must suppress `Drop` for `inout` inputs — the caller retains ownership of the buffer.
