@@ -1,8 +1,8 @@
+use crate::{compile_and_run, CodegenError, RuntimeSymbols};
+use malus_sema::check;
+use malus_syntax::parse;
 use std::collections::HashMap;
 use std::sync::Mutex;
-use malus_syntax::parse;
-use malus_sema::check;
-use crate::{compile_and_run, CodegenError, RuntimeSymbols};
 
 // Tests share MOCK_STORE global state, so they must not run in parallel.
 static TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -16,7 +16,10 @@ struct MockStore {
 
 impl MockStore {
     fn new() -> Self {
-        Self { data: HashMap::new(), next_id: 1 }
+        Self {
+            data: HashMap::new(),
+            next_id: 1,
+        }
     }
 
     fn insert(&mut self, elements: Vec<f32>) -> i64 {
@@ -48,17 +51,21 @@ extern "C" fn mock_tensor_print(handle: i64) {
     let elems = with_store(|s| s.data.get(&handle).cloned().unwrap_or_default());
     print!("[");
     for (i, v) in elems.iter().enumerate() {
-        if i > 0 { print!(", "); }
+        if i > 0 {
+            print!(", ");
+        }
         print!("{v}");
     }
     print!("]");
 }
 
 extern "C" fn mock_tensor_free(handle: i64) {
-    with_store(|s| { s.data.remove(&handle); });
+    with_store(|s| {
+        s.data.remove(&handle);
+    });
 }
 
-extern "C" fn mock_kernel_dispatch(_name: *const u8, _handles: *const i64, _n: i32) -> i64 {
+extern "C" fn mock_kernel_dispatch(_kernel_id: u64, _handles: *const i64, _count: usize) -> i64 {
     with_store(|s| s.insert(vec![]))
 }
 
@@ -67,10 +74,10 @@ extern "C" fn mock_gpu_barrier() {}
 fn mock_symbols() -> RuntimeSymbols {
     RuntimeSymbols {
         tensor_alloc_gpu: mock_tensor_alloc_gpu,
-        tensor_free:      mock_tensor_free,
-        tensor_print:     mock_tensor_print,
-        kernel_dispatch:  mock_kernel_dispatch,
-        gpu_barrier:      mock_gpu_barrier,
+        tensor_free: mock_tensor_free,
+        tensor_print: mock_tensor_print,
+        kernel_dispatch: mock_kernel_dispatch,
+        gpu_barrier: mock_gpu_barrier,
     }
 }
 
@@ -80,8 +87,10 @@ fn run_src(src: &str) -> Result<(), CodegenError> {
     let program = parse(malus_syntax::FileId(0), src).expect("parse failed");
     let aliases = HashMap::new();
     let typed = check(&program, &aliases).expect("type check failed");
+    let (_registry, kernel_ids) =
+        malus_codegen_gpu::compile_kernels(&typed).expect("kernel compilation failed");
     let symbols = mock_symbols();
-    compile_and_run(&typed, &symbols)
+    compile_and_run(&typed, &symbols, &kernel_ids)
 }
 
 // ── Tensor alloc, print, and free ────────────────────────────────────────────
@@ -244,9 +253,11 @@ fn test_no_main_returns_error() {
     };
 
     let symbols = mock_symbols();
-    let result = compile_and_run(&typed, &symbols);
+    let kernel_ids = HashMap::new();
+    let result = compile_and_run(&typed, &symbols, &kernel_ids);
     assert!(
         matches!(result, Err(CodegenError::NoMainFunction)),
-        "expected NoMainFunction, got: {:?}", result
+        "expected NoMainFunction, got: {:?}",
+        result
     );
 }

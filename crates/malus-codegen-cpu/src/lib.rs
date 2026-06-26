@@ -24,7 +24,7 @@ pub struct RuntimeSymbols {
     pub tensor_alloc_gpu: extern "C" fn(i32, i64, *const f32) -> i64,
     pub tensor_free:      extern "C" fn(i64),
     pub tensor_print:     extern "C" fn(i64),
-    pub kernel_dispatch:  extern "C" fn(*const u8, *const i64, i32) -> i64,
+    pub kernel_dispatch:  extern "C" fn(u64, *const i64, usize) -> i64,
     pub gpu_barrier:      extern "C" fn(),
 }
 
@@ -35,6 +35,7 @@ pub enum CodegenError {
     NoMainFunction,
     UnsupportedExpr(String),
     UnsupportedType(String),
+    UnknownKernel { name: String },
     JitError(String),
 }
 
@@ -44,6 +45,7 @@ impl std::fmt::Display for CodegenError {
             CodegenError::NoMainFunction => write!(f, "no fn main() found"),
             CodegenError::UnsupportedExpr(s) => write!(f, "unsupported expression: {s}"),
             CodegenError::UnsupportedType(s) => write!(f, "unsupported type: {s}"),
+            CodegenError::UnknownKernel { name } => write!(f, "unknown kernel: {name}"),
             CodegenError::JitError(s) => write!(f, "JIT error: {s}"),
         }
     }
@@ -132,6 +134,7 @@ fn is_float_scalar(s: &ScalarTy) -> bool {
 struct Codegen<'m> {
     module: &'m mut JITModule,
     func_ids: HashMap<String, FuncId>,
+    kernel_ids: &'m HashMap<String, u64>,
     rt_tensor_alloc_gpu: FuncId,
     rt_tensor_print: FuncId,
     rt_tensor_free: FuncId,
@@ -383,8 +386,9 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
             }
 
             TypedExprKind::KernelCall { callee, args, .. } => {
+                let kernel_id = *self.codegen.kernel_ids.get(callee)
+                    .ok_or_else(|| CodegenError::UnknownKernel { name: callee.clone() })?;
                 let n = args.len() as u32;
-                // Stack slot for the handles array (n * 8 bytes, 8-byte aligned).
                 let slot = self.builder.create_sized_stack_slot(
                     cranelift_codegen::ir::StackSlotData::new(
                         cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
@@ -397,12 +401,12 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                     self.builder.ins().stack_store(val, slot, (i as i32) * 8);
                 }
 
-                let name_ptr = self.emit_static_cstr(callee);
+                let id_val = self.builder.ins().iconst(I64, kernel_id as i64);
                 let handles_ptr = self.builder.ins().stack_addr(self.codegen.ptr_type(), slot, 0);
-                let n_val = self.builder.ins().iconst(I32, n as i64);
+                let n_val = self.builder.ins().iconst(self.codegen.ptr_type(), n as i64);
 
                 let dispatch_ref = self.import_func(self.codegen.rt_kernel_dispatch);
-                let call = self.builder.ins().call(dispatch_ref, &[name_ptr, handles_ptr, n_val]);
+                let call = self.builder.ins().call(dispatch_ref, &[id_val, handles_ptr, n_val]);
                 let results = self.builder.inst_results(call).to_vec();
                 Ok(results[0])
             }
@@ -594,7 +598,11 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
-pub fn compile_and_run(program: &TypedProgram, symbols: &RuntimeSymbols) -> Result<(), CodegenError> {
+pub fn compile_and_run(
+    program: &TypedProgram,
+    symbols: &RuntimeSymbols,
+    kernel_ids: &HashMap<String, u64>,
+) -> Result<(), CodegenError> {
     if !program.fns.iter().any(|f| f.name == "main") {
         return Err(CodegenError::NoMainFunction);
     }
@@ -645,9 +653,9 @@ pub fn compile_and_run(program: &TypedProgram, symbols: &RuntimeSymbols) -> Resu
     };
     let sig_dispatch = {
         let mut s = Signature::new(call_conv);
+        s.params.push(AbiParam::new(I64));
         s.params.push(AbiParam::new(ptr));
         s.params.push(AbiParam::new(ptr));
-        s.params.push(AbiParam::new(I32));
         s.returns.push(AbiParam::new(I64));
         s
     };
@@ -712,6 +720,7 @@ pub fn compile_and_run(program: &TypedProgram, symbols: &RuntimeSymbols) -> Resu
     let mut cg = Codegen {
         module: &mut module,
         func_ids,
+        kernel_ids,
         rt_tensor_alloc_gpu,
         rt_tensor_print,
         rt_tensor_free,

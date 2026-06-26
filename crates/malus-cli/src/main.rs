@@ -32,6 +32,16 @@ fn run_script(path: &str) {
 
     #[cfg(target_os = "macos")]
     {
+        let (registry, kernel_ids) = match malus_codegen_gpu::compile_kernels(&typed) {
+            Ok(result) => result,
+            Err(e) => {
+                eprintln!("malus: {}", e);
+                std::process::exit(1);
+            }
+        };
+
+        malus_runtime::runtime_init(&registry.into_hashmap());
+
         let symbols = malus_codegen_cpu::RuntimeSymbols {
             tensor_alloc_gpu: malus_runtime::tensor_alloc_gpu,
             tensor_free: malus_runtime::tensor_free,
@@ -39,7 +49,7 @@ fn run_script(path: &str) {
             kernel_dispatch: malus_runtime::kernel_dispatch,
             gpu_barrier: malus_runtime::gpu_barrier,
         };
-        if let Err(e) = malus_codegen_cpu::compile_and_run(&typed, &symbols) {
+        if let Err(e) = malus_codegen_cpu::compile_and_run(&typed, &symbols, &kernel_ids) {
             eprintln!("malus: {}", e);
             std::process::exit(1);
         }

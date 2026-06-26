@@ -41,7 +41,12 @@ Whether a tensor is logically associated with CPU or GPU. Explicit at creation, 
 _Avoid_: Device, location
 
 **In-flight tensor**:
-A tensor that has been passed to a kernel that is still executing asynchronously. The compiler inserts a GPU barrier before freeing an in-flight tensor.
+A tensor that has been passed to a kernel whose GPU work has not yet been committed. The compiler inserts a GPU barrier before any CPU-side access (free, read, or return) of an in-flight tensor.
+_Avoid_: Pending input, GPU-active tensor
+
+**Pending tensor**:
+A tensor produced by a kernel whose GPU work has not yet been committed. CPU reads of a pending tensor return stale data unless preceded by a GPU barrier.
+_Avoid_: Pending output, uncommitted tensor
 
 ### Kernel mechanics
 

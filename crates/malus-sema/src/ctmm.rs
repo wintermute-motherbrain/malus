@@ -10,62 +10,110 @@ pub fn annotate_fns(fns: &mut Vec<TypedFn>) {
     }
 }
 
-/// For each local tensor binding in the body, find its last use, then inject
-/// a Drop (and GpuBarrier if in-flight) immediately after that statement.
 fn annotate_body(body: &mut Vec<TypedStmt>) {
-    // Determine which bindings are defined locally (excluding params — those are
-    // injected by the caller and tracked separately).
-    // We only inject Drop for `let` bindings within this body.
     let local_bindings = collect_local_bindings(body);
-
-    // Collect the set of bindings that escape (appear in a Return expr).
     let escaping = collect_escaping(body);
-
-    // For each non-escaping local binding, find the index of its last use.
     let last_uses = find_last_uses(body, &local_bindings, &escaping);
 
-    // Track which bindings were passed to a KernelCall (in-flight).
-    let in_flight_bindings = collect_in_flight(body);
+    insert_drops(body, &last_uses);
+    insert_barriers(body);
+}
 
-    // Group drops by their last-use statement index.
-    // For each group, emit one GpuBarrier (if any drop is in-flight) then all Drops.
-    let mut by_idx: HashMap<usize, (bool, Vec<String>)> = HashMap::new();
-    for (name, last_idx) in &last_uses {
-        let entry = by_idx.entry(*last_idx).or_insert((false, Vec::new()));
-        if in_flight_bindings.contains(name) {
-            entry.0 = true; // needs a barrier
-        }
-        entry.1.push(name.clone());
+// ── Phase 1: Drop insertion ───────────────────────────────────────────────────
+
+fn insert_drops(body: &mut Vec<TypedStmt>, last_uses: &HashMap<String, usize>) {
+    let mut by_idx: HashMap<usize, Vec<String>> = HashMap::new();
+    for (name, last_idx) in last_uses {
+        by_idx.entry(*last_idx).or_default().push(name.clone());
     }
 
-    // Sort indices descending so insertions don't shift earlier positions.
     let mut indices: Vec<usize> = by_idx.keys().copied().collect();
     indices.sort_by(|a, b| b.cmp(a));
 
     for idx in indices {
-        let (needs_barrier, mut names) = by_idx.remove(&idx).unwrap();
-        names.sort(); // deterministic ordering
+        let mut names = by_idx.remove(&idx).unwrap();
+        names.sort();
         let insert_pos = idx + 1;
-        let mut offset = 0;
-        if needs_barrier {
-            body.insert(insert_pos, TypedStmt::GpuBarrier);
-            offset += 1;
-        }
-        for name in names {
-            body.insert(insert_pos + offset, TypedStmt::Drop { name });
-            offset += 1;
+        for (offset, name) in names.iter().enumerate() {
+            body.insert(insert_pos + offset, TypedStmt::Drop { name: name.clone() });
         }
     }
 }
 
-/// Collect the names of all `let` bindings defined in the body.
+// ── Phase 2: Barrier insertion (GPU-pending set) ──────────────────────────────
+
+fn insert_barriers(body: &mut Vec<TypedStmt>) {
+    let mut pending: HashSet<String> = HashSet::new();
+    let mut i = 0;
+    while i < body.len() {
+        if matches!(body[i], TypedStmt::GpuBarrier) {
+            pending.clear();
+            i += 1;
+            continue;
+        }
+
+        if let Some((in_flight, output_name)) = extract_kernel_call(&body[i]) {
+            for n in in_flight {
+                pending.insert(n.clone());
+            }
+            if let Some(name) = output_name {
+                pending.insert(name.to_string());
+            }
+            if matches!(body[i], TypedStmt::Return { .. }) {
+                body.insert(i, TypedStmt::GpuBarrier);
+                pending.clear();
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+
+        let mut referenced = HashSet::new();
+        collect_idents_in_stmt(&body[i], &mut referenced);
+        if referenced.intersection(&pending).next().is_some() {
+            body.insert(i, TypedStmt::GpuBarrier);
+            pending.clear();
+            i += 1;
+        }
+        i += 1;
+    }
+}
+
+fn extract_kernel_call<'a>(stmt: &'a TypedStmt) -> Option<(&'a Vec<String>, Option<&'a str>)> {
+    match stmt {
+        TypedStmt::Let { name, expr } => {
+            if let TypedExprKind::KernelCall { in_flight, .. } = &expr.kind {
+                Some((in_flight, Some(name)))
+            } else {
+                None
+            }
+        }
+        TypedStmt::Expr(expr) => {
+            if let TypedExprKind::KernelCall { in_flight, .. } = &expr.kind {
+                Some((in_flight, None))
+            } else {
+                None
+            }
+        }
+        TypedStmt::Return { expr } => {
+            if let TypedExprKind::KernelCall { in_flight, .. } = &expr.kind {
+                Some((in_flight, None))
+            } else {
+                None
+            }
+        }
+        TypedStmt::Drop { .. } | TypedStmt::GpuBarrier => None,
+    }
+}
+
+// ── Binding collection helpers ────────────────────────────────────────────────
+
 fn collect_local_bindings(body: &[TypedStmt]) -> HashSet<String> {
     body.iter().filter_map(|s| {
         if let TypedStmt::Let { name, .. } = s { Some(name.clone()) } else { None }
     }).collect()
 }
 
-/// Collect binding names that appear in a Return expression.
 fn collect_escaping(body: &[TypedStmt]) -> HashSet<String> {
     let mut escaping = HashSet::new();
     for stmt in body {
@@ -76,7 +124,6 @@ fn collect_escaping(body: &[TypedStmt]) -> HashSet<String> {
     escaping
 }
 
-/// Find the last statement index at which each (non-escaping) local binding is used.
 fn find_last_uses(
     body: &[TypedStmt],
     locals: &HashSet<String>,
@@ -93,50 +140,6 @@ fn find_last_uses(
         }
     }
     last
-}
-
-/// Collect all binding names passed to a KernelCall anywhere in the body.
-fn collect_in_flight(body: &[TypedStmt]) -> HashSet<String> {
-    let mut in_flight = HashSet::new();
-    for stmt in body {
-        collect_in_flight_stmt(stmt, &mut in_flight);
-    }
-    in_flight
-}
-
-fn collect_in_flight_stmt(stmt: &TypedStmt, out: &mut HashSet<String>) {
-    match stmt {
-        TypedStmt::Let { expr, .. } => collect_in_flight_expr(expr, out),
-        TypedStmt::Return { expr } => collect_in_flight_expr(expr, out),
-        TypedStmt::Expr(expr) => collect_in_flight_expr(expr, out),
-        TypedStmt::Drop { .. } | TypedStmt::GpuBarrier => {}
-    }
-}
-
-fn collect_in_flight_expr(expr: &crate::typed_ir::TypedExpr, out: &mut HashSet<String>) {
-    match &expr.kind {
-        TypedExprKind::KernelCall { in_flight, args, .. } => {
-            out.extend(in_flight.iter().cloned());
-            for arg in args { collect_in_flight_expr(arg, out); }
-        }
-        TypedExprKind::BinOp { lhs, rhs, .. } => {
-            collect_in_flight_expr(lhs, out);
-            collect_in_flight_expr(rhs, out);
-        }
-        TypedExprKind::Unary { operand, .. } => collect_in_flight_expr(operand, out),
-        TypedExprKind::Call { args, .. } => {
-            for arg in args { collect_in_flight_expr(arg, out); }
-        }
-        TypedExprKind::TensorLiteral { elements, .. } => {
-            for e in elements { collect_in_flight_expr(e, out); }
-        }
-        TypedExprKind::Index { base, indices } => {
-            collect_in_flight_expr(base, out);
-            for i in indices { collect_in_flight_expr(i, out); }
-        }
-        TypedExprKind::FieldAccess { base, .. } => collect_in_flight_expr(base, out),
-        TypedExprKind::Lit(_) | TypedExprKind::Ident(_) => {}
-    }
 }
 
 // ── Identifier collectors ─────────────────────────────────────────────────────

@@ -5,3 +5,4 @@ edition = "2021"
 
 [dependencies]
 malus-sema = { path = "../malus-sema" }
+malus-syntax = { path = "../malus-syntax" }

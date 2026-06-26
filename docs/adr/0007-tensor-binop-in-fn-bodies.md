@@ -23,7 +23,7 @@ Both options require infrastructure that does not exist until M5 (GPU codegen) o
 
 ## When to revisit
 
-During M5 (GPU codegen) or when adding the element-wise stdlib kernel suite. At that point, tensor BinOp in `fn` bodies should lower to a `kernel_dispatch` call to a built-in element-wise kernel, consistent with how user-written kernels are dispatched.
+Deferred to M5.1 (follow-up to M5 GPU codegen). M5 delivers the `KernelRegistry` and `kernel_dispatch` infrastructure that built-in element-wise kernels require. At that point, tensor BinOp in `fn` bodies should lower to a `kernel_dispatch` call to a built-in element-wise kernel, consistent with how user-written kernels are dispatched. See `docs/milestones/m5.1-builtin-elementwise-kernels.md`.
 
 ## Considered Options
 

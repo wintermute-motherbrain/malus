@@ -340,6 +340,7 @@ dependencies = [
  "cranelift-jit",
  "cranelift-module",
  "cranelift-native",
+ "malus-codegen-gpu",
  "malus-sema",
  "malus-syntax",
 ]
@@ -349,6 +350,7 @@ name = "malus-codegen-gpu"
 version = "0.1.0"
 dependencies = [
  "malus-sema",
+ "malus-syntax",
 ]
 
 [[package]]
@@ -362,7 +364,9 @@ dependencies = [
 name = "malus-runtime"
 version = "0.1.0"
 dependencies = [
+ "foreign-types",
  "metal",
+ "objc",
 ]
 
 [[package]]
