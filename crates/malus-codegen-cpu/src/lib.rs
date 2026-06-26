@@ -14,8 +14,8 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{DataDescription, FuncId, Linkage, Module};
 
-use malus_sema::{ResolvedTy, TypedExprKind, TypedFn, TypedProgram, TypedStmt};
-use malus_syntax::ast::{BinOp, Lit, ScalarTy, UnaryOp};
+use malus_sema::{ResolvedTy, TypedExpr, TypedExprKind, TypedFn, TypedProgram, TypedStmt};
+use malus_syntax::ast::{elementwise_builtin_name, BinOp, Lit, ScalarTy, UnaryOp};
 
 // ── Runtime symbol injection ─────────────────────────────────────────────────
 
@@ -283,6 +283,36 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
         self.codegen.module.declare_func_in_func(func_id, self.builder.func)
     }
 
+    fn lower_kernel_dispatch(
+        &mut self,
+        callee: &str,
+        args: &[&TypedExpr],
+    ) -> Result<cranelift_codegen::ir::Value, CodegenError> {
+        let kernel_id = *self.codegen.kernel_ids.get(callee)
+            .ok_or_else(|| CodegenError::UnknownKernel { name: callee.to_string() })?;
+        let n = args.len() as u32;
+        let slot = self.builder.create_sized_stack_slot(
+            cranelift_codegen::ir::StackSlotData::new(
+                cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                n * 8,
+                3,
+            )
+        );
+        for (i, arg) in args.iter().enumerate() {
+            let val = self.lower_expr(arg)?;
+            self.builder.ins().stack_store(val, slot, (i as i32) * 8);
+        }
+
+        let id_val = self.builder.ins().iconst(I64, kernel_id as i64);
+        let handles_ptr = self.builder.ins().stack_addr(self.codegen.ptr_type(), slot, 0);
+        let n_val = self.builder.ins().iconst(self.codegen.ptr_type(), n as i64);
+
+        let dispatch_ref = self.import_func(self.codegen.rt_kernel_dispatch);
+        let call = self.builder.ins().call(dispatch_ref, &[id_val, handles_ptr, n_val]);
+        let results = self.builder.inst_results(call).to_vec();
+        Ok(results[0])
+    }
+
     fn lower_expr(&mut self, expr: &malus_sema::TypedExpr) -> Result<cranelift_codegen::ir::Value, CodegenError> {
         match &expr.kind {
             TypedExprKind::Lit(lit) => self.lower_lit(lit, &expr.ty),
@@ -291,8 +321,15 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
 
             TypedExprKind::BinOp { op, lhs, rhs } => {
                 match &lhs.ty {
+                    ResolvedTy::Tensor { dtype } if *dtype == ScalarTy::F32 => {
+                        if let Some(name) = elementwise_builtin_name(op) {
+                            self.lower_kernel_dispatch(name, &[lhs.as_ref(), rhs.as_ref()])
+                        } else {
+                            Err(CodegenError::UnsupportedExpr(format!("binop {:?} on tensors not supported", op)))
+                        }
+                    }
                     ResolvedTy::Tensor { .. } => Err(CodegenError::UnsupportedExpr(
-                        "tensor BinOp in host fns not yet supported (pending language design on MPS dispatch)".into()
+                        "non-f32 tensor BinOp not yet supported".into()
                     )),
                     ResolvedTy::Scalar(s) => {
                         let l = self.lower_expr(lhs)?;
@@ -386,29 +423,8 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
             }
 
             TypedExprKind::KernelCall { callee, args, .. } => {
-                let kernel_id = *self.codegen.kernel_ids.get(callee)
-                    .ok_or_else(|| CodegenError::UnknownKernel { name: callee.clone() })?;
-                let n = args.len() as u32;
-                let slot = self.builder.create_sized_stack_slot(
-                    cranelift_codegen::ir::StackSlotData::new(
-                        cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
-                        n * 8,
-                        3,
-                    )
-                );
-                for (i, arg) in args.iter().enumerate() {
-                    let val = self.lower_expr(arg)?;
-                    self.builder.ins().stack_store(val, slot, (i as i32) * 8);
-                }
-
-                let id_val = self.builder.ins().iconst(I64, kernel_id as i64);
-                let handles_ptr = self.builder.ins().stack_addr(self.codegen.ptr_type(), slot, 0);
-                let n_val = self.builder.ins().iconst(self.codegen.ptr_type(), n as i64);
-
-                let dispatch_ref = self.import_func(self.codegen.rt_kernel_dispatch);
-                let call = self.builder.ins().call(dispatch_ref, &[id_val, handles_ptr, n_val]);
-                let results = self.builder.inst_results(call).to_vec();
-                Ok(results[0])
+                let arg_refs: Vec<&TypedExpr> = args.iter().collect();
+                self.lower_kernel_dispatch(callee, &arg_refs)
             }
 
             TypedExprKind::TensorLiteral { dtype, elements, .. } => {

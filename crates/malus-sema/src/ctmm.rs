@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
-use crate::typed_ir::{TypedExprKind, TypedFn, TypedStmt};
+use malus_syntax::ast::Placement;
+use crate::typed_ir::{TypedExpr, TypedExprKind, TypedFn, TypedStmt};
 
 /// CTMM: run last-use analysis on all fn bodies, injecting Drop and GpuBarrier nodes.
 /// Kernel bodies are skipped — kernels borrow their inputs and return new owned tensors;
@@ -11,12 +12,186 @@ pub fn annotate_fns(fns: &mut Vec<TypedFn>) {
 }
 
 fn annotate_body(body: &mut Vec<TypedStmt>) {
+    hoist_gpu_subexprs(body);
+    hoist_gpu_producing_returns(body);
     let local_bindings = collect_local_bindings(body);
     let escaping = collect_escaping(body);
     let last_uses = find_last_uses(body, &local_bindings, &escaping);
 
     insert_drops(body, &last_uses);
     insert_barriers(body);
+}
+
+fn is_gpu_producing(expr: &TypedExpr) -> bool {
+    matches!(&expr.kind, TypedExprKind::KernelCall { .. })
+        || matches!(&expr.kind, TypedExprKind::BinOp { lhs, .. } if lhs.ty.is_tensor())
+        || matches!(&expr.kind, TypedExprKind::Call { .. } if expr.ty.is_tensor() && expr.placement == Some(Placement::Gpu))
+}
+
+fn hoist_gpu_subexprs(body: &mut Vec<TypedStmt>) {
+    let mut counter = 0u32;
+    let mut result: Vec<TypedStmt> = Vec::with_capacity(body.len());
+    for stmt in body.drain(..) {
+        match stmt {
+            TypedStmt::Let { name, expr } => {
+                let mut hoisted = Vec::new();
+                let expr = hoist_gpu_in_expr(expr, &mut hoisted, &mut counter);
+                result.extend(hoisted);
+                result.push(TypedStmt::Let { name, expr });
+            }
+            TypedStmt::Return { expr } => {
+                let mut hoisted = Vec::new();
+                let expr = hoist_gpu_in_expr(expr, &mut hoisted, &mut counter);
+                result.extend(hoisted);
+                result.push(TypedStmt::Return { expr });
+            }
+            TypedStmt::Expr(expr) => {
+                let mut hoisted = Vec::new();
+                let expr = hoist_gpu_in_expr(expr, &mut hoisted, &mut counter);
+                result.extend(hoisted);
+                result.push(TypedStmt::Expr(expr));
+            }
+            other => result.push(other),
+        }
+    }
+    *body = result;
+}
+
+fn hoist_gpu_in_expr(
+    expr: TypedExpr,
+    hoisted: &mut Vec<TypedStmt>,
+    counter: &mut u32,
+) -> TypedExpr {
+    let span = expr.span;
+    match expr.kind {
+        TypedExprKind::Call { callee, args } => {
+            let new_args = hoist_args(args, hoisted, counter);
+            TypedExpr {
+                kind: TypedExprKind::Call { callee, args: new_args },
+                span,
+                ..expr
+            }
+        }
+        TypedExprKind::KernelCall { callee, args, in_flight } => {
+            let new_args = hoist_args(args, hoisted, counter);
+            TypedExpr {
+                kind: TypedExprKind::KernelCall { callee, args: new_args, in_flight },
+                span,
+                ..expr
+            }
+        }
+        TypedExprKind::BinOp { op, lhs, rhs } => {
+            TypedExpr {
+                kind: TypedExprKind::BinOp {
+                    op,
+                    lhs: Box::new(hoist_gpu_in_expr(*lhs, hoisted, counter)),
+                    rhs: Box::new(hoist_gpu_in_expr(*rhs, hoisted, counter)),
+                },
+                span,
+                ..expr
+            }
+        }
+        TypedExprKind::Unary { op, operand } => {
+            TypedExpr {
+                kind: TypedExprKind::Unary {
+                    op,
+                    operand: Box::new(hoist_gpu_in_expr(*operand, hoisted, counter)),
+                },
+                span,
+                ..expr
+            }
+        }
+        TypedExprKind::TensorLiteral { placement, dtype, elements } => {
+            let new_elements = elements
+                .into_iter()
+                .map(|e| hoist_gpu_in_expr(e, hoisted, counter))
+                .collect();
+            TypedExpr {
+                kind: TypedExprKind::TensorLiteral { placement, dtype, elements: new_elements },
+                span,
+                ..expr
+            }
+        }
+        TypedExprKind::Index { base, indices } => {
+            let new_base = Box::new(hoist_gpu_in_expr(*base, hoisted, counter));
+            let new_indices = indices
+                .into_iter()
+                .map(|i| hoist_gpu_in_expr(i, hoisted, counter))
+                .collect();
+            TypedExpr {
+                kind: TypedExprKind::Index { base: new_base, indices: new_indices },
+                span,
+                ..expr
+            }
+        }
+        TypedExprKind::FieldAccess { base, field } => {
+            TypedExpr {
+                kind: TypedExprKind::FieldAccess {
+                    base: Box::new(hoist_gpu_in_expr(*base, hoisted, counter)),
+                    field,
+                },
+                span,
+                ..expr
+            }
+        }
+        _ => expr,
+    }
+}
+
+fn hoist_args(
+    args: Vec<TypedExpr>,
+    hoisted: &mut Vec<TypedStmt>,
+    counter: &mut u32,
+) -> Vec<TypedExpr> {
+    let mut new_args = Vec::with_capacity(args.len());
+    for arg in args {
+        let arg = hoist_gpu_in_expr(arg, hoisted, counter);
+        if is_gpu_producing(&arg) && arg.ty.is_tensor() {
+            let name = format!("__malus_tmp_{}", counter);
+            *counter += 1;
+            let ty = arg.ty.clone();
+            let placement = arg.placement;
+            let span = arg.span;
+            hoisted.push(TypedStmt::Let { name: name.clone(), expr: arg });
+            new_args.push(TypedExpr {
+                kind: TypedExprKind::Ident(name),
+                ty,
+                placement,
+                span,
+            });
+        } else {
+            new_args.push(arg);
+        }
+    }
+    new_args
+}
+
+fn hoist_gpu_producing_returns(body: &mut Vec<TypedStmt>) {
+    let mut i = 0;
+    let mut counter = 0u32;
+    while i < body.len() {
+        if let TypedStmt::Return { expr } = &body[i] {
+            if is_gpu_producing(expr) && expr.ty.is_tensor() {
+                let expr = if let TypedStmt::Return { expr } = body.remove(i) { expr } else { unreachable!() };
+                let name = format!("__malus_ret_{}", counter);
+                counter += 1;
+                let ret_ty = expr.ty.clone();
+                let span = expr.span;
+                body.insert(i, TypedStmt::Let { name: name.clone(), expr });
+                body.insert(i + 1, TypedStmt::Return {
+                    expr: TypedExpr {
+                        kind: TypedExprKind::Ident(name.clone()),
+                        ty: ret_ty,
+                        placement: None,
+                        span,
+                    },
+                });
+                i += 2;
+                continue;
+            }
+        }
+        i += 1;
+    }
 }
 
 // ── Phase 1: Drop insertion ───────────────────────────────────────────────────
@@ -52,12 +227,12 @@ fn insert_barriers(body: &mut Vec<TypedStmt>) {
             continue;
         }
 
-        if let Some((in_flight, output_name)) = extract_kernel_call(&body[i]) {
-            for n in in_flight {
+        if let Some((in_flight, output_name)) = extract_gpu_producing_expr(&body[i]) {
+            for n in &in_flight {
                 pending.insert(n.clone());
             }
             if let Some(name) = output_name {
-                pending.insert(name.to_string());
+                pending.insert(name);
             }
             if matches!(body[i], TypedStmt::Return { .. }) {
                 body.insert(i, TypedStmt::GpuBarrier);
@@ -79,30 +254,30 @@ fn insert_barriers(body: &mut Vec<TypedStmt>) {
     }
 }
 
-fn extract_kernel_call<'a>(stmt: &'a TypedStmt) -> Option<(&'a Vec<String>, Option<&'a str>)> {
-    match stmt {
-        TypedStmt::Let { name, expr } => {
-            if let TypedExprKind::KernelCall { in_flight, .. } = &expr.kind {
-                Some((in_flight, Some(name)))
-            } else {
-                None
-            }
+fn extract_gpu_producing_expr(stmt: &TypedStmt) -> Option<(Vec<String>, Option<String>)> {
+    let (expr, output_name) = match stmt {
+        TypedStmt::Let { name, expr } => (expr, Some(name.clone())),
+        TypedStmt::Expr(expr) => (expr, None),
+        TypedStmt::Return { expr } => (expr, None),
+        TypedStmt::Drop { .. } | TypedStmt::GpuBarrier => return None,
+    };
+    match &expr.kind {
+        TypedExprKind::KernelCall { in_flight, .. } => {
+            Some((in_flight.clone(), output_name))
         }
-        TypedStmt::Expr(expr) => {
-            if let TypedExprKind::KernelCall { in_flight, .. } = &expr.kind {
-                Some((in_flight, None))
-            } else {
-                None
-            }
+        TypedExprKind::BinOp { lhs, .. } if lhs.ty.is_tensor() => {
+            let mut idents = HashSet::new();
+            collect_idents_in_expr(expr, &mut idents);
+            Some((idents.into_iter().collect(), output_name))
         }
-        TypedStmt::Return { expr } => {
-            if let TypedExprKind::KernelCall { in_flight, .. } = &expr.kind {
-                Some((in_flight, None))
-            } else {
-                None
+        TypedExprKind::Call { args, .. } if expr.ty.is_tensor() && expr.placement == Some(Placement::Gpu) => {
+            let mut idents = HashSet::new();
+            for a in args {
+                collect_idents_in_expr(a, &mut idents);
             }
+            Some((idents.into_iter().collect(), output_name))
         }
-        TypedStmt::Drop { .. } | TypedStmt::GpuBarrier => None,
+        _ => None,
     }
 }
 

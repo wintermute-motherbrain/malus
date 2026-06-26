@@ -2,10 +2,12 @@ use crate::{compile_and_run, CodegenError, RuntimeSymbols};
 use malus_sema::check;
 use malus_syntax::parse;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 // Tests share MOCK_STORE global state, so they must not run in parallel.
 static TEST_LOCK: Mutex<()> = Mutex::new(());
+static MOCK_DISPATCH_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 // ── Mock runtime (HashMap-backed, replicates the M3 stubs) ────────────────────
 
@@ -65,8 +67,14 @@ extern "C" fn mock_tensor_free(handle: i64) {
     });
 }
 
-extern "C" fn mock_kernel_dispatch(_kernel_id: u64, _handles: *const i64, _count: usize) -> i64 {
-    with_store(|s| s.insert(vec![]))
+extern "C" fn mock_kernel_dispatch(_kernel_id: u64, handles: *const i64, count: usize) -> i64 {
+    MOCK_DISPATCH_COUNT.fetch_add(1, Ordering::SeqCst);
+    let len = if count < 1 || handles.is_null() {
+        0
+    } else {
+        with_store(|s| s.data.get(unsafe { &*handles }).map(|v| v.len()).unwrap_or(0))
+    };
+    with_store(|s| s.insert(vec![1.0; len.max(1)]))
 }
 
 extern "C" fn mock_gpu_barrier() {}
@@ -84,6 +92,7 @@ fn mock_symbols() -> RuntimeSymbols {
 fn run_src(src: &str) -> Result<(), CodegenError> {
     let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     *MOCK_STORE.lock().unwrap() = Some(MockStore::new());
+    MOCK_DISPATCH_COUNT.store(0, Ordering::SeqCst);
     let program = parse(malus_syntax::FileId(0), src).expect("parse failed");
     let aliases = HashMap::new();
     let typed = check(&program, &aliases).expect("type check failed");
@@ -91,6 +100,10 @@ fn run_src(src: &str) -> Result<(), CodegenError> {
         malus_codegen_gpu::compile_kernels(&typed).expect("kernel compilation failed");
     let symbols = mock_symbols();
     compile_and_run(&typed, &symbols, &kernel_ids)
+}
+
+fn dispatch_count() -> usize {
+    MOCK_DISPATCH_COUNT.load(Ordering::SeqCst)
 }
 
 // ── Tensor alloc, print, and free ────────────────────────────────────────────
@@ -258,6 +271,72 @@ fn test_no_main_returns_error() {
     assert!(
         matches!(result, Err(CodegenError::NoMainFunction)),
         "expected NoMainFunction, got: {:?}",
+        result
+    );
+}
+
+// ── M5.1: fn-body tensor BinOp dispatches to built-in kernel ──────────────────
+
+#[test]
+fn test_fn_body_tensor_add_dispatches_once() {
+    let src = r#"
+fn main():
+    let a = Tensor.gpu<f32>([1.0, 2.0, 3.0, 4.0])
+    let b = Tensor.gpu<f32>([5.0, 6.0, 7.0, 8.0])
+    let c = a + b
+    print(c)
+"#;
+    run_src(src).expect("fn-body tensor add should compile and run");
+    assert_eq!(dispatch_count(), 1, "a + b in fn body should dispatch one builtin kernel");
+}
+
+#[test]
+fn test_chained_binops_dispatch_twice() {
+    let src = r#"
+fn main():
+    let a = Tensor.gpu<f32>([1.0, 2.0])
+    let b = Tensor.gpu<f32>([3.0, 4.0])
+    let c = Tensor.gpu<f32>([5.0, 6.0])
+    let r = a + b * c
+    print(r)
+"#;
+    run_src(src).expect("chained fn-body BinOps should compile and run");
+    assert_eq!(dispatch_count(), 2, "a + b * c should dispatch two builtin kernels");
+}
+
+#[test]
+fn test_mixed_builtin_and_user_kernel_dispatch() {
+    let src = r#"
+fn main():
+    let a = Tensor.gpu<f32>([1.0, 2.0])
+    let b = Tensor.gpu<f32>([3.0, 4.0])
+    let c = add(a, b)
+    let d = c + a
+    print(d)
+
+kernel add(a: Tensor<f32>, b: Tensor<f32>) -> Tensor<f32>:
+    return a + b
+"#;
+    run_src(src).expect("mixed user kernel + builtin should compile and run");
+    assert_eq!(dispatch_count(), 2, "user kernel + builtin add should dispatch twice");
+}
+
+#[test]
+fn test_non_f32_tensor_binop_rejected() {
+    let src = r#"
+fn add(a: Tensor<f16>, b: Tensor<f16>) -> Tensor<f16>:
+    return a + b
+
+fn main():
+    let a = Tensor.gpu<f16>([1.0, 2.0])
+    let b = Tensor.gpu<f16>([3.0, 4.0])
+    let c = add(a, b)
+    print(c)
+"#;
+    let result = run_src(src);
+    assert!(
+        matches!(result, Err(CodegenError::UnsupportedExpr(_))),
+        "non-f32 tensor BinOp should be rejected, got: {:?}",
         result
     );
 }

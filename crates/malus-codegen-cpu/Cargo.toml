@@ -15,3 +15,6 @@ cranelift-module   = "0.113"
 
 [dev-dependencies]
 malus-codegen-gpu = { path = "../malus-codegen-gpu" }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+malus-runtime = { path = "../malus-runtime" }

@@ -48,6 +48,10 @@ _Avoid_: Pending input, GPU-active tensor
 A tensor produced by a kernel whose GPU work has not yet been committed. CPU reads of a pending tensor return stale data unless preceded by a GPU barrier.
 _Avoid_: Pending output, uncommitted tensor
 
+**Pending set**:
+The CTMM compile-time set of tensor bindings produced or consumed by a GPU-producing expression (`KernelCall`, tensor `BinOp`, or GPU-returning `Call`) since the last `GpuBarrier`. Any CPU-side access of a binding in the pending set triggers a barrier insertion.
+_Avoid_: GPU-active set
+
 ### Kernel mechanics
 
 **Launch configuration**:
@@ -61,3 +65,7 @@ _Avoid_: Builtins, GPU functions
 **`inout` parameter**:
 A kernel parameter that is mutated in place rather than borrowed immutably. Avoids allocating a new output buffer for element-wise ops.
 _Avoid_: Mutable parameter, write parameter
+
+**Built-in element-wise kernel**:
+An MSL kernel synthesized by `malus-codegen-gpu` for a primitive arithmetic operator (`malus_add`, `malus_sub`, `malus_mul`, `malus_div`), dispatched via `kernel_dispatch` with a sequential `kernel_id` appended after user kernels. Indistinguishable from a user kernel at runtime.
+_Avoid_: Builtin kernel, intrinsic kernel, stdlib kernel

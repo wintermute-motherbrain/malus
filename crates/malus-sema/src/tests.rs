@@ -322,3 +322,54 @@ fn main():
     let c_let = main.body.iter().any(|s| matches!(s, TypedStmt::Let { name, .. } if name == "c"));
     assert!(c_let, "let c should be present");
 }
+
+// ── CTMM: tensor BinOp in fn body triggers barrier ──────────────────────────────
+
+#[test]
+fn test_tensor_binop_in_fn_body_inserts_barrier() {
+    let src = r#"
+fn main():
+    let a = Tensor.gpu<f32>([1.0, 2.0])
+    let b = Tensor.gpu<f32>([3.0, 4.0])
+    let c = a + b
+    print(c)
+"#;
+    let typed = check_src(src).expect("should type-check");
+    let main = typed.fns.iter().find(|f| f.name == "main").unwrap();
+    let has_barrier = main.body.iter().any(|s| matches!(s, TypedStmt::GpuBarrier));
+    assert!(has_barrier, "GpuBarrier should be present: a + b in fn body produces a pending tensor");
+}
+
+#[test]
+fn test_tensor_binop_return_inserts_barrier() {
+    let src = r#"
+fn add(a: Tensor<f32>, b: Tensor<f32>) -> Tensor<f32>:
+    return a + b
+
+fn main():
+    let a = Tensor.gpu<f32>([1.0, 2.0])
+    let b = Tensor.gpu<f32>([3.0, 4.0])
+    let c = add(a, b)
+    print(c)
+"#;
+    let typed = check_src(src).expect("should type-check");
+    let add_fn = typed.fns.iter().find(|f| f.name == "add").unwrap();
+    let has_barrier = add_fn.body.iter().any(|s| matches!(s, TypedStmt::GpuBarrier));
+    assert!(has_barrier, "GpuBarrier should be present before return of a tensor BinOp result");
+}
+
+#[test]
+fn test_scalar_binop_does_not_insert_barrier() {
+    let src = r#"
+fn add(x: f32, y: f32) -> f32:
+    return x + y
+
+fn main():
+    let z = add(1.0, 2.0)
+    print(z)
+"#;
+    let typed = check_src(src).expect("should type-check");
+    let add_fn = typed.fns.iter().find(|f| f.name == "add").unwrap();
+    let has_barrier = add_fn.body.iter().any(|s| matches!(s, TypedStmt::GpuBarrier));
+    assert!(!has_barrier, "scalar BinOp must not trigger GPU barrier insertion");
+}

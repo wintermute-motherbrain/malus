@@ -4,7 +4,7 @@
 
 malus is a compiled ML DSL for Apple Silicon. Python-like syntax, dual compilation pipeline: `fn` bodies → Cranelift JIT (CPU), `kernel` bodies → Metal Shading Language (GPU). The CTMM memory model inserts static `free`/barrier calls at compile time; no GC, no RC on the fast path.
 
-## Current state: M5 done, **M5.1 is next**
+## Current state: M5.1 + M6 done, **M7 is next**
 
 | Milestone | Status | Crate |
 |---|---|---|
@@ -13,8 +13,9 @@ malus is a compiled ML DSL for Apple Silicon. Python-like syntax, dual compilati
 | M3 — CPU Codegen (Cranelift JIT for `fn` bodies) | ✅ done | `malus-codegen-cpu` |
 | M4 — Metal Runtime | ✅ done | `malus-runtime` |
 | M5 — GPU Codegen (MSL for `kernel` bodies) | ✅ done | `malus-codegen-gpu` |
-| M5.1 — Built-in element-wise kernels for fn-body BinOp | **← next** | `malus-codegen-gpu`, `malus-codegen-cpu` |
-| M6 — Integration (end-to-end CLI) | not started | `malus-cli` |
+| M5.1 — Built-in element-wise kernels for fn-body BinOp | ✅ done | `malus-codegen-gpu`, `malus-codegen-cpu` |
+| M6 — Integration (end-to-end CLI) | ✅ done | `malus-cli` |
+| M7 — v1 features (zeros/ones, scalar broadcasting, RNG) | **← next** | `malus-runtime`, `malus-codegen-*` |
 
 Full milestone specs: `docs/milestones/`. Architecture decisions: `docs/adr/`. Domain vocabulary: `CONTEXT.md`.
 
@@ -82,11 +83,12 @@ The `i64` handle is a raw pointer to a heap-allocated `TensorBuffer { buffer: me
 
 **kernel_dispatch:** looks up the `MTLComputePipelineState` by `kernel_id`, allocates an output buffer matching the first input's dtype/len, encodes a compute pass (`setComputePipelineState`, `setBuffer` per input + output, `dispatchThreads:threadsPerThreadgroup:`), does NOT commit (commit happens in `gpu_barrier`).
 
-**Known M5 limitations / deferred work:**
-- `BinOp` on tensor types in host `fn` bodies returns `UnsupportedExpr` — deferred to M5.1; see `docs/adr/0007-tensor-binop-in-fn-bodies.md` and `docs/milestones/m5.1-builtin-elementwise-kernels.md`.
+**Known limitations / deferred work:**
+- Scalar broadcasting in `fn`-body BinOp (`a * factor`) — sema requires same-type tensor operands; scalar broadcasting is M7 scope.
 - `zeros` / `ones` builtins return `UnsupportedExpr` — not needed for the golden example.
 - Non-f32 dtypes panic — the `Dtype` enum exists but only `F32` is functional.
 - Zero-length tensors crash Metal's `new_buffer(0, ...)` — not needed for the golden example.
+- Intermediate temporaries from chained `fn`-body BinOps (e.g. `b * c` in `a + b * c`) are not freed — tracked in `docs/milestones/ctmm-v1-gaps.md`.
 - CTMM's GPU-pending barrier logic (ADR-0009) coalesces barriers conservatively; drops between chained kernel calls may cause two command buffers instead of one.
 
 ## Coding conventions

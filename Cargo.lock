@@ -341,6 +341,7 @@ dependencies = [
  "cranelift-module",
  "cranelift-native",
  "malus-codegen-gpu",
+ "malus-runtime",
  "malus-sema",
  "malus-syntax",
 ]

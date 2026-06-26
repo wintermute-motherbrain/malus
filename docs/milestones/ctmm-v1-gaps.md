@@ -49,6 +49,12 @@ This covers the MVP's `add_tensors.ml` perfectly: all tensor flows are linear (n
 
 **What's needed for v1:** A proper liveness analysis (dataflow) that computes last-use per-branch and inserts `Drop` at join points where liveness drops to zero.
 
+### 6. Unbound temporaries from nested GPU-producing expressions
+
+**Gap:** When a nested expression like `a + b * c` is lowered in a `fn` body, the inner `b * c` dispatches `kernel_dispatch` and returns a handle that is never bound to a name (it's a temporary `Value` in Cranelift). CTMM's `find_last_uses` and `insert_drops` only track named bindings, so this intermediate tensor is never freed. This is pre-existing behavior — nested user kernel calls (e.g. `add(scale(a), b)`) leak the same way.
+
+**What's needed for v1:** Either desugar nested GPU-producing expressions into named `Let` bindings before CTMM (so the intermediate gets a `Drop`), or track raw `Value` lifetimes in codegen-cpu and emit `tensor_free` for temporaries.
+
 ## Summary table
 
 | Scenario | v0.1 | v1 needed |
@@ -60,4 +66,5 @@ This covers the MVP's `add_tensors.ml` perfectly: all tensor flows are linear (n
 | Closure captures | Not possible (closures are v1) | Capture analysis |
 | `inout` kernel parameters | Not possible (inout is v1) | Suppress Drop |
 | Branching / if-else liveness | Unsound (last-use may be wrong) | Dataflow liveness |
+| Unbound temporaries (nested BinOps) | Leaked (no Drop inserted) | Desugar to `Let` or track `Value` lifetimes |
 | Cross-function ownership chains | Correct for simple cases | Interprocedural analysis |

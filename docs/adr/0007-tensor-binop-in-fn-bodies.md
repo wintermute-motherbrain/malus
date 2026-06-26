@@ -1,5 +1,7 @@
 # Tensor BinOp in host `fn` bodies is not lowered in M3
 
+**Status:** Resolved by M5.1.
+
 Tensor binary operations (`a + b`, `a * b`, etc.) appearing inside `fn` bodies currently return `CodegenError::UnsupportedExpr` rather than being lowered to Cranelift IR. This is a deliberate deferral, not an oversight.
 
 ## The problem
@@ -24,6 +26,8 @@ Both options require infrastructure that does not exist until M5 (GPU codegen) o
 ## When to revisit
 
 Deferred to M5.1 (follow-up to M5 GPU codegen). M5 delivers the `KernelRegistry` and `kernel_dispatch` infrastructure that built-in element-wise kernels require. At that point, tensor BinOp in `fn` bodies should lower to a `kernel_dispatch` call to a built-in element-wise kernel, consistent with how user-written kernels are dispatched. See `docs/milestones/m5.1-builtin-elementwise-kernels.md`.
+
+**Resolution (M5.1):** Implemented as specified. `compile_kernels` synthesizes `malus_add`/`sub`/`mul`/`div` MSL kernels with sequential ids appended after user kernels; codegen-cpu's `BinOp`-on-tensor arm lowers to `kernel_dispatch` via the extracted `lower_kernel_dispatch` helper. The original assumption that no CTMM changes would be needed was incorrect: CTMM's `extract_gpu_producing_expr` was extended to recognize tensor `BinOp` and GPU-returning `Call`, and a `hoist_gpu_producing_returns` pass was added to ensure barriers fire after dispatches in return expressions.
 
 ## Considered Options
 

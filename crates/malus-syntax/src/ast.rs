@@ -30,7 +30,7 @@ pub enum Ty {
 
 // ── Operators ─────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum BinOp {
     Add, Sub, Mul, Div, Matmul,
     Eq, NotEq, Lt, LtEq, Gt, GtEq,
@@ -41,6 +41,17 @@ pub enum BinOp {
 pub enum UnaryOp {
     Neg,
     Not,
+}
+
+pub fn elementwise_builtin_name(op: &BinOp) -> Option<&'static str> {
+    match op {
+        BinOp::Add => Some("malus_add"),
+        BinOp::Sub => Some("malus_sub"),
+        BinOp::Mul => Some("malus_mul"),
+        BinOp::Div => Some("malus_div"),
+        BinOp::Matmul | BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::LtEq
+        | BinOp::Gt | BinOp::GtEq | BinOp::And | BinOp::Or => None,
+    }
 }
 
 // ── Literals ──────────────────────────────────────────────────────────────────

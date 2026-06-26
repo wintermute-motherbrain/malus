@@ -1,7 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use malus_sema::{TypedExpr, TypedExprKind, TypedKernel, TypedProgram, TypedStmt};
-use malus_syntax::ast::{BinOp, ScalarTy, UnaryOp};
+use malus_syntax::ast::{elementwise_builtin_name, BinOp, ScalarTy, UnaryOp};
 
 #[cfg(test)]
 mod tests;
@@ -88,14 +88,90 @@ pub fn compile_kernels(
     let mut registry = KernelRegistry::new();
     let mut name_to_id = HashMap::new();
 
-    for (id, kernel) in program.kernels.iter().enumerate() {
-        let kernel_id = id as u64;
+    let mut next_id: u64 = 0;
+
+    for kernel in &program.kernels {
+        let kernel_id = next_id;
+        next_id += 1;
         let msl = lower_kernel(kernel, kernel_id)?;
         registry.insert(kernel_id, msl);
         name_to_id.insert(kernel.name.clone(), kernel_id);
     }
 
+    let mut builtins = BTreeSet::new();
+    for f in &program.fns {
+        for stmt in &f.body {
+            collect_tensor_binops_in_stmt(stmt, &mut builtins);
+        }
+    }
+    for op in &builtins {
+        let name = elementwise_builtin_name(op)
+            .expect("collected op must have a builtin name");
+        let kernel_id = next_id;
+        next_id += 1;
+        let msl = synthesize_builtin(*op, kernel_id)?;
+        registry.insert(kernel_id, msl);
+        name_to_id.insert(name.to_string(), kernel_id);
+    }
+
     Ok((registry, name_to_id))
+}
+
+fn collect_tensor_binops_in_stmt(stmt: &TypedStmt, out: &mut BTreeSet<BinOp>) {
+    match stmt {
+        TypedStmt::Let { expr, .. } => collect_tensor_binops_in_expr(expr, out),
+        TypedStmt::Return { expr } => collect_tensor_binops_in_expr(expr, out),
+        TypedStmt::Expr(expr) => collect_tensor_binops_in_expr(expr, out),
+        TypedStmt::Drop { .. } | TypedStmt::GpuBarrier => {}
+    }
+}
+
+fn collect_tensor_binops_in_expr(expr: &TypedExpr, out: &mut BTreeSet<BinOp>) {
+    match &expr.kind {
+        TypedExprKind::BinOp { op, lhs, rhs } => {
+            if lhs.ty.is_tensor() && elementwise_builtin_name(op).is_some() {
+                out.insert(op.clone());
+            }
+            collect_tensor_binops_in_expr(lhs, out);
+            collect_tensor_binops_in_expr(rhs, out);
+        }
+        TypedExprKind::Unary { operand, .. } => {
+            collect_tensor_binops_in_expr(operand, out);
+        }
+        TypedExprKind::Call { args, .. } => {
+            for a in args {
+                collect_tensor_binops_in_expr(a, out);
+            }
+        }
+        TypedExprKind::KernelCall { args, .. } => {
+            for a in args {
+                collect_tensor_binops_in_expr(a, out);
+            }
+        }
+        TypedExprKind::TensorLiteral { elements, .. } => {
+            for e in elements {
+                collect_tensor_binops_in_expr(e, out);
+            }
+        }
+        TypedExprKind::Index { base, indices } => {
+            collect_tensor_binops_in_expr(base, out);
+            for i in indices {
+                collect_tensor_binops_in_expr(i, out);
+            }
+        }
+        TypedExprKind::FieldAccess { base, .. } => {
+            collect_tensor_binops_in_expr(base, out);
+        }
+        TypedExprKind::Lit(_) | TypedExprKind::Ident(_) => {}
+    }
+}
+
+fn synthesize_builtin(op: BinOp, kernel_id: u64) -> Result<String, CodegenError> {
+    let msl_op = binop_to_msl(&op)?;
+    Ok(format!(
+        "#include <metal_stdlib>\nusing namespace metal;\n\nkernel void malus_kernel_{}(\n    device float* a [[buffer(0)]],\n    device float* b [[buffer(1)]],\n    device float* out [[buffer(2)]],\n    uint tid [[thread_position_in_grid]]\n) {{\n    out[tid] = (a[tid] {} b[tid]);\n}}\n",
+        kernel_id, msl_op,
+    ))
 }
 
 // ── MSL lowering ──────────────────────────────────────────────────────────────
