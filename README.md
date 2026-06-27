@@ -16,34 +16,60 @@ A lightweight, high-performance domain-specific language for machine learning wo
 
 ## Example
 
-```malus
-fn main():
-    let a = Tensor.gpu<f32>([1.0, 2.0, 3.0, 4.0])
-    let b = Tensor.gpu<f32>([5.0, 6.0, 7.0, 8.0])
-    let c = add(a, b)
-    println(c)
+The V1 capstone: a 2→8→1 MLP that learns XOR in 10k steps.
 
-kernel add(a: Tensor<f32>, b: Tensor<f32>) -> Tensor<f32>:
-    return a + b
+```malus
+kernel sigmoid_backward(grad_out: Tensor<f32>, sig_z: Tensor<f32>) -> Tensor<f32>:
+    return grad_out * sig_z * (1.0 - sig_z)
+
+fn main():
+    let x      = Tensor.gpu<f32>([[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]])
+    let target = Tensor.gpu<f32>([[0.0], [1.0], [1.0], [0.0]])
+    let ones41 = Tensor.gpu<f32>([[1.0], [1.0], [1.0], [1.0]])
+
+    let mut w1 = Tensor.gpu<f32>([[0.5, -0.6, 0.7, -0.4, 0.3, -0.5, 0.6, -0.3],
+                                   [-0.4, 0.5, -0.6, 0.7, -0.3, 0.4, -0.5, 0.6]])
+    let mut b1 = Tensor.gpu<f32>([[0.1, -0.1, 0.1, -0.1, 0.1, -0.1, 0.1, -0.1]])
+    let mut w2 = Tensor.gpu<f32>([[0.6], [-0.5], [0.4], [-0.6], [0.5], [-0.4], [0.6], [-0.5]])
+    let mut b2 = Tensor.gpu<f32>([[0.0]])
+    let lr = 1.5
+
+    for step in range(10000):
+        let z1  = x @ w1 + ones41 @ b1
+        let h   = sigmoid(z1)
+        let z2  = h @ w2 + ones41 @ b2
+        let out = sigmoid(z2)
+
+        let diff = out - target
+        let loss = sum(diff * diff)
+        if step == 9999:
+            println("loss = {}", loss)
+            println("predictions: {}", out)
+
+        let dout = 2.0 * diff
+        let dz2  = sigmoid_backward(dout, out)
+        let dw2  = transpose(h) @ dz2
+        let db2  = transpose(ones41) @ dz2
+        let dh   = dz2 @ transpose(w2)
+        let dz1  = sigmoid_backward(dh, h)
+        let dw1  = transpose(x) @ dz1
+        let db1  = transpose(ones41) @ dz1
+
+        w1 = w1 - lr * dw1
+        b1 = b1 - lr * db1
+        w2 = w2 - lr * dw2
+        b2 = b2 - lr * db2
 ```
 
 ```sh
-$ malus examples/add_tensors.ml
-[6, 8, 10, 12]
+$ malus examples/xor.ml
+loss = [0.00012191984]
+predictions: [0.0056860363, 0.99518234, 0.9939387, 0.005444207]
 ```
-
-Tensor arithmetic also works directly in `fn` bodies via built-in kernels:
-
-```malus
-fn add(a: Tensor<f32>, b: Tensor<f32>) -> Tensor<f32>:
-    return a + b
-```
-
-See [`examples/relu_backward.ml`](./examples/relu_backward.ml) for a gradient kernel with mutable accumulation and scalar broadcasting.
 
 ## Status
 
-**Working today:**
+**V1 complete.** All M1–M11 milestones shipped.
 
 - Dual-pipeline compilation — `fn` bodies JIT via Cranelift, `kernel` bodies compiled to MSL and dispatched on Metal
 - CTMM memory model — static tensor `free` and GPU barrier insertion at compile time, no GC overhead
@@ -54,14 +80,11 @@ See [`examples/relu_backward.ml`](./examples/relu_backward.ml) for a gradient ke
 - Core math stdlib — `matmul`, `relu`, `sigmoid`, `tanh`, `exp`, `log`, `sqrt`, `abs`, `transpose`, `zeros`, `ones`, `sum`
 - Control flow — `if`/`else`, `for`, `while` with hierarchical CTMM drop placement
 - Structs + data-carrying enums + `match` — user-defined product/sum types with keyword construction and exhaustive match
+- Fixed-length arrays — `Array<T, N>`, `for x in arr`, single-index, recursive per-element drop
+- 2-D tensor literals — `Tensor.gpu<f32>([[r0c0, r0c1], [r1c0, r1c1]])` with rectangularity validation
+- Ariadne diagnostics — source spans, underlines, and help text on all parse/type errors
 - Multi-file imports — `import ops` / `from ops import add`
 - Format-string printing — `println("loss: {}", tensor)`
-
-**Coming next:**
-
-- Fixed-length arrays with iteration
-- Better diagnostics (source spans, structured errors)
-- V1 done-when: a manually-differentiated 2-layer MLP running on Metal
 
 ## Project structure
 
@@ -80,11 +103,12 @@ docs/
   spec/               # language spec
 examples/
   add_tensors.ml      # basic kernel dispatch
-  relu_backward.ml    # gradient kernel, let mut accumulation, scalar broadcast
-  scalar_ops.ml       # scalar arithmetic
   mlp_forward.ml      # 2-layer forward pass with relu/matmul/sum/transpose
   control_flow.ml     # for loop + nested if with tensor ops
   structs_enums.ml    # struct + data-carrying enum + match
+  arrays.ml           # Array<T,N>, ForIn, indexing
+  nested_tensor.ml    # 2-D tensor literal fed to matmul
+  xor.ml              # V1 capstone: 2→8→1 sigmoid MLP that learns XOR
   import_demo/        # multi-file import
 CONTEXT.md            # domain glossary
 ```
@@ -93,7 +117,7 @@ CONTEXT.md            # domain glossary
 
 ```sh
 cargo build --release
-./target/release/malus examples/add_tensors.ml
+./target/release/malus examples/xor.ml
 ```
 
 Requires: Rust 1.78+, macOS 14+ with Xcode command line tools (Metal runtime is macOS-only; non-macOS builds compile but cannot execute GPU code).
