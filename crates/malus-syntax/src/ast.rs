@@ -185,6 +185,10 @@ pub enum StmtKind {
     /// Exhaustive — every variant must appear exactly once. Arms may bind payload
     /// fields positionally. `return` is valid as an arm terminator.
     Match { scrutinee: Expr, arms: Vec<MatchArm> },
+    /// `break` — exit the innermost loop immediately.
+    Break,
+    /// `continue` — jump to the next iteration of the innermost loop.
+    Continue,
 }
 
 // ── Parameters ────────────────────────────────────────────────────────────────

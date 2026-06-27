@@ -191,6 +191,7 @@ fn collect_binops_in_stmt(
                 }
             }
         }
+        TypedStmt::Break | TypedStmt::Continue => {}
     }
 }
 
@@ -281,6 +282,7 @@ fn collect_unary_builtins_in_stmt(stmt: &TypedStmt, out: &mut BTreeSet<String>) 
                 }
             }
         }
+        TypedStmt::Break | TypedStmt::Continue => {}
     }
 }
 

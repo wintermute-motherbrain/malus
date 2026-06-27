@@ -125,8 +125,12 @@ pub extern "C" fn tensor_alloc_gpu(
     let byte_len = n * dt.element_size();
 
     let ctx = context();
+    // Metal rejects a 0-byte allocation; use a 1-byte placeholder so zero-length
+    // tensors (`zeros(0)`, empty kernel output) are safe to allocate and free.
+    // `tb.len` stays = n (0) so slices and shape queries remain correct.
+    let alloc_len = byte_len.max(1);
     let buffer = ctx.device.new_buffer(
-        byte_len as u64,
+        alloc_len as u64,
         MTLResourceOptions::StorageModeShared,
     );
 
@@ -346,6 +350,12 @@ pub extern "C" fn kernel_dispatch(kernel_id: u64, handles: *const i64, count: us
         std::ptr::null(),
     );
     let output_tb = unsafe { &*(output_handle as *const TensorBuffer) };
+
+    // Defensive guard: a zero-length output means there is nothing to dispatch.
+    // Encoding a dispatchThreads with grid_size = (0,1,1) aborts the Metal encoder.
+    if output_tb.len == 0 {
+        return output_handle;
+    }
 
     let mut guard = ctx.current_command_buffer.lock().unwrap();
     if guard.is_none() {

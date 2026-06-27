@@ -114,6 +114,13 @@ pub enum TypedStmt {
     DropArray { name: String, elem_ty: ResolvedTy, len: usize },
     /// Exhaustive `match` on an enum binding.
     Match { scrutinee: TypedExpr, arms: Vec<TypedMatchArm> },
+    // ── M12: loop control ─────────────────────────────────────────────────────
+    /// `break` — exit the innermost loop.  CTMM injects Drop/DropStruct/DropEnum
+    /// for all loop-body locals live at this point before the jump.
+    Break,
+    /// `continue` — jump to the next iteration of the innermost loop.  Same
+    /// CTMM unwind as `Break`.
+    Continue,
 }
 
 /// One arm of a `match` statement.

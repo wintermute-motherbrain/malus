@@ -32,6 +32,14 @@ pub enum SemaError {
     MatchScrutineeNotEnum { found: String, span: Span },
     // ── M11: diagnostics ─────────────────────────────────────────────────────
     TensorShapeMismatch { expected: usize, found: usize, span: Span },
+    // ── M12: hardening ───────────────────────────────────────────────────────
+    BreakOutsideLoop { span: Span },
+    ContinueOutsideLoop { span: Span },
+    /// A match-arm binding of struct/enum type escapes its arm.  Aggregate
+    /// boxes have no refcount, so an escaped payload would alias freed memory
+    /// once the matched enum is dropped.  Unified heap-box RC is scheduled for
+    /// M13; for now the escape is a hard error.
+    NonTensorPayloadEscapes { binding: String, ty: String, span: Span },
 }
 
 impl SemaError {
@@ -60,7 +68,10 @@ impl SemaError {
             | MissingField { span, .. }
             | UnknownConstructorField { span, .. }
             | MatchScrutineeNotEnum { span, .. }
-            | TensorShapeMismatch { span, .. } => Some(*span),
+            | TensorShapeMismatch { span, .. }
+            | BreakOutsideLoop { span }
+            | ContinueOutsideLoop { span }
+            | NonTensorPayloadEscapes { span, .. } => Some(*span),
             DuplicateDefinition { second, .. } | DuplicateTypeDefinition { second, .. } => Some(*second),
             MainNotFound => None,
         }
@@ -102,6 +113,9 @@ impl SemaError {
             DuplicateTypeDefinition { .. } => "defined again here",
             MatchScrutineeNotEnum { .. } => "not an enum type",
             TensorShapeMismatch { .. } => "tensor shape mismatch",
+            BreakOutsideLoop { .. } => "break outside loop",
+            ContinueOutsideLoop { .. } => "continue outside loop",
+            NonTensorPayloadEscapes { .. } => "aggregate payload escapes its match arm",
             MainNotFound => "",
         }
     }
@@ -119,6 +133,7 @@ impl SemaError {
             NonExhaustiveMatch { .. } => Some("list all variants explicitly — wildcard _ arms are not supported in V1"),
             MatchWildcard { .. } => Some("list each variant explicitly instead of using _"),
             MissingField { .. } => Some("all fields must be provided in struct literals"),
+            NonTensorPayloadEscapes { .. } => Some("copy the fields you need out of the payload instead of moving the whole value; full aggregate ref-counting lands in M13"),
             _ => None,
         }
     }
@@ -179,6 +194,12 @@ impl fmt::Display for SemaError {
                 write!(f, "match scrutinee must be an enum type, got {}", found),
             SemaError::TensorShapeMismatch { expected, found, .. } =>
                 write!(f, "tensor literal declares shape with {} element(s) but {} value(s) provided", expected, found),
+            SemaError::BreakOutsideLoop { .. } =>
+                write!(f, "`break` is only valid inside a loop body"),
+            SemaError::ContinueOutsideLoop { .. } =>
+                write!(f, "`continue` is only valid inside a loop body"),
+            SemaError::NonTensorPayloadEscapes { binding, ty, .. } =>
+                write!(f, "match-arm binding '{}' of type {} escapes its arm; struct/enum payloads have no refcount and cannot outlive the matched value", binding, ty),
         }
     }
 }

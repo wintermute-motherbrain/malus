@@ -800,3 +800,271 @@ fn main():
     run_src(src).expect("M9 done-when should compile and run");
     assert_eq!(live_tensor_count(), 0, "no tensors should leak in done-when program");
 }
+
+// ── M12: break / continue ─────────────────────────────────────────────────────
+
+#[test]
+fn test_break_exits_loop() {
+    let src = r#"
+fn main():
+    let mut acc = 0
+    for i in range(10):
+        if i == 7:
+            break
+        if i == 3:
+            continue
+        acc = acc + i
+    println("acc: {}", acc)
+"#;
+    // 0+1+2 + (3 skipped via continue) + 4+5+6 = 18; 7 triggers break
+    run_src(src).expect("break/continue loop should compile and run");
+}
+
+#[test]
+fn test_break_drops_loop_body_tensor() {
+    // A tensor allocated inside the loop body before a break must be freed on
+    // the break path — not just on the normal fall-through path.
+    let src = r#"
+fn main():
+    let mut i = 0
+    for i in range(5):
+        let t = Tensor.gpu<f32>([1.0, 2.0])
+        if i == 2:
+            break
+        print(t)
+"#;
+    run_src(src).expect("break with loop-body tensor should compile and run");
+    assert_eq!(live_tensor_count(), 0, "tensor created before break must not leak");
+}
+
+#[test]
+fn test_continue_drops_loop_body_tensor() {
+    let src = r#"
+fn main():
+    for i in range(5):
+        let t = Tensor.gpu<f32>([1.0, 2.0])
+        if i == 2:
+            continue
+        print(t)
+"#;
+    run_src(src).expect("continue with loop-body tensor should compile and run");
+    assert_eq!(live_tensor_count(), 0, "tensor created before continue must not leak");
+}
+
+#[test]
+fn test_break_inside_if_inside_loop() {
+    // break nested inside an if, with a loop-body tensor live at the break.
+    let src = r#"
+fn main():
+    for i in range(10):
+        let t = Tensor.gpu<f32>([1.0])
+        if i == 3:
+            if i > 2:
+                break
+        print(t)
+"#;
+    run_src(src).expect("nested break should compile and run");
+    assert_eq!(live_tensor_count(), 0, "no tensor leak on nested break");
+}
+
+#[test]
+fn test_while_break() {
+    let src = r#"
+fn main():
+    let mut n = 0
+    while n < 10:
+        let t = Tensor.gpu<f32>([1.0])
+        if n == 4:
+            break
+        print(t)
+        n = n + 1
+"#;
+    run_src(src).expect("while + break should compile and run");
+    assert_eq!(live_tensor_count(), 0, "no tensor leak on while break");
+}
+
+// ── M12: enum-payload retain-on-escape ───────────────────────────────────────
+
+#[test]
+fn test_match_payload_stays_local() {
+    // Tensor payload used only inside the arm — no escape.  Retain/Drop pair
+    // should cancel; DropEnum releases back to 0.
+    let src = r#"
+enum Wrapper:
+    Some(val: Tensor<f32>)
+    Empty
+
+fn make() -> Wrapper:
+    return Wrapper.Some(val=Tensor.gpu<f32>([1.0, 2.0]))
+
+fn main():
+    let w = make()
+    match w:
+        Some(val):
+            print(val)
+        Empty:
+            println("empty")
+"#;
+    run_src(src).expect("local match payload should compile and run");
+    assert_eq!(live_tensor_count(), 0, "no tensor leak for local payload use");
+}
+
+#[test]
+fn test_match_payload_escapes_to_outer_binding() {
+    // Tensor payload escapes via assignment to an outer `let mut`.
+    // Must not leak OR double-free.
+    let src = r#"
+enum Wrapper:
+    Some(val: Tensor<f32>)
+    Empty
+
+fn make() -> Wrapper:
+    return Wrapper.Some(val=Tensor.gpu<f32>([3.0, 4.0]))
+
+fn main():
+    let w = make()
+    let mut escaped = Tensor.gpu<f32>([0.0])
+    match w:
+        Some(val):
+            escaped = val
+        Empty:
+            escaped = Tensor.gpu<f32>([0.0])
+    print(escaped)
+"#;
+    run_src(src).expect("escaped payload should compile and run");
+    assert_eq!(live_tensor_count(), 0, "no tensor leak or double-free on escape");
+}
+
+#[test]
+fn test_match_empty_variant_no_leak() {
+    let src = r#"
+enum Wrapper:
+    Some(val: Tensor<f32>)
+    Empty
+
+fn main():
+    let w = Wrapper.Empty
+    match w:
+        Some(val):
+            print(val)
+        Empty:
+            println("empty")
+"#;
+    run_src(src).expect("empty variant match should compile and run");
+    assert_eq!(live_tensor_count(), 0, "no tensor leak for empty variant");
+}
+
+// ── M12: zero-length tensor guard ────────────────────────────────────────────
+
+#[test]
+fn test_zero_length_tensor_alloc() {
+    // zeros(0) allocates a zero-length tensor — must not crash on allocation.
+    let src = r#"
+fn main():
+    let empty = zeros(0)
+    print(empty)
+"#;
+    run_src(src).expect("zeros(0) should not crash");
+    assert_eq!(live_tensor_count(), 0, "zero-length tensor must be freed");
+}
+
+// ── M12: break/continue outside a loop → sema error ──────────────────────────
+
+fn check_src(src: &str) -> Result<malus_sema::TypedProgram, Vec<malus_sema::SemaError>> {
+    let program = parse(malus_syntax::FileId(0), src).expect("parse failed");
+    let aliases = HashMap::new();
+    check(&program, &aliases)
+}
+
+#[test]
+fn test_break_outside_loop_rejected() {
+    let src = r#"
+fn main():
+    break
+"#;
+    let result = check_src(src);
+    assert!(result.is_err(), "break outside loop should be rejected by sema");
+    let errs = result.unwrap_err();
+    assert!(
+        errs.iter().any(|e| matches!(e, malus_sema::SemaError::BreakOutsideLoop { .. })),
+        "expected BreakOutsideLoop error, got: {:?}", errs
+    );
+}
+
+#[test]
+fn test_continue_outside_loop_rejected() {
+    let src = r#"
+fn main():
+    continue
+"#;
+    let result = check_src(src);
+    assert!(result.is_err(), "continue outside loop should be rejected by sema");
+    let errs = result.unwrap_err();
+    assert!(
+        errs.iter().any(|e| matches!(e, malus_sema::SemaError::ContinueOutsideLoop { .. })),
+        "expected ContinueOutsideLoop error, got: {:?}", errs
+    );
+}
+
+#[test]
+fn test_break_inside_if_outside_loop_rejected() {
+    let src = r#"
+fn main():
+    let a = Tensor.gpu<f32>([1.0])
+    if a.len > 0:
+        break
+"#;
+    let result = check_src(src);
+    assert!(result.is_err(), "break inside if but outside loop should be rejected");
+}
+
+// ── M12: non-tensor payload escape → sema error ──────────────────────────────
+
+#[test]
+fn test_struct_payload_escape_rejected() {
+    let src = r#"
+struct Point:
+    x: f32
+
+enum Wrapper:
+    Some(pt: Point)
+    Empty
+
+fn main():
+    let w = Wrapper.Some(pt=Point(x=1.0))
+    match w:
+        Some(pt):
+            let escaped = pt
+        Empty:
+            println("empty")
+"#;
+    let result = check_src(src);
+    assert!(result.is_err(), "escaping struct payload should be rejected");
+    let errs = result.unwrap_err();
+    assert!(
+        errs.iter().any(|e| matches!(e, malus_sema::SemaError::NonTensorPayloadEscapes { .. })),
+        "expected NonTensorPayloadEscapes error, got: {:?}", errs
+    );
+}
+
+#[test]
+fn test_struct_payload_field_read_ok() {
+    // Reading a scalar field out of a struct payload is fine — not an escape.
+    let src = r#"
+struct Point:
+    x: f32
+
+enum Wrapper:
+    Some(pt: Point)
+    Empty
+
+fn main():
+    let w = Wrapper.Some(pt=Point(x=3.0))
+    match w:
+        Some(pt):
+            println("x: {}", pt.x)
+        Empty:
+            println("empty")
+"#;
+    run_src(src).expect("reading a struct payload field should compile and run");
+}

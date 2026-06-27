@@ -15,6 +15,8 @@ pub enum TokenKind {
     Mut,
     Match,
     Return,
+    Break,
+    Continue,
     If,
     Else,
     For,

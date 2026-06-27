@@ -57,6 +57,18 @@ Ensure `collect_idents_in_stmt` recurses into all control-flow nodes (already re
 
 `.data` field access on a `Variable` lowers to a plain handle load (no retain — `.data` is a borrow for printing/inspection only in M13).
 
+### 5. Unified heap-box RC for struct/enum payloads (M12 gap)
+
+M12 made it a hard compile error (`SemaError::NonTensorPayloadEscapes`) for a match-arm binding of struct or enum type to escape its arm, because aggregate heap boxes carry no refcount (see ADR-0019). M13 removes that restriction by adding a reference count to every struct and enum heap box:
+
+**Runtime (`malus-runtime/src/metal.rs`):** Add a `Box<AggregateBuffer>` allocation path used by `StructInit`/`EnumInit` lowering. `AggregateBuffer` carries a pointer to the raw struct/enum data and an `AtomicUsize` refcount. Register `aggregate_retain`/`aggregate_release` as named JIT symbols alongside `tensor_retain`/`tensor_release`.
+
+**Typed IR (`malus-sema/src/typed_ir.rs`):** Add `TypedStmt::RetainAgg { name }` and `TypedStmt::ReleaseAgg { name }` (or extend `Retain`/`Release` with a variant tag). `DropStruct`/`DropEnum` delegate to `aggregate_release`.
+
+**CTMM:** Extend `ty_needs_rc` to return true for `Struct` and `Enum` types (in addition to `Variable`). Emit retain/release nodes for struct/enum bindings as for `Variable`. The match-arm retain-on-bind (`annotate_match_arms`) already emits `Retain` for tensor payloads; extend it to emit `RetainAgg` for struct/enum payloads. Retire the `NonTensorPayloadEscapes` sema error.
+
+**Sema:** Remove the `payload_binding_escapes` escape check. Struct/enum payloads are now safely RC-managed and may escape.
+
 ## Out of Scope
 
 - Tape recording (M14)

@@ -623,6 +623,8 @@ fn flat_stmt_kinds(stmts: &[TypedStmt]) -> Vec<&'static str> {
             TypedStmt::DropArray { .. }  => "DropArray",
             TypedStmt::ForIn { .. }      => "ForIn",
             TypedStmt::Match { .. }     => "Match",
+            TypedStmt::Break            => "Break",
+            TypedStmt::Continue         => "Continue",
         };
         out.push(tag);
     }

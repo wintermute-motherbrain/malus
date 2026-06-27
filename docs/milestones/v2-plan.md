@@ -6,7 +6,9 @@ V2 answers the question V1 proved was *askable*: **can you remove the hand-writt
 
 V2 adds a define-by-run gradient tape to malus. The tape records each differentiable forward op on `Variable` values; a single `backward(loss)` call walks it in reverse and accumulates gradients automatically. The done-when replaces every line of manual gradient math in `examples/xor.ml` with that one call.
 
-V2 also closes three deferred V1 bugs: the enum-payload match-binding use-after-free, the zero-length tensor dispatch crash, and missing `break`/`continue` support.
+V2 also closes three deferred V1 bugs: the enum-payload match-binding use-after-free, the zero-length tensor dispatch crash, and missing `break`/`continue` support (all done in M12).
+
+M12 closes the enum-payload use-after-free for **tensor** payloads via retain-on-bind in CTMM and makes **struct/enum payload escapes** a hard compile error (see ADR-0019). M13 completes the story by adding a reference count to every struct/enum heap box so the compiler can allow the escape safely, retiring the M12 compile error.
 
 ## V2 Done-When Program
 

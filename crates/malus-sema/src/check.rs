@@ -28,6 +28,7 @@ struct BodyCtx<'a> {
     errors: &'a mut Vec<SemaError>,
     return_ty: ResolvedTy,
     in_kernel: bool,
+    loop_depth: usize,
 }
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -220,6 +221,7 @@ pub fn check(
                     errors: &mut body_errors,
                     return_ty: sig.return_ty.clone(),
                     in_kernel: false,
+                    loop_depth: 0,
                 };
                 let typed_body = check_body(body, &mut ctx);
                 env.pop_scope();
@@ -268,6 +270,7 @@ pub fn check(
                     errors: &mut body_errors,
                     return_ty: kernel_return_ty,
                     in_kernel: true,
+                    loop_depth: 0,
                 };
                 let typed_body = check_body(body, &mut ctx);
                 env.pop_scope();
@@ -410,6 +413,20 @@ fn check_body(
                 };
                 typed.push(TypedStmt::If { condition: tcond, then_body: tthen, else_body: telse });
             }
+            StmtKind::Break => {
+                if ctx.loop_depth == 0 {
+                    ctx.errors.push(SemaError::BreakOutsideLoop { span: stmt.span });
+                    return typed;
+                }
+                typed.push(TypedStmt::Break);
+            }
+            StmtKind::Continue => {
+                if ctx.loop_depth == 0 {
+                    ctx.errors.push(SemaError::ContinueOutsideLoop { span: stmt.span });
+                    return typed;
+                }
+                typed.push(TypedStmt::Continue);
+            }
             StmtKind::For { var, start, end, body } => {
                 // Loop bounds must be I64 (range() desugars to int literals or exprs).
                 let i64_ty = ResolvedTy::Scalar(ScalarTy::I64);
@@ -424,7 +441,9 @@ fn check_body(
                 // Loop variable is I64, visible only inside the body.
                 ctx.env.push_scope();
                 ctx.env.bind(var.clone(), i64_ty, None);
+                ctx.loop_depth += 1;
                 let tbody = check_body(body, ctx);
+                ctx.loop_depth -= 1;
                 ctx.env.pop_scope();
                 typed.push(TypedStmt::For { var: var.clone(), start: tstart, end: tend, body: tbody });
             }
@@ -450,7 +469,9 @@ fn check_body(
                 };
                 ctx.env.push_scope();
                 ctx.env.bind(var.clone(), elem_ty, None);
+                ctx.loop_depth += 1;
                 let tbody = check_body(body, ctx);
+                ctx.loop_depth -= 1;
                 ctx.env.pop_scope();
                 typed.push(TypedStmt::ForIn { var: var.clone(), iter: titer, body: tbody });
             }
@@ -469,7 +490,9 @@ fn check_body(
                     return typed;
                 }
                 ctx.env.push_scope();
+                ctx.loop_depth += 1;
                 let tbody = check_body(body, ctx);
+                ctx.loop_depth -= 1;
                 ctx.env.pop_scope();
                 typed.push(TypedStmt::While { condition: tcond, body: tbody });
             }
@@ -545,6 +568,20 @@ fn check_body(
                         ctx.env.bind(bname.clone(), fty.clone(), fpl);
                         bindings_typed.push((bname.clone(), fty.clone()));
                     }
+                    // Reject struct/enum payload bindings that escape the arm.
+                    // Aggregate boxes have no refcount; an escape leads to UAF once
+                    // DropEnum releases the box.  Unified heap-box RC arrives at M13.
+                    for (bname, fty) in &bindings_typed {
+                        if fty.is_struct() || fty.is_enum() {
+                            if payload_binding_escapes(bname, &arm.body) {
+                                ctx.errors.push(SemaError::NonTensorPayloadEscapes {
+                                    binding: bname.clone(),
+                                    ty: fty.to_string(),
+                                    span: arm.span,
+                                });
+                            }
+                        }
+                    }
                     let arm_body = check_body(&arm.body, ctx);
                     ctx.env.pop_scope();
                     typed_arms.push(TypedMatchArm {
@@ -559,6 +596,77 @@ fn check_body(
         }
     }
     typed
+}
+
+// ── Match-arm aggregate escape check ─────────────────────────────────────────
+
+/// Returns true if `name` appears in an escaping position anywhere in `stmts`.
+/// Escaping positions: RHS of `Assign`, `Return` expression, `Call` argument,
+/// `StructInit`/`EnumInit` field.  Reading `name.field` or `name[i]` is NOT an
+/// escape (a copy of a scalar/tensor field, governed by the field's own rules).
+fn payload_binding_escapes(name: &str, stmts: &[malus_syntax::ast::Stmt]) -> bool {
+    stmts.iter().any(|s| payload_in_stmt(name, s))
+}
+
+fn payload_in_stmt(name: &str, stmt: &malus_syntax::ast::Stmt) -> bool {
+    use malus_syntax::ast::StmtKind;
+    match &stmt.kind {
+        StmtKind::Return { expr } => payload_in_expr(name, expr),
+        StmtKind::Assign { expr, .. } => payload_in_expr(name, expr),
+        StmtKind::Let { expr, .. } | StmtKind::LetMut { expr, .. } => payload_in_expr(name, expr),
+        StmtKind::Expr(expr) => payload_in_expr(name, expr),
+        StmtKind::If { condition, then_body, else_body } =>
+            payload_in_expr(name, condition)
+            || payload_binding_escapes(name, then_body)
+            || else_body.as_deref().map_or(false, |b| payload_binding_escapes(name, b)),
+        StmtKind::For { start, end, body, .. } =>
+            payload_in_expr(name, start)
+            || payload_in_expr(name, end)
+            || payload_binding_escapes(name, body),
+        StmtKind::ForIn { iter, body, .. } =>
+            payload_in_expr(name, iter)
+            || payload_binding_escapes(name, body),
+        StmtKind::While { condition, body } =>
+            payload_in_expr(name, condition)
+            || payload_binding_escapes(name, body),
+        StmtKind::Match { scrutinee, arms } =>
+            payload_in_expr(name, scrutinee)
+            || arms.iter().any(|a| payload_binding_escapes(name, &a.body)),
+        StmtKind::Break | StmtKind::Continue => false,
+    }
+}
+
+fn payload_in_expr(name: &str, expr: &malus_syntax::ast::Expr) -> bool {
+    use malus_syntax::ast::ExprKind;
+    match &expr.kind {
+        ExprKind::Ident(n) => n == name,
+        ExprKind::BinOp { lhs, rhs, .. } =>
+            payload_in_expr(name, lhs) || payload_in_expr(name, rhs),
+        ExprKind::Unary { operand, .. } => payload_in_expr(name, operand),
+        // Call covers fn calls, struct and enum constructors (all share the same AST node).
+        // If `name` appears as a callee or an argument value it's escaping.
+        ExprKind::Call { callee, args } =>
+            payload_in_expr(name, callee)
+            || args.iter().any(|a| payload_in_expr(name, &a.value)),
+        ExprKind::FieldAccess { base, .. } => {
+            // `name.field` is an element read — not an escape.
+            match &base.kind {
+                ExprKind::Ident(n) if n == name => false,
+                _ => payload_in_expr(name, base),
+            }
+        }
+        ExprKind::Index { base, indices } => {
+            // `name[i]` is an element read — not an escape.
+            let base_is_name = matches!(&base.kind, ExprKind::Ident(n) if n == name);
+            (!base_is_name && payload_in_expr(name, base))
+            || indices.iter().any(|i| payload_in_expr(name, i))
+        }
+        ExprKind::TensorLiteral { elements, .. } =>
+            elements.iter().any(|e| payload_in_expr(name, e)),
+        ExprKind::ArrayLiteral { elements } =>
+            elements.iter().any(|e| payload_in_expr(name, e)),
+        ExprKind::Lit(_) => false,
+    }
 }
 
 // ── Expression type synthesis ─────────────────────────────────────────────────

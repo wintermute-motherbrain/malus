@@ -42,6 +42,12 @@ pub fn annotate_fns(fns: &mut Vec<TypedFn>) {
 // ── Core analysis ─────────────────────────────────────────────────────────────
 
 fn annotate_body(body: &mut Vec<TypedStmt>) {
+    annotate_body_seeded(body, &[]);
+}
+
+/// Core CTMM pass.  `seed` carries tensor payload bindings from a surrounding
+/// match arm so they are treated as arm-scoped locals (retain-on-bind, M12).
+fn annotate_body_seeded(body: &mut Vec<TypedStmt>, seed: &[(String, ResolvedTy)]) {
     // Steps 1-2: hoist GPU subexpressions and GPU-producing returns in the outer
     // body.  Control-flow nodes are passed through unchanged — their inner bodies
     // will be hoisted in step 3 when `annotate_body` recurses into them.
@@ -53,16 +59,30 @@ fn annotate_body(body: &mut Vec<TypedStmt>) {
     // means the outer passes can treat `If`/`For`/`While` as opaque use sites.
     recurse_into_inner_scopes(body);
 
+    // Step 3b (M12): retain tensor match-arm payload bindings + recurse into arms.
+    annotate_match_arms(body);
+
     // Steps 4-9: outer-scope analysis.
-    let locals = collect_local_bindings(body);
-    let local_types = collect_local_types(body);
+    let mut locals = collect_local_bindings(body);
+    let mut local_types = collect_local_types(body);
+    // Seed tensor payload bindings from the enclosing arm (tensor-only; aggregate
+    // bindings are arm-local borrows freed by DropEnum on the scrutinee).
+    for (n, t) in seed {
+        locals.insert(n.clone());
+        local_types.insert(n.clone(), t.clone());
+    }
     let escaping = collect_escaping(body);
     insert_assign_drops(body, &escaping);
-    let last_uses = find_last_uses(body, &locals, &escaping);
+    let mut last_uses = find_last_uses(body, &locals, &escaping);
+    // Step 7b (M12): ensure every seeded (retained) tensor payload binding has a
+    // matching Drop, even if it is never used locally and does not escape.
+    seed_unused_floor(&mut last_uses, seed, &escaping);
     insert_drops(body, &last_uses, &local_types);
     // Step 8.5: inject Drop/DropStruct before early Returns inside nested scopes
     // for bindings whose end-of-scope Drop is after the control-flow node.
     inject_early_return_unwinds(body, &local_types);
+    // Step 8.6 (M12): inject drops before Break/Continue jumps.
+    inject_break_continue_unwinds(body, &local_types);
     insert_barriers(body);
 }
 
@@ -81,6 +101,50 @@ fn recurse_into_inner_scopes(body: &mut Vec<TypedStmt>) {
                 annotate_body(body);
             }
             _ => {}
+        }
+    }
+}
+
+/// Step 3b (M12): For each match arm, prepend `Retain` for every tensor payload
+/// binding and recurse `annotate_body_seeded` into the arm body.
+///
+/// Aggregate (struct/enum) bindings are neither seeded nor retained: they are
+/// arm-local borrows freed by `DropEnum` on the scrutinee, and sema has already
+/// rejected any escape of such a binding.
+///
+/// Nested matches inside an arm are handled automatically because
+/// `annotate_body_seeded` calls `annotate_match_arms` again on the arm body.
+fn annotate_match_arms(body: &mut Vec<TypedStmt>) {
+    for stmt in body.iter_mut() {
+        if let TypedStmt::Match { arms, .. } = stmt {
+            for arm in arms.iter_mut() {
+                let tensor_binds: Vec<(String, ResolvedTy)> = arm.bindings.iter()
+                    .filter(|(_, t)| t.is_tensor())
+                    .cloned()
+                    .collect();
+                // Prepend Retain for each tensor payload in field-declaration order.
+                for (name, _) in tensor_binds.iter().rev() {
+                    arm.body.insert(0, TypedStmt::Retain { name: name.clone() });
+                }
+                annotate_body_seeded(&mut arm.body, &tensor_binds);
+            }
+        }
+    }
+}
+
+/// Step 7b (M12): A seeded tensor payload that is neither used locally nor
+/// escaping would leave its prepended `Retain` unbalanced (leak).  Force its
+/// `last_uses` entry to index 0 so `insert_drops` places a `Drop` immediately
+/// after the `Retain` — an inert retain/release pair that keeps the refcount
+/// balanced on every path.
+fn seed_unused_floor(
+    last_uses: &mut HashMap<String, usize>,
+    seed: &[(String, ResolvedTy)],
+    escaping: &HashSet<String>,
+) {
+    for (name, _) in seed {
+        if !last_uses.contains_key(name.as_str()) && !escaping.contains(name.as_str()) {
+            last_uses.insert(name.clone(), 0);
         }
     }
 }
@@ -498,7 +562,8 @@ fn inject_early_return_unwinds(
         // having live_here referencing drop_positions — use an index match.
         let is_cf = matches!(&body[i],
             TypedStmt::If { .. } | TypedStmt::For { .. }
-            | TypedStmt::While { .. } | TypedStmt::ForIn { .. });
+            | TypedStmt::While { .. } | TypedStmt::ForIn { .. }
+            | TypedStmt::Match { .. });
         if !is_cf {
             continue;
         }
@@ -513,6 +578,11 @@ fn inject_early_return_unwinds(
             | TypedStmt::While { body: inner, .. }
             | TypedStmt::ForIn { body: inner, .. } => {
                 inject_unwind_in_body(inner, &live_here, local_types);
+            }
+            TypedStmt::Match { arms, .. } => {
+                for arm in arms.iter_mut() {
+                    inject_unwind_in_body(&mut arm.body, &live_here, local_types);
+                }
             }
             _ => {}
         }
@@ -545,7 +615,8 @@ fn inject_unwind_in_body(
                 // Skip past the Return (no inner scopes inside it).
             }
             TypedStmt::If { .. } | TypedStmt::For { .. }
-            | TypedStmt::While { .. } | TypedStmt::ForIn { .. } => {
+            | TypedStmt::While { .. } | TypedStmt::ForIn { .. }
+            | TypedStmt::Match { .. } => {
                 // Recurse into nested control flow.
                 match &mut body[i] {
                     TypedStmt::If { then_body, else_body, .. } => {
@@ -559,6 +630,11 @@ fn inject_unwind_in_body(
                     | TypedStmt::ForIn { body: inner, .. } => {
                         inject_unwind_in_body(inner, live_outer, local_types);
                     }
+                    TypedStmt::Match { arms, .. } => {
+                        for arm in arms.iter_mut() {
+                            inject_unwind_in_body(&mut arm.body, live_outer, local_types);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -570,6 +646,153 @@ fn inject_unwind_in_body(
 
 fn make_unwind_drop(name: &str, local_types: &HashMap<String, ResolvedTy>) -> Option<TypedStmt> {
     local_types.get(name).and_then(|ty| make_drop_stmt_for_ty(name, ty))
+}
+
+// ── Phase 1.6 (M12): Break/Continue unwind ────────────────────────────────────
+//
+// `break`/`continue` jump out of the loop body, skipping any `Drop` nodes that
+// would fire at the normal end of the iteration.  For each jump we inject drops
+// for all loop-body-level locals whose `Drop` sits after the jump point (i.e. is
+// live there).
+//
+// This pass runs at every `annotate_body_seeded` level so multi-level scopes
+// compose: a binding declared inside an `if` inside a loop gets its drop injected
+// by the if-branch level; the loop-body level separately drops loop-body-top-level
+// locals (descending through the if without descending into nested loops).
+//
+// Descends into: If / Match (same live_here set).
+// Does NOT descend into: For / While / ForIn — a Break/Continue inside a nested
+// loop belongs to that loop and was already handled when its body was annotated.
+
+fn inject_break_continue_unwinds(body: &mut Vec<TypedStmt>, local_types: &HashMap<String, ResolvedTy>) {
+    // Map name → position of its Drop/DropStruct/DropEnum/DropArray in this body.
+    let mut drop_positions: HashMap<String, usize> = HashMap::new();
+    for (i, stmt) in body.iter().enumerate() {
+        match stmt {
+            TypedStmt::Drop { name }
+            | TypedStmt::DropStruct { name, .. }
+            | TypedStmt::DropEnum { name, .. }
+            | TypedStmt::DropArray { name, .. } => {
+                drop_positions.insert(name.clone(), i);
+            }
+            _ => {}
+        }
+    }
+    if drop_positions.is_empty() {
+        return;
+    }
+
+    let mut i = 0;
+    while i < body.len() {
+        // Compute the set of locals whose Drop is after position i (live at i).
+        let live_here: HashSet<String> = drop_positions.iter()
+            .filter(|(_, &pos)| pos > i)
+            .map(|(name, _)| name.clone())
+            .collect();
+
+        if live_here.is_empty() {
+            i += 1;
+            continue;
+        }
+
+        match &body[i] {
+            TypedStmt::Break | TypedStmt::Continue => {
+                // Insert drops for all live locals immediately before the jump.
+                let mut to_drop: Vec<String> = live_here.into_iter()
+                    .filter(|n| local_types.contains_key(n.as_str()))
+                    .collect();
+                to_drop.sort();
+                let mut inserted = 0;
+                for name in &to_drop {
+                    if let Some(stmt) = make_unwind_drop(name, local_types) {
+                        body.insert(i + inserted, stmt);
+                        inserted += 1;
+                    }
+                }
+                i += inserted + 1; // skip past the inserted drops + the jump itself
+                continue;
+            }
+            TypedStmt::If { .. } | TypedStmt::Match { .. } => {
+                // Descend; do NOT descend into nested loops.
+                inject_bc_unwind_in_body_mut(body, i, &live_here, local_types);
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+}
+
+/// Recurse into If/Match arms looking for Break/Continue, injecting drops of
+/// `live_outer` before each one.  Stops at nested For/While/ForIn.
+fn inject_bc_unwind_in_body(
+    inner: &mut Vec<TypedStmt>,
+    live_outer: &HashSet<String>,
+    local_types: &HashMap<String, ResolvedTy>,
+) {
+    let mut i = 0;
+    while i < inner.len() {
+        match &inner[i] {
+            TypedStmt::Break | TypedStmt::Continue => {
+                let mut to_drop: Vec<String> = live_outer.iter()
+                    .filter(|n| local_types.contains_key(n.as_str()))
+                    .cloned()
+                    .collect();
+                to_drop.sort();
+                let mut inserted = 0;
+                for name in &to_drop {
+                    if let Some(stmt) = make_unwind_drop(name, local_types) {
+                        inner.insert(i + inserted, stmt);
+                        inserted += 1;
+                    }
+                }
+                i += inserted + 1;
+                continue;
+            }
+            TypedStmt::If { .. } | TypedStmt::Match { .. } => {
+                match &mut inner[i] {
+                    TypedStmt::If { then_body, else_body, .. } => {
+                        inject_bc_unwind_in_body(then_body, live_outer, local_types);
+                        if let Some(eb) = else_body {
+                            inject_bc_unwind_in_body(eb, live_outer, local_types);
+                        }
+                    }
+                    TypedStmt::Match { arms, .. } => {
+                        for arm in arms.iter_mut() {
+                            inject_bc_unwind_in_body(&mut arm.body, live_outer, local_types);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            // Do NOT descend into nested loops — their Break/Continue is theirs.
+            _ => {}
+        }
+        i += 1;
+    }
+}
+
+/// Helper: perform the mutable descent for inject_break_continue_unwinds without
+/// holding a simultaneous borrow on body through the live_here set.
+fn inject_bc_unwind_in_body_mut(
+    body: &mut Vec<TypedStmt>,
+    idx: usize,
+    live_here: &HashSet<String>,
+    local_types: &HashMap<String, ResolvedTy>,
+) {
+    match &mut body[idx] {
+        TypedStmt::If { then_body, else_body, .. } => {
+            inject_bc_unwind_in_body(then_body, live_here, local_types);
+            if let Some(eb) = else_body {
+                inject_bc_unwind_in_body(eb, live_here, local_types);
+            }
+        }
+        TypedStmt::Match { arms, .. } => {
+            for arm in arms.iter_mut() {
+                inject_bc_unwind_in_body(&mut arm.body, live_here, local_types);
+            }
+        }
+        _ => {}
+    }
 }
 
 // ── Phase 2: Barrier insertion (GPU-pending set) ──────────────────────────────
@@ -585,8 +808,17 @@ fn insert_barriers(body: &mut Vec<TypedStmt>) {
         }
 
         // Drop of an in-flight name requires a barrier before freeing.
-        if let TypedStmt::Drop { name } = &body[i] {
-            if pending.contains(name.as_str()) {
+        // M12: also guard DropEnum/DropStruct/DropArray — their payload tensor
+        // fields may still be in-flight when the box is released.
+        let drop_name = match &body[i] {
+            TypedStmt::Drop { name }
+            | TypedStmt::DropStruct { name, .. }
+            | TypedStmt::DropEnum { name, .. }
+            | TypedStmt::DropArray { name, .. } => Some(name.as_str()),
+            _ => None,
+        };
+        if let Some(name) = drop_name {
+            if pending.contains(name) {
                 body.insert(i, TypedStmt::GpuBarrier);
                 pending.clear();
                 i += 1; // skip barrier
@@ -657,7 +889,9 @@ fn extract_gpu_producing_expr(stmt: &TypedStmt) -> Option<(Vec<String>, Option<S
         | TypedStmt::Match { .. }
         | TypedStmt::Retain { .. }
         | TypedStmt::Release { .. }
-        | TypedStmt::ForIn { .. } => return None,
+        | TypedStmt::ForIn { .. }
+        | TypedStmt::Break
+        | TypedStmt::Continue => return None,
     };
     match &expr.kind {
         TypedExprKind::KernelCall { in_flight, .. } => {
@@ -767,7 +1001,9 @@ fn collect_idents_in_stmt(stmt: &TypedStmt, out: &mut HashSet<String>) {
         | TypedStmt::DropArray { .. }
         | TypedStmt::GpuBarrier
         | TypedStmt::Retain { .. }
-        | TypedStmt::Release { .. } => {}
+        | TypedStmt::Release { .. }
+        | TypedStmt::Break
+        | TypedStmt::Continue => {}
         TypedStmt::If { condition, then_body, else_body } => {
             collect_idents_in_expr(condition, out);
             for s in then_body { collect_idents_in_stmt(s, out); }

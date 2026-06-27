@@ -4,7 +4,7 @@
 
 malus is a compiled ML DSL for Apple Silicon. Python-like syntax, dual compilation pipeline: `fn` bodies → Cranelift JIT (CPU), `kernel` bodies → Metal Shading Language (GPU). The CTMM memory model inserts static `free`/barrier calls at compile time, falling back to reference counting only when lifetimes are structurally ambiguous.
 
-## Current state: **M11 done — V1 complete; V2 (autograd) and V3 (nanoGPT) planned**
+## Current state: **M12 done — V2 hardening complete; M13 (`Variable` type) next**
 
 | Milestone | Status | Crate |
 |---|---|---|
@@ -21,7 +21,7 @@ malus is a compiled ML DSL for Apple Silicon. Python-like syntax, dual compilati
 | M10 — Structs + Enums (structs, data-carrying enums, match) | ✅ done | `malus-syntax`, `malus-sema`, `malus-codegen-cpu` |
 | M11 — The 2-Layer MLP (fixed arrays, 2-D literals, diagnostics, XOR) | ✅ done | all crates |
 | **V2 — Autograd** | | |
-| M12 — Hardening (enum-payload UAF, zero-length crash, break/continue) | 🔲 planned | `malus-syntax`, `malus-sema`, `malus-codegen-cpu`, `malus-runtime` |
+| M12 — Hardening (enum-payload retain-on-bind, zero-length guard, break/continue) | ✅ done | `malus-syntax`, `malus-sema`, `malus-codegen-cpu`, `malus-runtime` |
 | M13 — The `Variable` Type (type-directed RC, dormant retain/release ABI activated) | 🔲 planned | `malus-syntax`, `malus-sema`, `malus-codegen-cpu` |
 | M14 — The Tape + `backward()` (global tape, VJPs for all V1 ops, `no_grad`) | 🔲 planned | `malus-runtime`, `malus-sema`, `malus-codegen-cpu` |
 | M15 — Differentiable Stdlib + Capstone (`zero_grad`, V2 XOR capstone) | 🔲 planned | all crates |
@@ -100,13 +100,14 @@ examples/
   arrays.ml            # M11: Array<T,N>, ForIn, indexing
   nested_tensor.ml     # M11: 2-D tensor literal [[r0],[r1]]
   xor.ml               # M11 done-when: 2→8→1 sigmoid MLP that learns XOR (V1 capstone)
+  hardening.ml         # M12 done-when: break/continue, zeros(0), enum-payload escape
   import_demo/         # multi-file import demo (main.ml, ops.ml)
-docs/milestones/       # m1–m11 specs, v1-plan.md
+docs/milestones/       # m1–m12 specs, v1-plan.md, v2-plan.md
 docs/spec/             # language spec (01-overview … 09-modules)
 docs/adr/              # architecture decision records
 ```
 
-## The pipeline (V1 complete — M1–M11)
+## The pipeline (M12 complete — M1–M12)
 
 ```
 .ml source file
@@ -166,9 +167,7 @@ The `i64` handle is a raw pointer to a heap-allocated `TensorBuffer { buffer: me
 
 | Limitation | Status | Notes |
 |---|---|---|
-| Enum-payload match-binding use-after-free | M12 | Tensor extracted from match arm aliases DropEnum memory; fix: retain-on-escape |
-| `break`/`continue` statements | M12 | Not yet a keyword; needs CTMM unwind pass analogous to early-return |
-| Zero-length tensors crash Metal | M12 | `kernel_dispatch` with `out_len==0` encodes a zero threadgroup; needs early-return guard |
+| Escaping struct/enum match-arm payload (non-tensor) | M13 | Compile error today (ADR-0019); aggregate boxes have no refcount until M13 adds one |
 | NumPy-style broadcasting | M16 | Element-count must match today; right-aligned broadcast deferred |
 | Axis reductions (`mean`, `var`, `max` with keepdim) | M16 | Only whole-tensor `sum` exists |
 | `reshape`/`view`, batched/3-D matmul | M17 | matmul is 2-D only |

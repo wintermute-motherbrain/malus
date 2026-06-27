@@ -326,6 +326,24 @@ impl Parser {
                     span: Span::new(start.file, start.start as usize, end.end as usize),
                 })
             }
+            TokenKind::Break => {
+                self.advance();
+                let end = self.current_span();
+                self.expect_newline_or_eof()?;
+                Ok(Stmt {
+                    kind: StmtKind::Break,
+                    span: Span::new(start.file, start.start as usize, end.start as usize),
+                })
+            }
+            TokenKind::Continue => {
+                self.advance();
+                let end = self.current_span();
+                self.expect_newline_or_eof()?;
+                Ok(Stmt {
+                    kind: StmtKind::Continue,
+                    span: Span::new(start.file, start.start as usize, end.start as usize),
+                })
+            }
             // ── Control flow ─────────────────────────────────────────────────
             //
             // These stmts end on a DEDENT (not a Newline), so they do NOT call

@@ -144,7 +144,7 @@ _Avoid_: clear gradients, reset gradients
 ### Types (V1)
 
 **Struct**:
-A user-defined product type with named, typed fields. Constructed with keyword arguments: `Layer(weights=w, bias=b)`. Fields accessed with dot notation: `layer.weights`. Tensor fields trigger the RC fallback — the struct holds a retain, released when the struct is dropped.
+A user-defined product type with named, typed fields. Constructed with keyword arguments: `Layer(weights=w, bias=b)`. Fields accessed with dot notation: `layer.weights`. Tensor fields are moved into the struct at construction (ownership transfers; no retain is emitted). `DropStruct` releases each tensor field via `tensor_release`, freeing the tensor when the refcount hits zero.
 _Avoid_: Record, dataclass
 
 **Enum**:

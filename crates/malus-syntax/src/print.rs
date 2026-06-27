@@ -120,6 +120,8 @@ fn print_stmt(out: &mut String, stmt: &Stmt, depth: usize) {
             writeln!(out, "{indent}for {var} in {}:", print_expr(iter)).unwrap();
             for s in body { print_stmt(out, s, depth + 1); }
         }
+        StmtKind::Break => { writeln!(out, "{indent}break").unwrap(); }
+        StmtKind::Continue => { writeln!(out, "{indent}continue").unwrap(); }
     }
 }
 
@@ -400,6 +402,8 @@ mod tests {
                         iter: Box::new(erase_expr(*iter, z)),
                         body: body.into_iter().map(|s| erase_stmt(s, z)).collect(),
                     },
+                StmtKind::Break => StmtKind::Break,
+                StmtKind::Continue => StmtKind::Continue,
             },
         }
     }

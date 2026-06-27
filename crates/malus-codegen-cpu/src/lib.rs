@@ -6,7 +6,7 @@ mod tests;
 
 use std::collections::HashMap;
 
-use cranelift_codegen::ir::{AbiParam, Function, InstBuilder, Signature, UserFuncName};
+use cranelift_codegen::ir::{AbiParam, Block, Function, InstBuilder, Signature, UserFuncName};
 use cranelift_codegen::ir::types::{F32, I8, I16, I32, I64};
 use cranelift_codegen::settings::{self, Configurable};
 
@@ -250,6 +250,7 @@ impl<'m> Codegen<'m> {
             var_map,
             next_var,
             codegen: self,
+            loop_stack: Vec::new(),
         };
 
         let mut returned = false;
@@ -285,6 +286,9 @@ struct FnTranslator<'a, 'm> {
     var_map: HashMap<String, Variable>,
     next_var: usize,
     codegen: &'a mut Codegen<'m>,
+    /// Stack of (continue_blk, break_blk) for the innermost enclosing loops.
+    /// Pushed when entering a For/While/ForIn body, popped on exit.
+    loop_stack: Vec<(Block, Block)>,
 }
 
 impl<'a, 'm> FnTranslator<'a, 'm> {
@@ -349,29 +353,38 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                 let then_blk = self.builder.create_block();
                 let merge_blk = self.builder.create_block();
 
-                // Early return inside a branch body is out of scope for V1, so
-                // every branch body is guaranteed to fall through.  We therefore
-                // always emit the unconditional jump to `merge_blk`.
                 if let Some(eb) = else_body {
                     let else_blk = self.builder.create_block();
                     self.builder.ins().brif(cond_val, then_blk, &[], else_blk, &[]);
 
                     // then branch
                     self.builder.switch_to_block(then_blk);
-                    for s in then_body { self.lower_stmt(s)?; }
-                    self.builder.ins().jump(merge_blk, &[]);
+                    let mut then_term = false;
+                    for s in then_body {
+                        if then_term { break; }
+                        then_term = self.lower_stmt(s)?;
+                    }
+                    if !then_term { self.builder.ins().jump(merge_blk, &[]); }
 
                     // else branch
                     self.builder.switch_to_block(else_blk);
-                    for s in eb { self.lower_stmt(s)?; }
-                    self.builder.ins().jump(merge_blk, &[]);
+                    let mut else_term = false;
+                    for s in eb {
+                        if else_term { break; }
+                        else_term = self.lower_stmt(s)?;
+                    }
+                    if !else_term { self.builder.ins().jump(merge_blk, &[]); }
                 } else {
                     self.builder.ins().brif(cond_val, then_blk, &[], merge_blk, &[]);
 
-                    // then branch
+                    // then branch (no-else: merge_blk already a predecessor via brif)
                     self.builder.switch_to_block(then_blk);
-                    for s in then_body { self.lower_stmt(s)?; }
-                    self.builder.ins().jump(merge_blk, &[]);
+                    let mut then_term = false;
+                    for s in then_body {
+                        if then_term { break; }
+                        then_term = self.lower_stmt(s)?;
+                    }
+                    if !then_term { self.builder.ins().jump(merge_blk, &[]); }
                 }
 
                 self.builder.switch_to_block(merge_blk);
@@ -389,6 +402,8 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
 
                 let header_blk = self.builder.create_block();
                 let body_blk   = self.builder.create_block();
+                // Separate increment block so `continue` increments before re-testing.
+                let incr_blk   = self.builder.create_block();
                 let exit_blk   = self.builder.create_block();
 
                 // Jump from the pre-header into the loop header.
@@ -402,10 +417,21 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                 // `icmp` returns I8; brif branches on nonzero.
                 self.builder.ins().brif(cmp, body_blk, &[], exit_blk, &[]);
 
-                // Loop body.
+                // Loop body: `continue` → incr_blk, `break` → exit_blk.
                 self.builder.switch_to_block(body_blk);
-                for s in body { self.lower_stmt(s)?; }
-                // Increment loop variable and jump back to header (back-edge).
+                self.loop_stack.push((incr_blk, exit_blk));
+                let mut body_terminated = false;
+                for s in body {
+                    if body_terminated { break; }
+                    body_terminated = self.lower_stmt(s)?;
+                }
+                self.loop_stack.pop();
+                if !body_terminated {
+                    self.builder.ins().jump(incr_blk, &[]);
+                }
+
+                // Increment block: advance loop variable, jump back to header.
+                self.builder.switch_to_block(incr_blk);
                 let cur2 = self.builder.use_var(loop_var);
                 let one  = self.builder.ins().iconst(I64, 1);
                 let next = self.builder.ins().iadd(cur2, one);
@@ -428,10 +454,18 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                 let cond_val = self.lower_expr(condition)?;
                 self.builder.ins().brif(cond_val, body_blk, &[], exit_blk, &[]);
 
-                // Loop body.
+                // Loop body: `continue` → header_blk, `break` → exit_blk.
                 self.builder.switch_to_block(body_blk);
-                for s in body { self.lower_stmt(s)?; }
-                self.builder.ins().jump(header_blk, &[]);
+                self.loop_stack.push((header_blk, exit_blk));
+                let mut body_terminated = false;
+                for s in body {
+                    if body_terminated { break; }
+                    body_terminated = self.lower_stmt(s)?;
+                }
+                self.loop_stack.pop();
+                if !body_terminated {
+                    self.builder.ins().jump(header_blk, &[]);
+                }
 
                 self.builder.switch_to_block(exit_blk);
                 Ok(false)
@@ -465,6 +499,8 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
 
                 let header_blk = self.builder.create_block();
                 let body_blk   = self.builder.create_block();
+                // Separate increment block so `continue` advances the index first.
+                let incr_blk   = self.builder.create_block();
                 let exit_blk   = self.builder.create_block();
 
                 self.builder.ins().jump(header_blk, &[]);
@@ -488,9 +524,19 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                 self.builder.def_var(elem_var, elem_val);
 
                 let body = body.clone();
-                for s in &body { self.lower_stmt(s)?; }
+                self.loop_stack.push((incr_blk, exit_blk));
+                let mut body_terminated = false;
+                for s in &body {
+                    if body_terminated { break; }
+                    body_terminated = self.lower_stmt(s)?;
+                }
+                self.loop_stack.pop();
+                if !body_terminated {
+                    self.builder.ins().jump(incr_blk, &[]);
+                }
 
-                // Increment index.
+                // Increment block: advance index, jump back to header.
+                self.builder.switch_to_block(incr_blk);
                 let cur_idx2 = self.builder.use_var(idx_var);
                 let one = self.builder.ins().iconst(I64, 1);
                 let next_idx = self.builder.ins().iadd(cur_idx2, one);
@@ -499,6 +545,21 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
 
                 self.builder.switch_to_block(exit_blk);
                 Ok(false)
+            }
+
+            // ── M12: break / continue ────────────────────────────────────────────
+            TypedStmt::Break => {
+                let (_, break_blk) = *self.loop_stack.last()
+                    .ok_or_else(|| CodegenError::UnsupportedExpr("break outside loop".into()))?;
+                self.builder.ins().jump(break_blk, &[]);
+                Ok(true) // block terminated
+            }
+
+            TypedStmt::Continue => {
+                let (continue_blk, _) = *self.loop_stack.last()
+                    .ok_or_else(|| CodegenError::UnsupportedExpr("continue outside loop".into()))?;
+                self.builder.ins().jump(continue_blk, &[]);
+                Ok(true) // block terminated
             }
 
             // ── M10 RC nodes (wired, not emitted by M9 CTMM) ─────────────────────
