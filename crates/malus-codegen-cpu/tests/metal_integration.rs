@@ -21,6 +21,8 @@ fn real_symbols() -> RuntimeSymbols {
         tensor_transpose:       malus_runtime::tensor_transpose,
         tensor_sum:             malus_runtime::tensor_sum,
         tensor_len:             malus_runtime::tensor_len,
+        tensor_retain:          malus_runtime::tensor_retain,
+        tensor_release:         malus_runtime::tensor_release,
     }
 }
 

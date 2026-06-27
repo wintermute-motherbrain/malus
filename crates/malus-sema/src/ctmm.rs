@@ -1,32 +1,93 @@
+// CTMM: hierarchical last-use analysis for `fn` bodies.
+//
+// Injects `Drop` and `GpuBarrier` nodes so tensor allocations are freed
+// statically without reference counting.  Kernel bodies are skipped — they
+// borrow their inputs and return a new owned tensor; no local allocations
+// exist inside a kernel body in V1.
+//
+// ## Hierarchical pass order (M9, see ADR-0014)
+//
+// Control flow (`if`/`for`/`while`) created a problem for the original flat
+// linear scan: a tensor whose last use was inside a branch would get its `Drop`
+// placed at the wrong position (or skipped).  The hierarchical analysis fixes
+// this by recursing into inner scopes *first*:
+//
+//   1. `hoist_gpu_subexprs`          — outer body, control-flow nodes passed through unchanged
+//   2. `hoist_gpu_producing_returns` — outer body, control-flow nodes passed through unchanged
+//   3. `recurse_into_inner_scopes`   — full `annotate_body` on each if/for/while body
+//   4. `collect_local_bindings`      — outer body only (inner bindings handled in step 3)
+//   5. `collect_escaping`            — recurses into inner bodies (return inside branch)
+//   6. `insert_assign_drops`         — recurses into inner bodies; `locals` guard removed
+//   7. `find_last_uses`              — `collect_idents_in_stmt` recurses, so outer analysis
+//                                      sees inner references and records last-use at the
+//                                      control-flow node's position in the outer body
+//   8. `insert_drops`                — outer body only
+//   9. `insert_barriers`             — outer body with precise recursive boundary check
+
 use std::collections::{HashMap, HashSet};
 use malus_syntax::ast::Placement;
 use crate::typed_ir::{TypedExpr, TypedExprKind, TypedFn, TypedStmt};
 
-/// CTMM: run last-use analysis on all fn bodies, injecting Drop and GpuBarrier nodes.
-/// Kernel bodies are skipped — kernels borrow their inputs and return new owned tensors;
-/// there is no local allocation to free inside a kernel body in v0.1.
+// ── Public entry point ────────────────────────────────────────────────────────
+
+/// Run the CTMM analysis on all `fn` bodies, injecting `Drop` and `GpuBarrier`
+/// nodes.  Kernel bodies are skipped.
 pub fn annotate_fns(fns: &mut Vec<TypedFn>) {
     for f in fns.iter_mut() {
         annotate_body(&mut f.body);
     }
 }
 
+// ── Core analysis ─────────────────────────────────────────────────────────────
+
 fn annotate_body(body: &mut Vec<TypedStmt>) {
+    // Steps 1-2: hoist GPU subexpressions and GPU-producing returns in the outer
+    // body.  Control-flow nodes are passed through unchanged — their inner bodies
+    // will be hoisted in step 3 when `annotate_body` recurses into them.
     hoist_gpu_subexprs(body);
     hoist_gpu_producing_returns(body);
-    let local_bindings = collect_local_bindings(body);
+
+    // Step 3: recurse into each inner scope *before* running the outer passes.
+    // This gives inner bindings their own `Drop` and `GpuBarrier` nodes, and
+    // means the outer passes can treat `If`/`For`/`While` as opaque use sites.
+    recurse_into_inner_scopes(body);
+
+    // Steps 4-9: outer-scope analysis.
+    let locals = collect_local_bindings(body);
     let escaping = collect_escaping(body);
-    insert_assign_drops(body, &local_bindings, &escaping);
-    let last_uses = find_last_uses(body, &local_bindings, &escaping);
+    insert_assign_drops(body, &escaping);
+    let last_uses = find_last_uses(body, &locals, &escaping);
     insert_drops(body, &last_uses);
     insert_barriers(body);
 }
 
+/// Step 3: call `annotate_body` on each inner scope so inner bindings get
+/// their own `Drop`/`GpuBarrier` nodes.
+fn recurse_into_inner_scopes(body: &mut Vec<TypedStmt>) {
+    for stmt in body.iter_mut() {
+        match stmt {
+            TypedStmt::If { then_body, else_body, .. } => {
+                annotate_body(then_body);
+                if let Some(eb) = else_body { annotate_body(eb); }
+            }
+            TypedStmt::For { body, .. } | TypedStmt::While { body, .. } => {
+                annotate_body(body);
+            }
+            _ => {}
+        }
+    }
+}
+
+// ── GPU-producing predicate ───────────────────────────────────────────────────
+
 fn is_gpu_producing(expr: &TypedExpr) -> bool {
     matches!(&expr.kind, TypedExprKind::KernelCall { .. })
         || matches!(&expr.kind, TypedExprKind::BinOp { lhs, .. } if lhs.ty.is_tensor())
-        || matches!(&expr.kind, TypedExprKind::Call { .. } if expr.ty.is_tensor() && expr.placement == Some(Placement::Gpu))
+        || matches!(&expr.kind, TypedExprKind::Call { .. }
+                    if expr.ty.is_tensor() && expr.placement == Some(Placement::Gpu))
 }
+
+// ── Step 1: GPU subexpression hoisting ───────────────────────────────────────
 
 fn hoist_gpu_subexprs(body: &mut Vec<TypedStmt>) {
     let mut counter = 0u32;
@@ -77,6 +138,8 @@ fn hoist_gpu_subexprs(body: &mut Vec<TypedStmt>) {
                 result.extend(hoisted);
                 result.push(TypedStmt::Expr(expr));
             }
+            // Control-flow nodes are passed through unchanged; their inner bodies
+            // are hoisted when `annotate_body` recurses in step 3.
             other => result.push(other),
         }
     }
@@ -192,6 +255,8 @@ fn hoist_args(
     new_args
 }
 
+// ── Step 2: GPU-producing return hoisting ─────────────────────────────────────
+
 fn hoist_gpu_producing_returns(body: &mut Vec<TypedStmt>) {
     let mut i = 0;
     let mut counter = 0u32;
@@ -222,23 +287,41 @@ fn hoist_gpu_producing_returns(body: &mut Vec<TypedStmt>) {
 
 // ── Phase 0: Assign old-value drops ──────────────────────────────────────────
 
-/// Insert Drop{name} immediately before each Assign to a local tensor binding.
-/// This frees the old tensor allocation before the Assign writes the new value.
-/// Must run after hoist_gpu_subexprs (which ensures the Assign RHS no longer
-/// references the target, making the early Drop safe) and before find_last_uses.
-fn insert_assign_drops(
-    body: &mut Vec<TypedStmt>,
-    locals: &HashSet<String>,
-    escaping: &HashSet<String>,
-) {
+/// Insert `Drop{name}` immediately before each `Assign` to a tensor binding.
+/// Frees the old tensor allocation before the Assign writes the new value.
+///
+/// The `locals.contains(name)` guard from the original code is intentionally
+/// absent (see ADR-0014 §4): the type checker guarantees only `let mut` bindings
+/// appear as Assign targets (never parameters), so checking against the outer
+/// `locals` set is unnecessary and would incorrectly suppress drops for outer
+/// `let mut` tensors reassigned inside a loop body.
+///
+/// Must run after `hoist_gpu_subexprs` (which ensures the Assign RHS no longer
+/// references the target via the D6 guard, making the early Drop safe).
+fn insert_assign_drops(body: &mut Vec<TypedStmt>, escaping: &HashSet<String>) {
     let mut i = 0;
     while i < body.len() {
-        if let TypedStmt::Assign { name, expr } = &body[i] {
-            if locals.contains(name) && !escaping.contains(name) && expr.ty.is_tensor() {
+        match &body[i] {
+            TypedStmt::Assign { name, expr }
+                if !escaping.contains(name) && expr.ty.is_tensor() =>
+            {
                 let name = name.clone();
                 body.insert(i, TypedStmt::Drop { name });
                 i += 1; // skip past the Drop we just inserted
             }
+            _ => {}
+        }
+        // Recurse into inner bodies so outer-scope `let mut` tensors reassigned
+        // inside a loop get a Drop before each inner Assign.
+        match &mut body[i] {
+            TypedStmt::If { then_body, else_body, .. } => {
+                insert_assign_drops(then_body, escaping);
+                if let Some(eb) = else_body { insert_assign_drops(eb, escaping); }
+            }
+            TypedStmt::For { body: inner, .. } | TypedStmt::While { body: inner, .. } => {
+                insert_assign_drops(inner, escaping);
+            }
+            _ => {}
         }
         i += 1;
     }
@@ -288,6 +371,23 @@ fn insert_barriers(body: &mut Vec<TypedStmt>) {
             continue;
         }
 
+        // Control-flow nodes: if any pending tensor is referenced anywhere inside
+        // the node, emit a barrier before it and clear pending.  The inner bodies
+        // already received their own barrier pass in `annotate_body` step 3.
+        if matches!(&body[i], TypedStmt::If { .. } | TypedStmt::For { .. } | TypedStmt::While { .. }) {
+            if !pending.is_empty() {
+                let mut referenced = HashSet::new();
+                collect_idents_in_stmt(&body[i], &mut referenced);
+                if referenced.intersection(&pending).next().is_some() {
+                    body.insert(i, TypedStmt::GpuBarrier);
+                    pending.clear();
+                    i += 1;
+                }
+            }
+            i += 1;
+            continue;
+        }
+
         if let Some((in_flight, output_name)) = extract_gpu_producing_expr(&body[i]) {
             for n in &in_flight {
                 pending.insert(n.clone());
@@ -320,7 +420,14 @@ fn extract_gpu_producing_expr(stmt: &TypedStmt) -> Option<(Vec<String>, Option<S
         TypedStmt::Let { name, expr } => (expr, Some(name.clone())),
         TypedStmt::Expr(expr) => (expr, None),
         TypedStmt::Return { expr } => (expr, None),
-        TypedStmt::Drop { .. } | TypedStmt::GpuBarrier | TypedStmt::Assign { .. } => return None,
+        TypedStmt::Drop { .. }
+        | TypedStmt::GpuBarrier
+        | TypedStmt::Assign { .. }
+        | TypedStmt::If { .. }
+        | TypedStmt::For { .. }
+        | TypedStmt::While { .. }
+        | TypedStmt::Retain { .. }
+        | TypedStmt::Release { .. } => return None,
     };
     match &expr.kind {
         TypedExprKind::KernelCall { in_flight, .. } => {
@@ -331,7 +438,9 @@ fn extract_gpu_producing_expr(stmt: &TypedStmt) -> Option<(Vec<String>, Option<S
             collect_idents_in_expr(expr, &mut idents);
             Some((idents.into_iter().collect(), output_name))
         }
-        TypedExprKind::Call { args, .. } if expr.ty.is_tensor() && expr.placement == Some(Placement::Gpu) => {
+        TypedExprKind::Call { args, .. }
+            if expr.ty.is_tensor() && expr.placement == Some(Placement::Gpu) =>
+        {
             let mut idents = HashSet::new();
             for a in args {
                 collect_idents_in_expr(a, &mut idents);
@@ -344,28 +453,43 @@ fn extract_gpu_producing_expr(stmt: &TypedStmt) -> Option<(Vec<String>, Option<S
 
 // ── Binding collection helpers ────────────────────────────────────────────────
 
+/// Collect `let` bindings introduced directly in `body` (not in inner scopes).
+/// Inner bindings are handled by the recursive `annotate_body` in step 3.
 fn collect_local_bindings(body: &[TypedStmt]) -> HashSet<String> {
     body.iter().filter_map(|s| {
         if let TypedStmt::Let { name, .. } = s { Some(name.clone()) } else { None }
     }).collect()
 }
 
+/// Collect names that must not be statically dropped:
+/// - tensors that appear in a `return` expr (they escape to the caller)
+/// - tensor idents that are the RHS of an `Assign` (moved into the target;
+///   the target's own `Drop` will free it — dropping the source would double-free)
+///
+/// Recurses into inner bodies so a `return` inside a branch is accounted for.
 fn collect_escaping(body: &[TypedStmt]) -> HashSet<String> {
     let mut escaping = HashSet::new();
+    collect_escaping_in(body, &mut escaping);
+    escaping
+}
+
+fn collect_escaping_in(body: &[TypedStmt], out: &mut HashSet<String>) {
     for stmt in body {
-        if let TypedStmt::Return { expr } = stmt {
-            collect_idents_in_expr(expr, &mut escaping);
-        }
-        // A tensor ident that is the RHS of an Assign is "moved" into the target.
-        // The target's final Drop will free the allocation, so the source temp
-        // must NOT be separately dropped (that would be a double-free).
-        if let TypedStmt::Assign { expr, .. } = stmt {
-            if expr.ty.is_tensor() {
-                collect_idents_in_expr(expr, &mut escaping);
+        match stmt {
+            TypedStmt::Return { expr } => collect_idents_in_expr(expr, out),
+            TypedStmt::Assign { expr, .. } if expr.ty.is_tensor() => {
+                collect_idents_in_expr(expr, out);
             }
+            TypedStmt::If { then_body, else_body, .. } => {
+                collect_escaping_in(then_body, out);
+                if let Some(eb) = else_body { collect_escaping_in(eb, out); }
+            }
+            TypedStmt::For { body, .. } | TypedStmt::While { body, .. } => {
+                collect_escaping_in(body, out);
+            }
+            _ => {}
         }
     }
-    escaping
 }
 
 fn find_last_uses(
@@ -376,6 +500,10 @@ fn find_last_uses(
     let mut last: HashMap<String, usize> = HashMap::new();
     for (idx, stmt) in body.iter().enumerate() {
         let mut used = HashSet::new();
+        // `collect_idents_in_stmt` recurses into control-flow bodies so outer
+        // bindings referenced *inside* an If/For/While are recorded at the
+        // index of the control-flow node in the outer body.  This causes `Drop`
+        // to be inserted *after* the node, which is always correct.
         collect_idents_in_stmt(stmt, &mut used);
         for name in &used {
             if locals.contains(name) && !escaping.contains(name) {
@@ -390,11 +518,30 @@ fn find_last_uses(
 
 fn collect_idents_in_stmt(stmt: &TypedStmt, out: &mut HashSet<String>) {
     match stmt {
-        TypedStmt::Let { expr, .. } => collect_idents_in_expr(expr, out),
-        TypedStmt::Assign { expr, .. } => collect_idents_in_expr(expr, out),
-        TypedStmt::Return { expr } => collect_idents_in_expr(expr, out),
+        TypedStmt::Let { expr, .. }
+        | TypedStmt::Assign { expr, .. }
+        | TypedStmt::Return { expr } => collect_idents_in_expr(expr, out),
         TypedStmt::Expr(expr) => collect_idents_in_expr(expr, out),
-        TypedStmt::Drop { .. } | TypedStmt::GpuBarrier => {}
+        TypedStmt::Drop { .. }
+        | TypedStmt::GpuBarrier
+        | TypedStmt::Retain { .. }
+        | TypedStmt::Release { .. } => {}
+        TypedStmt::If { condition, then_body, else_body } => {
+            collect_idents_in_expr(condition, out);
+            for s in then_body { collect_idents_in_stmt(s, out); }
+            if let Some(eb) = else_body {
+                for s in eb { collect_idents_in_stmt(s, out); }
+            }
+        }
+        TypedStmt::For { start, end, body, .. } => {
+            collect_idents_in_expr(start, out);
+            collect_idents_in_expr(end, out);
+            for s in body { collect_idents_in_stmt(s, out); }
+        }
+        TypedStmt::While { condition, body } => {
+            collect_idents_in_expr(condition, out);
+            for s in body { collect_idents_in_stmt(s, out); }
+        }
     }
 }
 

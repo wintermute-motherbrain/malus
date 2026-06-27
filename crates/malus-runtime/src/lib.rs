@@ -8,7 +8,7 @@ mod metal;
 #[cfg(target_os = "macos")]
 pub use metal::{
     runtime_init, tensor_alloc_gpu, tensor_alloc_zeros_gpu, tensor_alloc_ones_gpu,
-    tensor_free, tensor_print, tensor_len,
+    tensor_retain, tensor_release, tensor_free, tensor_print, tensor_len,
     tensor_matmul, tensor_transpose, tensor_sum,
     kernel_dispatch, gpu_barrier, Dtype, TensorBuffer,
 };

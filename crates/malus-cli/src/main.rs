@@ -54,6 +54,8 @@ fn run_script(path: &str) {
             tensor_transpose:       malus_runtime::tensor_transpose,
             tensor_sum:             malus_runtime::tensor_sum,
             tensor_len:             malus_runtime::tensor_len,
+            tensor_retain:          malus_runtime::tensor_retain,
+            tensor_release:         malus_runtime::tensor_release,
         };
         if let Err(e) = malus_codegen_cpu::compile_and_run(&typed, &symbols, &kernel_ids) {
             eprintln!("malus: {}", e);

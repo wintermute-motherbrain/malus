@@ -504,3 +504,248 @@ fn main():
     assert!(matches!(&k.body[0], TypedStmt::Let { name, .. } if name == "mask"));
     assert!(matches!(&k.body[1], TypedStmt::Return { .. }));
 }
+
+// ── M9: control-flow type-checking ───────────────────────────────────────────
+
+#[test]
+fn test_if_typechecks() {
+    let src = r#"
+fn main():
+    let a = Tensor.gpu<f32>([1.0, 2.0])
+    let b = Tensor.gpu<f32>([3.0, 4.0])
+    if a.len > 1:
+        print(b)
+    print(a)
+"#;
+    let typed = check_src(src).expect("if stmt should type-check");
+    let main = typed.fns.iter().find(|f| f.name == "main").unwrap();
+    let has_if = main.body.iter().any(|s| matches!(s, TypedStmt::If { .. }));
+    assert!(has_if, "If node should be present in typed body");
+}
+
+#[test]
+fn test_if_condition_must_be_bool() {
+    let src = r#"
+fn main():
+    let a = Tensor.gpu<f32>([1.0])
+    if a:
+        print(a)
+"#;
+    // A tensor is not Bool — should fail.
+    let errors = check_src(src).expect_err("tensor condition should fail");
+    assert!(errors.iter().any(|e| matches!(e, SemaError::TypeMismatch { .. })),
+        "expected TypeMismatch for non-bool condition, got: {:?}", errors);
+}
+
+#[test]
+fn test_if_else_typechecks() {
+    let src = r#"
+fn main():
+    let x = Tensor.gpu<f32>([1.0])
+    if x.len > 0:
+        print(x)
+    else:
+        print(x)
+"#;
+    let typed = check_src(src).expect("if/else should type-check");
+    let main = typed.fns.iter().find(|f| f.name == "main").unwrap();
+    let has_if = main.body.iter().any(|s| matches!(s, TypedStmt::If { else_body: Some(_), .. }));
+    assert!(has_if, "If node with else_body should be present");
+}
+
+#[test]
+fn test_for_loop_var_is_i64() {
+    // Loop var `i` should be Scalar(I64) and visible inside the body.
+    let src = r#"
+fn main():
+    let a = Tensor.gpu<f32>([1.0])
+    for i in range(3):
+        print(a)
+    print(a)
+"#;
+    let typed = check_src(src).expect("for loop should type-check");
+    let main = typed.fns.iter().find(|f| f.name == "main").unwrap();
+    let has_for = main.body.iter().any(|s| matches!(s, TypedStmt::For { .. }));
+    assert!(has_for, "For node should be present");
+}
+
+#[test]
+fn test_for_loop_var_does_not_escape() {
+    // Loop var `i` is scoped to the loop body; referencing it after should fail.
+    let src = r#"
+fn main():
+    for i in range(3):
+        print(i)
+    print(i)
+"#;
+    let errors = check_src(src).expect_err("loop var should not be visible after loop");
+    assert!(
+        errors.iter().any(|e| matches!(e, SemaError::UnknownIdent { name, .. } if name == "i")),
+        "expected UnknownIdent(i), got: {:?}", errors
+    );
+}
+
+#[test]
+fn test_while_typechecks() {
+    let src = r#"
+fn main():
+    let a = Tensor.gpu<f32>([1.0])
+    while a.len > 0:
+        print(a)
+"#;
+    let typed = check_src(src).expect("while stmt should type-check");
+    let main = typed.fns.iter().find(|f| f.name == "main").unwrap();
+    let has_while = main.body.iter().any(|s| matches!(s, TypedStmt::While { .. }));
+    assert!(has_while, "While node should be present in typed body");
+}
+
+// ── M9: CTMM — hierarchical drop placement ───────────────────────────────────
+
+/// Helper: collect all TypedStmt variants (recursively) into a flat list of
+/// variant names.  Used by CTMM tests to assert on the overall stmt sequence.
+fn flat_stmt_kinds(stmts: &[TypedStmt]) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    for s in stmts {
+        let tag = match s {
+            TypedStmt::Let { .. }      => "Let",
+            TypedStmt::Assign { .. }   => "Assign",
+            TypedStmt::Return { .. }   => "Return",
+            TypedStmt::Expr(_)         => "Expr",
+            TypedStmt::Drop { .. }     => "Drop",
+            TypedStmt::GpuBarrier      => "GpuBarrier",
+            TypedStmt::If { .. }       => "If",
+            TypedStmt::For { .. }      => "For",
+            TypedStmt::While { .. }    => "While",
+            TypedStmt::Retain { .. }   => "Retain",
+            TypedStmt::Release { .. }  => "Release",
+        };
+        out.push(tag);
+    }
+    out
+}
+
+fn drops_in(stmts: &[TypedStmt]) -> Vec<&str> {
+    stmts.iter().filter_map(|s| {
+        if let TypedStmt::Drop { name } = s { Some(name.as_str()) } else { None }
+    }).collect()
+}
+
+/// Loop-local tensor `out` must be freed *inside* the for body, not after the loop.
+#[test]
+fn test_ctmm_loop_local_drop_inside_body() {
+    let src = r#"
+kernel add(a: Tensor<f32>, b: Tensor<f32>) -> Tensor<f32>:
+    return a + b
+
+fn main():
+    let x = Tensor.gpu<f32>([1.0, 2.0])
+    let y = Tensor.gpu<f32>([3.0, 4.0])
+    for i in range(3):
+        let out = add(x, y)
+        print(out)
+    print(x)
+"#;
+    let typed = check_src(src).expect("should type-check");
+    let main = typed.fns.iter().find(|f| f.name == "main").unwrap();
+    // Outer body must NOT drop `out` (it's loop-local).
+    let outer_drops = drops_in(&main.body);
+    assert!(!outer_drops.contains(&"out"),
+        "outer body must not drop loop-local `out`, got outer drops: {:?}", outer_drops);
+    // The For node's body must contain Drop{out}.
+    let for_body = main.body.iter().find_map(|s| {
+        if let TypedStmt::For { body, .. } = s { Some(body.as_slice()) } else { None }
+    }).expect("For node not found");
+    let inner_drops = drops_in(for_body);
+    assert!(inner_drops.contains(&"out"),
+        "loop body must drop `out` after last use, inner drops: {:?}", inner_drops);
+}
+
+/// Outer tensor referenced inside a loop must be dropped *after* the For node.
+#[test]
+fn test_ctmm_outer_tensor_dropped_after_loop() {
+    let src = r#"
+fn main():
+    let x = Tensor.gpu<f32>([1.0, 2.0])
+    for i in range(3):
+        print(x)
+"#;
+    let typed = check_src(src).expect("should type-check");
+    let main = typed.fns.iter().find(|f| f.name == "main").unwrap();
+    // x should be dropped in the outer body, after the For node.
+    let outer_drops = drops_in(&main.body);
+    assert!(outer_drops.contains(&"x"),
+        "outer body must drop `x` after the loop, outer drops: {:?}", outer_drops);
+    // And it must come AFTER the For node.
+    let for_idx = main.body.iter().position(|s| matches!(s, TypedStmt::For { .. }))
+        .expect("For node not found");
+    let drop_x_idx = main.body.iter().rposition(|s| matches!(s, TypedStmt::Drop { name } if name == "x"))
+        .expect("Drop(x) not found");
+    assert!(drop_x_idx > for_idx,
+        "Drop(x) at {} must be after For at {}", drop_x_idx, for_idx);
+}
+
+/// `let mut acc` reassigned inside a loop gets Drop(acc) before each Assign.
+#[test]
+fn test_ctmm_let_mut_assign_drop_inside_loop() {
+    let src = r#"
+kernel add(a: Tensor<f32>, b: Tensor<f32>) -> Tensor<f32>:
+    return a + b
+
+fn main():
+    let mut acc = Tensor.gpu<f32>([0.0, 0.0])
+    let delta = Tensor.gpu<f32>([1.0, 2.0])
+    for i in range(3):
+        acc = add(acc, delta)
+    print(acc)
+"#;
+    let typed = check_src(src).expect("should type-check");
+    let main = typed.fns.iter().find(|f| f.name == "main").unwrap();
+    let for_body = main.body.iter().find_map(|s| {
+        if let TypedStmt::For { body, .. } = s { Some(body.as_slice()) } else { None }
+    }).expect("For node not found");
+    // Drop(acc) must appear before Assign(acc) inside the loop body.
+    let drop_before_assign = {
+        let mut saw_drop = false;
+        let mut found = false;
+        for stmt in for_body {
+            if matches!(stmt, TypedStmt::Drop { name } if name == "acc") { saw_drop = true; }
+            if matches!(stmt, TypedStmt::Assign { name, .. } if name == "acc") && saw_drop { found = true; }
+        }
+        found
+    };
+    assert!(drop_before_assign, "Drop(acc) must precede Assign(acc) in loop body; body: {:#?}", for_body);
+}
+
+/// M9 emits no Retain or Release nodes (ADR-0014: hierarchical Drop is sufficient).
+#[test]
+fn test_ctmm_no_retain_release_in_m9() {
+    let src = r#"
+kernel add(a: Tensor<f32>, b: Tensor<f32>) -> Tensor<f32>:
+    return a + b
+
+fn main():
+    let x = Tensor.gpu<f32>([1.0, 2.0])
+    let y = Tensor.gpu<f32>([3.0, 4.0])
+    for i in range(5):
+        let out = add(x, y)
+        print(out)
+    if x.len > 0:
+        print(x)
+"#;
+    let typed = check_src(src).expect("should type-check");
+
+    fn has_rc(stmts: &[TypedStmt]) -> bool {
+        stmts.iter().any(|s| match s {
+            TypedStmt::Retain { .. } | TypedStmt::Release { .. } => true,
+            TypedStmt::If { then_body, else_body, .. } => {
+                has_rc(then_body) || else_body.as_deref().map(has_rc).unwrap_or(false)
+            }
+            TypedStmt::For { body, .. } | TypedStmt::While { body, .. } => has_rc(body),
+            _ => false,
+        })
+    }
+
+    for f in &typed.fns {
+        assert!(!has_rc(&f.body), "M9 must emit no Retain/Release — found some in fn {}", f.name);
+    }
+}

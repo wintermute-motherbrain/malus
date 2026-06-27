@@ -112,6 +112,27 @@ pub enum StmtKind {
     Assign { target: String, expr: Expr },
     Return { expr: Expr },
     Expr(Expr),
+    /// `if condition: body [else: body]`
+    ///
+    /// `else if` is expressed as `else_body = Some(vec![If { .. }])` — the user
+    /// writes an `if` inside the `else:` block, which produces the same tree.
+    If {
+        condition: Expr,
+        then_body: Vec<Stmt>,
+        else_body: Option<Vec<Stmt>>,
+    },
+    /// `for var in range(end):` or `for var in range(start, end):`
+    ///
+    /// `range` is syntactic sugar recognised only in this position — it is NOT
+    /// a runtime function. The parser desugars `range(n)` to `start = 0, end = n`.
+    For {
+        var: String,
+        start: Expr,
+        end: Expr,
+        body: Vec<Stmt>,
+    },
+    /// `while condition: body`
+    While { condition: Expr, body: Vec<Stmt> },
 }
 
 // ── Parameters ────────────────────────────────────────────────────────────────

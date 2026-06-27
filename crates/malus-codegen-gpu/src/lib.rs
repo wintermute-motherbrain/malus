@@ -165,7 +165,10 @@ fn collect_binops_in_stmt(
         TypedStmt::Assign { expr, .. } => collect_binops_in_expr(expr, tensor_ops, scalar_ops),
         TypedStmt::Return { expr } => collect_binops_in_expr(expr, tensor_ops, scalar_ops),
         TypedStmt::Expr(expr) => collect_binops_in_expr(expr, tensor_ops, scalar_ops),
-        TypedStmt::Drop { .. } | TypedStmt::GpuBarrier => {}
+        TypedStmt::Drop { .. } | TypedStmt::GpuBarrier
+        | TypedStmt::Retain { .. } | TypedStmt::Release { .. } => {}
+        // Kernel bodies cannot contain control flow (V1 constraint).
+        TypedStmt::If { .. } | TypedStmt::For { .. } | TypedStmt::While { .. } => {}
     }
 }
 
@@ -221,7 +224,9 @@ fn collect_unary_builtins_in_stmt(stmt: &TypedStmt, out: &mut BTreeSet<String>) 
             collect_unary_builtins_in_expr(expr, out);
         }
         TypedStmt::Expr(expr) => collect_unary_builtins_in_expr(expr, out),
-        TypedStmt::Drop { .. } | TypedStmt::GpuBarrier => {}
+        TypedStmt::Drop { .. } | TypedStmt::GpuBarrier
+        | TypedStmt::Retain { .. } | TypedStmt::Release { .. } => {}
+        TypedStmt::If { .. } | TypedStmt::For { .. } | TypedStmt::While { .. } => {}
     }
 }
 

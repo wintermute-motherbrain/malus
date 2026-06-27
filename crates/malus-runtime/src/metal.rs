@@ -79,6 +79,10 @@ pub struct TensorBuffer {
     pub dtype: Dtype,
     pub len: usize,
     pub shape: Vec<usize>,
+    /// Reference count for M10 RC paths. Initialized to 1 at allocation;
+    /// freed when decremented to 0 via `tensor_release`.  `tensor_free`
+    /// delegates to `tensor_release`, so all free paths share one code path.
+    pub ref_count: std::sync::atomic::AtomicUsize,
 }
 
 // ── Runtime init: compile all MSL kernels ─────────────────────────────────────
@@ -136,7 +140,13 @@ pub extern "C" fn tensor_alloc_gpu(
         }
     }
 
-    let tb = Box::new(TensorBuffer { buffer, dtype: dt, len: n, shape });
+    let tb = Box::new(TensorBuffer {
+        buffer,
+        dtype: dt,
+        len: n,
+        shape,
+        ref_count: std::sync::atomic::AtomicUsize::new(1),
+    });
     Box::into_raw(tb) as i64
 }
 
@@ -154,14 +164,41 @@ pub extern "C" fn tensor_alloc_ones_gpu(shape_ptr: *const usize, ndims: usize) -
     tensor_alloc_gpu(0, shape_ptr, ndims, ones_data.as_ptr())
 }
 
+/// Increment the reference count of the tensor at `handle`.
+///
+/// M9 never calls this; it exists so M10 struct-field RC paths have the ABI
+/// available without requiring a runtime version bump.
 #[no_mangle]
-pub extern "C" fn tensor_free(handle: i64) {
+pub extern "C" fn tensor_retain(handle: i64) {
     if handle == 0 {
         return;
     }
-    unsafe {
-        drop(Box::from_raw(handle as *mut TensorBuffer));
+    let tb = unsafe { &*(handle as *const TensorBuffer) };
+    tb.ref_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Decrement the reference count.  Frees the tensor when it reaches zero.
+///
+/// All free paths (including `tensor_free`) go through here so the ownership
+/// invariant is single-sourced.
+#[no_mangle]
+pub extern "C" fn tensor_release(handle: i64) {
+    if handle == 0 {
+        return;
     }
+    let tb = unsafe { &*(handle as *const TensorBuffer) };
+    // AcqRel: Acquire on the last decrement so all prior writes to the buffer
+    // are visible before the drop; Release on all earlier decrements.
+    if tb.ref_count.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 {
+        unsafe { drop(Box::from_raw(handle as *mut TensorBuffer)); }
+    }
+}
+
+/// Free a tensor unconditionally.  Delegates to `tensor_release` so the
+/// decrement-to-zero path is shared.  Callers must not use `handle` after this.
+#[no_mangle]
+pub extern "C" fn tensor_free(handle: i64) {
+    tensor_release(handle);
 }
 
 #[no_mangle]

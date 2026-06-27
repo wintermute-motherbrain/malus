@@ -157,6 +157,10 @@ extern "C" fn mock_tensor_len(handle: i64) -> i64 {
     with_store(|s| s.get_len(handle)) as i64
 }
 
+// M9 RC ABI — no-ops in tests (M9 CTMM emits no Retain/Release nodes).
+extern "C" fn mock_tensor_retain(_handle: i64) {}
+extern "C" fn mock_tensor_release(_handle: i64) {}
+
 fn mock_symbols() -> RuntimeSymbols {
     RuntimeSymbols {
         tensor_alloc_gpu:       mock_tensor_alloc_gpu,
@@ -170,7 +174,14 @@ fn mock_symbols() -> RuntimeSymbols {
         tensor_transpose:       mock_tensor_transpose,
         tensor_sum:             mock_tensor_sum,
         tensor_len:             mock_tensor_len,
+        tensor_retain:          mock_tensor_retain,
+        tensor_release:         mock_tensor_release,
     }
+}
+
+/// Return the current number of live tensors in the mock store.
+fn live_tensor_count() -> usize {
+    with_store(|s| s.tensors.len())
 }
 
 fn run_src(src: &str) -> Result<(), CodegenError> {
@@ -582,4 +593,131 @@ fn main():
     println("exp result: {}", exp(x))
 "#;
     run_src(src).expect("done-when MLP forward should compile and run");
+}
+
+// ── M9: control flow ─────────────────────────────────────────────────────────
+
+#[test]
+fn test_if_taken_branch() {
+    let src = r#"
+fn main():
+    let a = Tensor.gpu<f32>([1.0, 2.0])
+    if a.len > 0:
+        print(a)
+"#;
+    run_src(src).expect("if (taken) should compile and run");
+    // a must not leak: should be freed after the if stmt.
+    assert_eq!(live_tensor_count(), 0, "a must be freed after the if stmt");
+}
+
+#[test]
+fn test_if_not_taken_no_crash() {
+    // Condition is false (len of a 2-element tensor is 2, not > 5).
+    let src = r#"
+fn main():
+    let a = Tensor.gpu<f32>([1.0, 2.0])
+    if a.len > 5:
+        print(a)
+"#;
+    run_src(src).expect("if (not taken) should compile and run without crash");
+    assert_eq!(live_tensor_count(), 0, "a must be freed even when branch is not taken");
+}
+
+#[test]
+fn test_if_else() {
+    let src = r#"
+fn main():
+    let a = Tensor.gpu<f32>([1.0, 2.0])
+    if a.len > 5:
+        print(a)
+    else:
+        print(a)
+"#;
+    run_src(src).expect("if/else should compile and run");
+    assert_eq!(live_tensor_count(), 0, "a must be freed after if/else");
+}
+
+#[test]
+fn test_for_loop_n_iterations() {
+    // Loop runs 4 iterations.  Each iteration allocates one tensor via add(a, b).
+    // CTMM places a Drop inside the loop body, so `out` is freed each iteration.
+    let src = r#"
+kernel add(a: Tensor<f32>, b: Tensor<f32>) -> Tensor<f32>:
+    return a + b
+
+fn main():
+    let a = Tensor.gpu<f32>([1.0, 2.0])
+    let b = Tensor.gpu<f32>([3.0, 4.0])
+    for i in range(4):
+        let out = add(a, b)
+        print(out)
+"#;
+    run_src(src).expect("for loop should compile and run");
+    // a, b freed after loop; out freed each iteration → nothing left.
+    assert_eq!(live_tensor_count(), 0, "no tensors should leak after for loop");
+    // add dispatched once per iteration → 4 times total.
+    assert_eq!(dispatch_count(), 4, "kernel should dispatch once per iteration");
+}
+
+#[test]
+fn test_for_loop_zero_iterations() {
+    let src = r#"
+fn main():
+    let a = Tensor.gpu<f32>([1.0])
+    for i in range(0):
+        print(a)
+"#;
+    run_src(src).expect("for loop with zero iterations should not crash");
+    assert_eq!(live_tensor_count(), 0, "a must be freed even with zero iterations");
+}
+
+#[test]
+fn test_while_loop() {
+    // We can't easily mutate the loop condition in the current IR without
+    // let mut + integer arithmetic, so just test that a while(false) compiles.
+    let src = r#"
+fn main():
+    let a = Tensor.gpu<f32>([1.0])
+    while a.len > 5:
+        print(a)
+"#;
+    run_src(src).expect("while (false condition) should compile and run");
+    assert_eq!(live_tensor_count(), 0, "a must be freed after while loop");
+}
+
+#[test]
+fn test_let_mut_in_loop() {
+    // `acc` is outer let mut; each iteration drops old acc and rebinds.
+    let src = r#"
+kernel add(a: Tensor<f32>, b: Tensor<f32>) -> Tensor<f32>:
+    return a + b
+
+fn main():
+    let mut acc = Tensor.gpu<f32>([0.0, 0.0])
+    let delta = Tensor.gpu<f32>([1.0, 2.0])
+    for i in range(3):
+        acc = add(acc, delta)
+    print(acc)
+"#;
+    run_src(src).expect("let mut accumulator in loop should compile and run");
+    assert_eq!(live_tensor_count(), 0, "acc and delta must be freed after loop");
+}
+
+/// M9 done-when: the example from the milestone spec.
+#[test]
+fn test_m9_done_when() {
+    let src = r#"
+fn main():
+    let x = ones(2, 3)
+    let w = ones(3, 2)
+    for i in range(5):
+        let out = x @ w
+        let s = sum(out)
+        println("step {}: sum = {}", i, s)
+        if i > 2:
+            println("  past halfway")
+    println("done")
+"#;
+    run_src(src).expect("M9 done-when should compile and run");
+    assert_eq!(live_tensor_count(), 0, "no tensors should leak in done-when program");
 }

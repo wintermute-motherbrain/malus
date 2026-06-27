@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use malus_syntax::ast::{
-    BinOp, ExprKind, ItemKind, Lit, Placement, Program, ScalarTy, Ty, UnaryOp,
+    BinOp, ExprKind, ItemKind, Lit, Placement, Program, ScalarTy, StmtKind, Ty, UnaryOp,
 };
 use malus_syntax::Span;
 use crate::builtins::{BuiltinKind, register_builtins};
@@ -283,6 +283,71 @@ fn check_body(
                     Some(texpr) => typed.push(TypedStmt::Expr(texpr)),
                     None => return typed,
                 }
+            }
+            StmtKind::If { condition, then_body, else_body } => {
+                // Condition must be Bool.
+                let tcond = match check_expr(condition, Some(&ResolvedTy::Bool), ctx) {
+                    Some(e) => e,
+                    None => return typed,
+                };
+                if tcond.ty != ResolvedTy::Bool {
+                    ctx.errors.push(SemaError::TypeMismatch {
+                        expected: ResolvedTy::Bool,
+                        found: tcond.ty.clone(),
+                        span: condition.span,
+                    });
+                    return typed;
+                }
+                // Each branch is checked in its own scope so bindings don't escape.
+                ctx.env.push_scope();
+                let tthen = check_body(then_body, ctx);
+                ctx.env.pop_scope();
+                let telse = if let Some(eb) = else_body {
+                    ctx.env.push_scope();
+                    let t = check_body(eb, ctx);
+                    ctx.env.pop_scope();
+                    Some(t)
+                } else {
+                    None
+                };
+                typed.push(TypedStmt::If { condition: tcond, then_body: tthen, else_body: telse });
+            }
+            StmtKind::For { var, start, end, body } => {
+                // Loop bounds must be I64 (range() desugars to int literals or exprs).
+                let i64_ty = ResolvedTy::Scalar(ScalarTy::I64);
+                let tstart = match check_expr(start, Some(&i64_ty), ctx) {
+                    Some(e) => e,
+                    None => return typed,
+                };
+                let tend = match check_expr(end, Some(&i64_ty), ctx) {
+                    Some(e) => e,
+                    None => return typed,
+                };
+                // Loop variable is I64, visible only inside the body.
+                ctx.env.push_scope();
+                ctx.env.bind(var.clone(), i64_ty, None);
+                let tbody = check_body(body, ctx);
+                ctx.env.pop_scope();
+                typed.push(TypedStmt::For { var: var.clone(), start: tstart, end: tend, body: tbody });
+            }
+            StmtKind::While { condition, body } => {
+                // Condition must be Bool.
+                let tcond = match check_expr(condition, Some(&ResolvedTy::Bool), ctx) {
+                    Some(e) => e,
+                    None => return typed,
+                };
+                if tcond.ty != ResolvedTy::Bool {
+                    ctx.errors.push(SemaError::TypeMismatch {
+                        expected: ResolvedTy::Bool,
+                        found: tcond.ty.clone(),
+                        span: condition.span,
+                    });
+                    return typed;
+                }
+                ctx.env.push_scope();
+                let tbody = check_body(body, ctx);
+                ctx.env.pop_scope();
+                typed.push(TypedStmt::While { condition: tcond, body: tbody });
             }
         }
     }

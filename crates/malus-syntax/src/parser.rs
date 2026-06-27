@@ -304,6 +304,87 @@ impl Parser {
                     span: Span::new(start.file, start.start as usize, end.end as usize),
                 })
             }
+            // ── Control flow ─────────────────────────────────────────────────
+            //
+            // These stmts end on a DEDENT (not a Newline), so they do NOT call
+            // `expect_newline_or_eof` — mirroring how `parse_fn`/`parse_kernel`
+            // consume `Colon` then `parse_body` and stop.
+            TokenKind::If => {
+                self.advance(); // consume 'if'
+                let condition = self.parse_expr()?;
+                self.expect(&TokenKind::Colon)?;
+                let then_body = self.parse_body()?;
+                // Optional `else:` clause.  `else if` is written as an `if`
+                // inside the else block — we do not support `else if` directly.
+                let else_body = if matches!(self.current_kind(), TokenKind::Else) {
+                    self.advance(); // consume 'else'
+                    self.expect(&TokenKind::Colon)?;
+                    Some(self.parse_body()?)
+                } else {
+                    None
+                };
+                let end = self.current_span();
+                Ok(Stmt {
+                    kind: StmtKind::If { condition, then_body, else_body },
+                    span: Span::new(start.file, start.start as usize, end.start as usize),
+                })
+            }
+            TokenKind::While => {
+                self.advance(); // consume 'while'
+                let condition = self.parse_expr()?;
+                self.expect(&TokenKind::Colon)?;
+                let body = self.parse_body()?;
+                let end = self.current_span();
+                Ok(Stmt {
+                    kind: StmtKind::While { condition, body },
+                    span: Span::new(start.file, start.start as usize, end.start as usize),
+                })
+            }
+            TokenKind::For => {
+                self.advance(); // consume 'for'
+                let (var, _) = self.expect_ident()?; // loop variable
+                self.expect(&TokenKind::In)?;
+
+                // `range` is syntactic sugar, not a runtime function.
+                // Accepted forms: `range(end)` → start=0  and `range(start, end)`.
+                let range_span = self.current_span();
+                match self.current_kind().clone() {
+                    TokenKind::Ident(ref name) if name == "range" => {
+                        self.advance(); // consume 'range'
+                    }
+                    _ => {
+                        return Err(ParseError::new(
+                            format!(
+                                "'for' loops must iterate over 'range(...)'; got {:?}",
+                                self.current_kind()
+                            ),
+                            range_span,
+                        ));
+                    }
+                }
+                self.expect(&TokenKind::LParen)?;
+                let first_arg = self.parse_expr()?;
+                let (start_expr, end_expr) = if matches!(self.current_kind(), TokenKind::Comma) {
+                    self.advance(); // consume ','
+                    let second = self.parse_expr()?;
+                    (first_arg, second)
+                } else {
+                    // range(n) → start = 0, end = n
+                    let zero = Expr {
+                        kind: ExprKind::Lit(Lit::Int(0)),
+                        span: start, // synthetic span at the 'for' keyword
+                    };
+                    (zero, first_arg)
+                };
+                self.expect(&TokenKind::RParen)?;
+                self.expect(&TokenKind::Colon)?;
+                let body = self.parse_body()?;
+                let end = self.current_span();
+                Ok(Stmt {
+                    kind: StmtKind::For { var, start: start_expr, end: end_expr, body },
+                    span: Span::new(start.file, start.start as usize, end.start as usize),
+                })
+            }
             _ => {
                 let expr = self.parse_expr()?;
                 // Check for assignment: <ident> = <expr>
@@ -982,5 +1063,92 @@ mod tests {
         let src = "fn f():\n    return 0\n\nfrom ops import add\n";
         let err = parse(FileId(0), src).unwrap_err();
         assert!(err.message.contains("import declarations must appear before"));
+    }
+
+    // ── M9: if / while / for parsing ─────────────────────────────────────────
+
+    #[test]
+    fn parse_if_no_else() {
+        let src = "fn f():\n    if x > 0:\n        print(x)\n";
+        let prog = parse_ok(src);
+        let ItemKind::Fn { body, .. } = &prog.items[0].kind else { panic!() };
+        let StmtKind::If { then_body, else_body, .. } = &body[0].kind else {
+            panic!("expected If, got {:?}", body[0].kind)
+        };
+        assert_eq!(then_body.len(), 1);
+        assert!(else_body.is_none());
+    }
+
+    #[test]
+    fn parse_if_else() {
+        let src = "fn f():\n    if x > 0:\n        print(x)\n    else:\n        print(y)\n";
+        let prog = parse_ok(src);
+        let ItemKind::Fn { body, .. } = &prog.items[0].kind else { panic!() };
+        let StmtKind::If { then_body, else_body, .. } = &body[0].kind else { panic!() };
+        assert_eq!(then_body.len(), 1);
+        assert!(else_body.as_ref().unwrap().len() == 1);
+    }
+
+    #[test]
+    fn parse_for_range_one_arg() {
+        let src = "fn f():\n    for i in range(10):\n        print(i)\n";
+        let prog = parse_ok(src);
+        let ItemKind::Fn { body, .. } = &prog.items[0].kind else { panic!() };
+        let StmtKind::For { var, start, end, body } = &body[0].kind else {
+            panic!("expected For, got {:?}", body[0].kind)
+        };
+        assert_eq!(var, "i");
+        // start should be literal 0
+        assert!(matches!(start.kind, ExprKind::Lit(Lit::Int(0))));
+        // end should be literal 10
+        assert!(matches!(end.kind, ExprKind::Lit(Lit::Int(10))));
+        assert_eq!(body.len(), 1);
+    }
+
+    #[test]
+    fn parse_for_range_two_args() {
+        let src = "fn f():\n    for i in range(a, b):\n        print(i)\n";
+        let prog = parse_ok(src);
+        let ItemKind::Fn { body, .. } = &prog.items[0].kind else { panic!() };
+        let StmtKind::For { var, start, end, .. } = &body[0].kind else { panic!() };
+        assert_eq!(var, "i");
+        assert!(matches!(&start.kind, ExprKind::Ident(n) if n == "a"));
+        assert!(matches!(&end.kind, ExprKind::Ident(n) if n == "b"));
+    }
+
+    #[test]
+    fn parse_while() {
+        let src = "fn f():\n    while x > 0:\n        print(x)\n";
+        let prog = parse_ok(src);
+        let ItemKind::Fn { body, .. } = &prog.items[0].kind else { panic!() };
+        let StmtKind::While { body: inner, .. } = &body[0].kind else {
+            panic!("expected While, got {:?}", body[0].kind)
+        };
+        assert_eq!(inner.len(), 1);
+    }
+
+    #[test]
+    fn parse_nested_for_and_if() {
+        let src = concat!(
+            "fn f():\n",
+            "    for i in range(5):\n",
+            "        let x = i\n",
+            "        if i > 2:\n",
+            "            print(i)\n",
+        );
+        let prog = parse_ok(src);
+        let ItemKind::Fn { body, .. } = &prog.items[0].kind else { panic!() };
+        let StmtKind::For { body: for_body, .. } = &body[0].kind else { panic!() };
+        // for body: let x, if
+        assert_eq!(for_body.len(), 2);
+        assert!(matches!(&for_body[0].kind, StmtKind::Let { .. }));
+        assert!(matches!(&for_body[1].kind, StmtKind::If { .. }));
+    }
+
+    #[test]
+    fn parse_for_non_range_is_error() {
+        let src = "fn f():\n    for i in mylist:\n        print(i)\n";
+        let err = parse(FileId(0), src).unwrap_err();
+        assert!(err.message.contains("range"), "error was: {}", err.message);
     }
 }

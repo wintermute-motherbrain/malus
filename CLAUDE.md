@@ -4,7 +4,7 @@
 
 malus is a compiled ML DSL for Apple Silicon. Python-like syntax, dual compilation pipeline: `fn` bodies → Cranelift JIT (CPU), `kernel` bodies → Metal Shading Language (GPU). The CTMM memory model inserts static `free`/barrier calls at compile time, falling back to reference counting only when lifetimes are structurally ambiguous.
 
-## Current state: M8 done, **M9 is next**
+## Current state: M9 done, **M10 is next**
 
 | Milestone | Status | Crate |
 |---|---|---|
@@ -17,8 +17,8 @@ malus is a compiled ML DSL for Apple Silicon. Python-like syntax, dual compilati
 | M6 — Integration (end-to-end CLI) | ✅ done | `malus-cli` |
 | M7 — Kernel Thickening (multi-stmt kernels, `let mut`, scalar broadcasting) | ✅ done | `malus-syntax`, `malus-sema`, `malus-codegen-*` |
 | M8 — Core Stdlib (matmul, relu/sigmoid/tanh, transpose, zeros/ones, sum) | ✅ done | `malus-runtime`, `malus-codegen-*` |
-| **M9 — Control Flow** (if/else, for, while, CTMM RC fallback) | **← next** | `malus-syntax`, `malus-sema`, `malus-codegen-cpu`, `malus-runtime` |
-| M10 — Structs + Enums (structs, data-carrying enums, match) | planned | `malus-syntax`, `malus-sema`, `malus-codegen-cpu` |
+| M9 — Control Flow (if/else, for, while, hierarchical CTMM) | ✅ done | `malus-syntax`, `malus-sema`, `malus-codegen-cpu`, `malus-runtime` |
+| **M10 — Structs + Enums** (structs, data-carrying enums, match) | **← next** | `malus-syntax`, `malus-sema`, `malus-codegen-cpu` |
 | M11 — The 2-Layer MLP (fixed arrays, diagnostics, done-when) | planned | all crates |
 
 Full milestone specs: `docs/milestones/`. V1 plan overview: `docs/milestones/v1-plan.md`. Architecture decisions: `docs/adr/`. Domain vocabulary: `CONTEXT.md`.
@@ -29,7 +29,7 @@ These decisions were made during V1 planning. Do not re-litigate them without us
 
 | Decision | Choice | Rationale |
 |---|---|---|
-| CTMM for conditional paths | RC fallback | ADR-0002 specifies RC as the fallback. Dataflow liveness is a V2 optimization. |
+| CTMM for conditional paths | Hierarchical Drop (M9); RC fallback deferred | ADR-0014 supersedes ADR-0002: hierarchical analysis places Drop after the control-flow node in the outer scope, which is always correct regardless of branch taken / iteration count. RC nodes added to ABI + IR for M10 readiness but M9 emits zero of them. Dataflow liveness is a V2 optimization. |
 | Mutation | `let mut` + reassignment | Shadowing breaks in loops (shadow dies at loop-body scope end). `let mut` CTMM = drop-old + bind-new. No aliasing risk under move semantics. |
 | Kernel body expressiveness | Let bindings, comparisons, ternary | Enough for all gradient kernels. Loops inside kernels need threadgroup controls — deferred post-V1. |
 | Enum scope | Data-carrying variants + match, no generics | No `Option<T>` in V1. |
@@ -46,20 +46,21 @@ crates/
   malus-syntax/        # lexer, parser, AST  (src/lexer.rs, src/parser.rs, src/ast.rs)
   malus-loader/        # module resolution + flattening  (src/lib.rs)
   malus-sema/          # type checker + CTMM  (src/{check,ctmm,env,builtins,ty,typed_ir,error}.rs)
-  malus-codegen-cpu/   # Cranelift JIT  — M8 complete (src/lib.rs, src/tests.rs)
-  malus-codegen-gpu/   # MSL codegen    — M8 complete (src/lib.rs, src/tests.rs)
-  malus-runtime/       # Metal API      — M8 complete (src/lib.rs, src/metal.rs, src/tests.rs)
+  malus-codegen-cpu/   # Cranelift JIT  — M9 complete (src/lib.rs, src/tests.rs)
+  malus-codegen-gpu/   # MSL codegen    — M9 complete (src/lib.rs, src/tests.rs)
+  malus-runtime/       # Metal API      — M9 complete (src/lib.rs, src/metal.rs, src/tests.rs)
   malus-cli/           # entry point    (src/main.rs)
 examples/
   add_tensors.ml       # MVP golden example
   mlp_forward.ml       # M8 done-when: 2-layer forward pass with relu/matmul/sum/transpose
+  control_flow.ml      # M9 done-when: for loop + nested if with tensor ops
   import_demo/         # multi-file import demo (main.ml, ops.ml)
 docs/milestones/       # m1–m11 specs, v1-plan.md
 docs/spec/             # language spec (01-overview … 09-modules)
 docs/adr/              # architecture decision records
 ```
 
-## The pipeline (M1–M8 complete)
+## The pipeline (M1–M9 complete)
 
 ```
 .ml source file
@@ -80,11 +81,11 @@ Compiles all MSL to MTLComputePipelineState, cached by kernel_id
      execute fn main()  →  kernel_dispatch(kernel_id, handles, count)  →  real GPU work
 ```
 
-`malus-cli/src/main.rs` runs all stages. `compile_and_run` is fully implemented; `fn main()` is JIT-compiled and executed via Cranelift. The `RuntimeSymbols` struct of eleven `extern "C" fn` pointers is injected by the CLI (real Metal fns from `malus-runtime` on macOS); tests inject mock fns. The `kernel_ids` map (`&HashMap<String, u64>`) is produced by `compile_kernels` and passed to `compile_and_run` so the JIT'd code can bake `u64` kernel ids at `KernelCall` and unary-builtin-dispatch sites.
+`malus-cli/src/main.rs` runs all stages. `compile_and_run` is fully implemented; `fn main()` is JIT-compiled and executed via Cranelift. The `RuntimeSymbols` struct of thirteen `extern "C" fn` pointers is injected by the CLI (real Metal fns from `malus-runtime` on macOS); tests inject mock fns. The `kernel_ids` map (`&HashMap<String, u64>`) is produced by `compile_kernels` and passed to `compile_and_run` so the JIT'd code can bake `u64` kernel ids at `KernelCall` and unary-builtin-dispatch sites.
 
-## Runtime C ABI (M8 state)
+## Runtime C ABI (M9 state)
 
-The eleven runtime functions are real Metal implementations in `malus-runtime/src/metal.rs`, injected into the JIT via a `RuntimeSymbols` struct. codegen-cpu stays platform-agnostic and Metal-unaware (ADR-0008).
+The thirteen runtime functions are real Metal implementations in `malus-runtime/src/metal.rs`, injected into the JIT via a `RuntimeSymbols` struct. codegen-cpu stays platform-agnostic and Metal-unaware (ADR-0008).
 
 ```c
 i64  tensor_alloc_gpu(i32 dtype_tag, const usize* shape_ptr, usize ndims, const float* data)
@@ -98,14 +99,14 @@ i64  kernel_dispatch(u64 kernel_id, const i64* handles, usize count)
 void gpu_barrier()
 void tensor_print(i64 handle)
 void tensor_free(i64 handle)
+// M9 RC ABI — wired, not called by M9 generated code; consumed by M10.
+void tensor_retain(i64 handle)
+void tensor_release(i64 handle)
 ```
 
-The `i64` handle is a raw pointer to a heap-allocated `TensorBuffer { buffer: metal::Buffer, dtype: Dtype, len: usize, shape: Vec<usize> }` wrapping a real `MTLBuffer` (`StorageModeShared`). The runtime owns it; `tensor_free` drops the box. Invariant: `len == shape.iter().product()`.
+The `i64` handle is a raw pointer to a heap-allocated `TensorBuffer { buffer: metal::Buffer, dtype: Dtype, len: usize, shape: Vec<usize>, ref_count: AtomicUsize }` wrapping a real `MTLBuffer` (`StorageModeShared`). The runtime owns it; `tensor_free` delegates to `tensor_release` which drops the box when the refcount hits zero. Invariant: `len == shape.iter().product()`.
 
 `tensor_matmul`, `tensor_transpose`, and `tensor_sum` are eager CPU ops that call `gpu_barrier()` internally before reading buffers. Their results are ready tensors (not pending). See ADR-0012.
-
-**Planned ABI additions:**
-- M9: `tensor_retain`, `tensor_release` added; `TensorBuffer` gains `ref_count: AtomicUsize`
 
 **dtype_tag** uses `ScalarTy` enum discriminant order: F32=0, F16=1, Bf16=2, I8=3, I16=4, I32=5, I64=6, U8=7, U16=8, U32=9, U64=10. `malus-runtime` defines an independent `Dtype` enum with `from_tag(i32)`/`to_tag() -> i32`; a drift-detection test asserts all 11 mappings. **V1 supports f32 only** — non-f32 panics per ADR-0006.
 
@@ -119,13 +120,13 @@ The `i64` handle is a raw pointer to a heap-allocated `TensorBuffer { buffer: me
 
 | Limitation | Fix in |
 |---|---|
-| No control flow (`if`/`else`, `for`, `while`) | M9 |
-| CTMM conditional last-use is unsound (linear scan) | M9 (RC fallback) |
 | No structs or enums | M10 |
 | No match expression | M10 |
 | Intermediate temporaries from nested BinOps leak | M11 |
 | No fixed-length arrays | M11 |
 | Plain-string error messages (no spans or source context) | M11 |
+| `break`/`continue` statements | Post-V1 |
+| Early `return` inside a control-flow body | Post-V1 |
 | matmul/transpose/sum are CPU loops, not MPS | Post-V1 (ADR-0012) |
 | Non-f32 dtypes panic | Post-V1 |
 | Zero-length tensors crash Metal | Post-V1 |

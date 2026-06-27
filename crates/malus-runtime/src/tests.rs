@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use crate::{
     Dtype, TensorBuffer, runtime_init,
     tensor_alloc_gpu, tensor_alloc_zeros_gpu, tensor_alloc_ones_gpu,
-    tensor_free, tensor_print, tensor_len,
+    tensor_retain, tensor_release, tensor_free, tensor_print, tensor_len,
     tensor_matmul, tensor_transpose, tensor_sum,
     kernel_dispatch, gpu_barrier,
 };
@@ -337,4 +337,37 @@ fn test_kernel_dispatch_preserves_shape() {
     tensor_free(a);
     tensor_free(b);
     tensor_free(output);
+}
+
+// ── M9: retain / release ──────────────────────────────────────────────────────
+
+#[test]
+fn test_tensor_retain_keeps_alive() {
+    let h = alloc_f32(&[1.0, 2.0, 3.0]);
+    // ref_count = 1 after alloc; retain bumps to 2.
+    tensor_retain(h);
+    // First release: ref_count → 1.  Must NOT free (buffer still alive).
+    tensor_release(h);
+    // Verify the buffer is still readable.
+    let data = read_f32(h);
+    assert_eq!(data, &[1.0f32, 2.0, 3.0], "buffer must be readable after retain+release");
+    // Second release: ref_count → 0.  Frees.
+    tensor_release(h);
+}
+
+#[test]
+fn test_tensor_free_still_works() {
+    // tensor_free now delegates to tensor_release.  Verify it still frees a fresh tensor.
+    let h = alloc_f32(&[9.0, 8.0, 7.0]);
+    tensor_free(h); // ref_count 1 → 0 → freed; must not crash
+}
+
+#[test]
+fn test_tensor_retain_null_no_crash() {
+    tensor_retain(0); // guard: handle == 0 → no-op
+}
+
+#[test]
+fn test_tensor_release_null_no_crash() {
+    tensor_release(0); // guard: handle == 0 → no-op
 }

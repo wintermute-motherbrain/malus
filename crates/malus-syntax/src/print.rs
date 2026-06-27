@@ -68,6 +68,22 @@ fn print_stmt(out: &mut String, stmt: &Stmt, depth: usize) {
         StmtKind::Expr(expr) => {
             writeln!(out, "{indent}{}", print_expr(expr)).unwrap();
         }
+        StmtKind::If { condition, then_body, else_body } => {
+            writeln!(out, "{indent}if {}:", print_expr(condition)).unwrap();
+            for s in then_body { print_stmt(out, s, depth + 1); }
+            if let Some(eb) = else_body {
+                writeln!(out, "{indent}else:").unwrap();
+                for s in eb { print_stmt(out, s, depth + 1); }
+            }
+        }
+        StmtKind::For { var, start, end, body } => {
+            writeln!(out, "{indent}for {var} in range({}, {}):", print_expr(start), print_expr(end)).unwrap();
+            for s in body { print_stmt(out, s, depth + 1); }
+        }
+        StmtKind::While { condition, body } => {
+            writeln!(out, "{indent}while {}:", print_expr(condition)).unwrap();
+            for s in body { print_stmt(out, s, depth + 1); }
+        }
     }
 }
 
@@ -278,6 +294,24 @@ mod tests {
                     StmtKind::Return { expr: erase_expr(expr, z) },
                 StmtKind::Expr(expr) =>
                     StmtKind::Expr(erase_expr(expr, z)),
+                StmtKind::If { condition, then_body, else_body } =>
+                    StmtKind::If {
+                        condition: erase_expr(condition, z),
+                        then_body: then_body.into_iter().map(|s| erase_stmt(s, z)).collect(),
+                        else_body: else_body.map(|eb| eb.into_iter().map(|s| erase_stmt(s, z)).collect()),
+                    },
+                StmtKind::For { var, start, end, body } =>
+                    StmtKind::For {
+                        var,
+                        start: erase_expr(start, z),
+                        end: erase_expr(end, z),
+                        body: body.into_iter().map(|s| erase_stmt(s, z)).collect(),
+                    },
+                StmtKind::While { condition, body } =>
+                    StmtKind::While {
+                        condition: erase_expr(condition, z),
+                        body: body.into_iter().map(|s| erase_stmt(s, z)).collect(),
+                    },
             },
         }
     }

@@ -32,6 +32,9 @@ pub struct RuntimeSymbols {
     pub tensor_transpose:       extern "C" fn(i64) -> i64,
     pub tensor_sum:             extern "C" fn(i64) -> i64,
     pub tensor_len:             extern "C" fn(i64) -> i64,
+    // M9 RC ABI — wired now, unused by M9 CTMM, consumed by M10.
+    pub tensor_retain:          extern "C" fn(i64),
+    pub tensor_release:         extern "C" fn(i64),
 }
 
 // ── Error ─────────────────────────────────────────────────────────────────────
@@ -156,6 +159,9 @@ struct Codegen<'m> {
     rt_print_f32: FuncId,
     rt_print_i64: FuncId,
     rt_print_bool: FuncId,
+    // M9 RC ABI — wired but not called by M9 generated code.
+    rt_tensor_retain: FuncId,
+    rt_tensor_release: FuncId,
 }
 
 impl<'m> Codegen<'m> {
@@ -187,7 +193,9 @@ impl<'m> Codegen<'m> {
         let entry = builder.create_block();
         builder.append_block_params_for_function_params(entry);
         builder.switch_to_block(entry);
-        builder.seal_block(entry);
+        // Do NOT seal the entry block eagerly — loop headers have back-edges
+        // from the loop body block that are emitted later, so we must call
+        // `seal_all_blocks()` once all control-flow edges are in place.
 
         let mut var_map: HashMap<String, Variable> = HashMap::new();
         let mut next_var = 0usize;
@@ -222,6 +230,9 @@ impl<'m> Codegen<'m> {
             translator.builder.ins().return_(&[]);
         }
 
+        // Seal all blocks now that every control-flow edge (including loop
+        // back-edges) has been emitted.
+        translator.builder.seal_all_blocks();
         translator.builder.finalize();
 
         let mut ctx = cranelift_codegen::Context::for_function(func);
@@ -288,6 +299,120 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
 
             TypedStmt::GpuBarrier => {
                 self.call_runtime_barrier();
+                Ok(false)
+            }
+
+            // ── Control flow (M9) ─────────────────────────────────────────────────
+            //
+            // Early return from inside a branch/loop body is out of scope for V1;
+            // branch bodies always fall through to the merge block.
+            // `brif` takes any integer and branches on nonzero — the I8 result of
+            // a comparison (`bmask`, 0 = false, -1 = true) works correctly.
+
+            TypedStmt::If { condition, then_body, else_body } => {
+                let cond_val = self.lower_expr(condition)?;
+
+                let then_blk = self.builder.create_block();
+                let merge_blk = self.builder.create_block();
+
+                // Early return inside a branch body is out of scope for V1, so
+                // every branch body is guaranteed to fall through.  We therefore
+                // always emit the unconditional jump to `merge_blk`.
+                if let Some(eb) = else_body {
+                    let else_blk = self.builder.create_block();
+                    self.builder.ins().brif(cond_val, then_blk, &[], else_blk, &[]);
+
+                    // then branch
+                    self.builder.switch_to_block(then_blk);
+                    for s in then_body { self.lower_stmt(s)?; }
+                    self.builder.ins().jump(merge_blk, &[]);
+
+                    // else branch
+                    self.builder.switch_to_block(else_blk);
+                    for s in eb { self.lower_stmt(s)?; }
+                    self.builder.ins().jump(merge_blk, &[]);
+                } else {
+                    self.builder.ins().brif(cond_val, then_blk, &[], merge_blk, &[]);
+
+                    // then branch
+                    self.builder.switch_to_block(then_blk);
+                    for s in then_body { self.lower_stmt(s)?; }
+                    self.builder.ins().jump(merge_blk, &[]);
+                }
+
+                self.builder.switch_to_block(merge_blk);
+                Ok(false)
+            }
+
+            TypedStmt::For { var, start, end, body } => {
+                // Declare the loop variable as a Cranelift SSA Variable (I64).
+                let loop_var = Variable::from_u32(self.next_var as u32);
+                self.next_var += 1;
+                self.builder.declare_var(loop_var, I64);
+                let start_val = self.lower_expr(start)?;
+                self.builder.def_var(loop_var, start_val);
+                self.var_map.insert(var.clone(), loop_var);
+
+                let header_blk = self.builder.create_block();
+                let body_blk   = self.builder.create_block();
+                let exit_blk   = self.builder.create_block();
+
+                // Jump from the pre-header into the loop header.
+                self.builder.ins().jump(header_blk, &[]);
+
+                // Loop header: test loop_var < end.
+                self.builder.switch_to_block(header_blk);
+                let cur = self.builder.use_var(loop_var);
+                let end_val = self.lower_expr(end)?;
+                let cmp = self.builder.ins().icmp(cranelift_codegen::ir::condcodes::IntCC::SignedLessThan, cur, end_val);
+                // `icmp` returns I8; brif branches on nonzero.
+                self.builder.ins().brif(cmp, body_blk, &[], exit_blk, &[]);
+
+                // Loop body.
+                self.builder.switch_to_block(body_blk);
+                for s in body { self.lower_stmt(s)?; }
+                // Increment loop variable and jump back to header (back-edge).
+                let cur2 = self.builder.use_var(loop_var);
+                let one  = self.builder.ins().iconst(I64, 1);
+                let next = self.builder.ins().iadd(cur2, one);
+                self.builder.def_var(loop_var, next);
+                self.builder.ins().jump(header_blk, &[]);
+
+                self.builder.switch_to_block(exit_blk);
+                Ok(false)
+            }
+
+            TypedStmt::While { condition, body } => {
+                let header_blk = self.builder.create_block();
+                let body_blk   = self.builder.create_block();
+                let exit_blk   = self.builder.create_block();
+
+                self.builder.ins().jump(header_blk, &[]);
+
+                // Loop header: evaluate condition.
+                self.builder.switch_to_block(header_blk);
+                let cond_val = self.lower_expr(condition)?;
+                self.builder.ins().brif(cond_val, body_blk, &[], exit_blk, &[]);
+
+                // Loop body.
+                self.builder.switch_to_block(body_blk);
+                for s in body { self.lower_stmt(s)?; }
+                self.builder.ins().jump(header_blk, &[]);
+
+                self.builder.switch_to_block(exit_blk);
+                Ok(false)
+            }
+
+            // ── M10 RC nodes (wired, not emitted by M9 CTMM) ─────────────────────
+            TypedStmt::Retain { name } => {
+                let handle = self.use_var(name)?;
+                self.call_runtime_retain(handle);
+                Ok(false)
+            }
+
+            TypedStmt::Release { name } => {
+                let handle = self.use_var(name)?;
+                self.call_runtime_release(handle);
                 Ok(false)
             }
         }
@@ -812,6 +937,16 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
         self.builder.ins().call(func_ref, &[handle]);
     }
 
+    fn call_runtime_retain(&mut self, handle: cranelift_codegen::ir::Value) {
+        let func_ref = self.import_func(self.codegen.rt_tensor_retain);
+        self.builder.ins().call(func_ref, &[handle]);
+    }
+
+    fn call_runtime_release(&mut self, handle: cranelift_codegen::ir::Value) {
+        let func_ref = self.import_func(self.codegen.rt_tensor_release);
+        self.builder.ins().call(func_ref, &[handle]);
+    }
+
     fn call_runtime_barrier(&mut self) {
         let func_ref = self.import_func(self.codegen.rt_gpu_barrier);
         self.builder.ins().call(func_ref, &[]);
@@ -851,6 +986,8 @@ pub fn compile_and_run(
     jit_builder.symbol("tensor_transpose",       symbols.tensor_transpose       as *const u8);
     jit_builder.symbol("tensor_sum",             symbols.tensor_sum             as *const u8);
     jit_builder.symbol("tensor_len",             symbols.tensor_len             as *const u8);
+    jit_builder.symbol("tensor_retain",          symbols.tensor_retain          as *const u8);
+    jit_builder.symbol("tensor_release",         symbols.tensor_release         as *const u8);
     jit_builder.symbol("print_cstr",             print_cstr                     as *const u8);
     jit_builder.symbol("print_f32",              print_f32                      as *const u8);
     jit_builder.symbol("print_i64",              print_i64                      as *const u8);
@@ -964,6 +1101,11 @@ pub fn compile_and_run(
         .map_err(|e| CodegenError::JitError(e.to_string()))?;
     let rt_print_bool = module.declare_function("print_bool", Linkage::Import, &sig_print_bool)
         .map_err(|e| CodegenError::JitError(e.to_string()))?;
+    // tensor_retain/tensor_release have the same signature as tensor_free: (i64) -> ()
+    let rt_tensor_retain = module.declare_function("tensor_retain", Linkage::Import, &sig_free)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
+    let rt_tensor_release = module.declare_function("tensor_release", Linkage::Import, &sig_free)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
 
     // First pass: declare all user fn signatures.
     let mut func_ids: HashMap<String, FuncId> = HashMap::new();
@@ -1001,6 +1143,8 @@ pub fn compile_and_run(
         rt_print_f32,
         rt_print_i64,
         rt_print_bool,
+        rt_tensor_retain,
+        rt_tensor_release,
     };
 
     // Second pass: compile each fn body.
