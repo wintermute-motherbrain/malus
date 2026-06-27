@@ -26,6 +26,7 @@
 
 use std::collections::{HashMap, HashSet};
 use malus_syntax::ast::Placement;
+use crate::ty::ResolvedTy;
 use crate::typed_ir::{TypedExpr, TypedExprKind, TypedFn, TypedStmt};
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -54,10 +55,11 @@ fn annotate_body(body: &mut Vec<TypedStmt>) {
 
     // Steps 4-9: outer-scope analysis.
     let locals = collect_local_bindings(body);
+    let local_types = collect_local_types(body);
     let escaping = collect_escaping(body);
     insert_assign_drops(body, &escaping);
     let last_uses = find_last_uses(body, &locals, &escaping);
-    insert_drops(body, &last_uses);
+    insert_drops(body, &last_uses, &local_types);
     insert_barriers(body);
 }
 
@@ -329,7 +331,11 @@ fn insert_assign_drops(body: &mut Vec<TypedStmt>, escaping: &HashSet<String>) {
 
 // ── Phase 1: Drop insertion ───────────────────────────────────────────────────
 
-fn insert_drops(body: &mut Vec<TypedStmt>, last_uses: &HashMap<String, usize>) {
+fn insert_drops(
+    body: &mut Vec<TypedStmt>,
+    last_uses: &HashMap<String, usize>,
+    local_types: &HashMap<String, ResolvedTy>,
+) {
     let mut by_idx: HashMap<usize, Vec<String>> = HashMap::new();
     for (name, last_idx) in last_uses {
         by_idx.entry(*last_idx).or_default().push(name.clone());
@@ -342,8 +348,23 @@ fn insert_drops(body: &mut Vec<TypedStmt>, last_uses: &HashMap<String, usize>) {
         let mut names = by_idx.remove(&idx).unwrap();
         names.sort();
         let insert_pos = idx + 1;
-        for (offset, name) in names.iter().enumerate() {
-            body.insert(insert_pos + offset, TypedStmt::Drop { name: name.clone() });
+        let mut offset = 0;
+        for name in &names {
+            let stmt = match local_types.get(name.as_str()) {
+                Some(ResolvedTy::Tensor { .. }) => TypedStmt::Drop { name: name.clone() },
+                Some(ResolvedTy::Struct { fields, .. }) => {
+                    let tensor_field_indices = fields.iter()
+                        .enumerate()
+                        .filter_map(|(i, (_, ty))| if ty.is_tensor() { Some(i) } else { None })
+                        .collect();
+                    TypedStmt::DropStruct { name: name.clone(), tensor_field_indices }
+                }
+                // Enum, Scalar, Bool, Unit — no drop needed in M10
+                // (enum-payload tensor RC deferred to M11).
+                _ => { continue; }
+            };
+            body.insert(insert_pos + offset, stmt);
+            offset += 1;
         }
     }
 }
@@ -421,11 +442,13 @@ fn extract_gpu_producing_expr(stmt: &TypedStmt) -> Option<(Vec<String>, Option<S
         TypedStmt::Expr(expr) => (expr, None),
         TypedStmt::Return { expr } => (expr, None),
         TypedStmt::Drop { .. }
+        | TypedStmt::DropStruct { .. }
         | TypedStmt::GpuBarrier
         | TypedStmt::Assign { .. }
         | TypedStmt::If { .. }
         | TypedStmt::For { .. }
         | TypedStmt::While { .. }
+        | TypedStmt::Match { .. }
         | TypedStmt::Retain { .. }
         | TypedStmt::Release { .. } => return None,
     };
@@ -458,6 +481,13 @@ fn extract_gpu_producing_expr(stmt: &TypedStmt) -> Option<(Vec<String>, Option<S
 fn collect_local_bindings(body: &[TypedStmt]) -> HashSet<String> {
     body.iter().filter_map(|s| {
         if let TypedStmt::Let { name, .. } = s { Some(name.clone()) } else { None }
+    }).collect()
+}
+
+/// Collect the resolved type of each `let` binding in `body` (outer scope only).
+fn collect_local_types(body: &[TypedStmt]) -> HashMap<String, ResolvedTy> {
+    body.iter().filter_map(|s| {
+        if let TypedStmt::Let { name, expr } = s { Some((name.clone(), expr.ty.clone())) } else { None }
     }).collect()
 }
 
@@ -523,6 +553,7 @@ fn collect_idents_in_stmt(stmt: &TypedStmt, out: &mut HashSet<String>) {
         | TypedStmt::Return { expr } => collect_idents_in_expr(expr, out),
         TypedStmt::Expr(expr) => collect_idents_in_expr(expr, out),
         TypedStmt::Drop { .. }
+        | TypedStmt::DropStruct { .. }
         | TypedStmt::GpuBarrier
         | TypedStmt::Retain { .. }
         | TypedStmt::Release { .. } => {}
@@ -541,6 +572,12 @@ fn collect_idents_in_stmt(stmt: &TypedStmt, out: &mut HashSet<String>) {
         TypedStmt::While { condition, body } => {
             collect_idents_in_expr(condition, out);
             for s in body { collect_idents_in_stmt(s, out); }
+        }
+        TypedStmt::Match { scrutinee, arms } => {
+            collect_idents_in_expr(scrutinee, out);
+            for arm in arms {
+                for s in &arm.body { collect_idents_in_stmt(s, out); }
+            }
         }
     }
 }
@@ -567,6 +604,12 @@ fn collect_idents_in_expr(expr: &crate::typed_ir::TypedExpr, out: &mut HashSet<S
             for i in indices { collect_idents_in_expr(i, out); }
         }
         TypedExprKind::FieldAccess { base, .. } => collect_idents_in_expr(base, out),
+        TypedExprKind::StructInit { fields, .. } => {
+            for f in fields { collect_idents_in_expr(f, out); }
+        }
+        TypedExprKind::EnumInit { payload, .. } => {
+            for p in payload { collect_idents_in_expr(p, out); }
+        }
         TypedExprKind::Lit(_) => {}
     }
 }

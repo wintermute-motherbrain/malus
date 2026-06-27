@@ -616,8 +616,10 @@ fn flat_stmt_kinds(stmts: &[TypedStmt]) -> Vec<&'static str> {
             TypedStmt::If { .. }       => "If",
             TypedStmt::For { .. }      => "For",
             TypedStmt::While { .. }    => "While",
-            TypedStmt::Retain { .. }   => "Retain",
-            TypedStmt::Release { .. }  => "Release",
+            TypedStmt::Retain { .. }    => "Retain",
+            TypedStmt::Release { .. }   => "Release",
+            TypedStmt::DropStruct { .. } => "DropStruct",
+            TypedStmt::Match { .. }     => "Match",
         };
         out.push(tag);
     }

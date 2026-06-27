@@ -1,16 +1,25 @@
 use std::collections::{HashMap, HashSet};
 use malus_syntax::ast::{
-    BinOp, ExprKind, ItemKind, Lit, Placement, Program, ScalarTy, StmtKind, Ty, UnaryOp,
+    BinOp, CallArg, ExprKind, ItemKind, Lit, Placement, Program, ScalarTy, StmtKind,
+    Ty, UnaryOp,
 };
 use malus_syntax::Span;
 use crate::builtins::{BuiltinKind, register_builtins};
-use crate::env::{Callee, Env, FnSig, KernelSig, KernelParamSig, ParamSig};
+use crate::env::{Callee, Env, EnumDef, FnSig, KernelSig, KernelParamSig, ParamSig, StructDef,
+    VariantSig};
 use crate::error::SemaError;
 use crate::ty::{is_float_scalar, scalar_ty_name, ResolvedTy};
 use crate::typed_ir::{
-    TypedExpr, TypedExprKind, TypedFn, TypedKernel, TypedKernelParam, TypedParam, TypedProgram,
-    TypedStmt,
+    TypedExpr, TypedExprKind, TypedFn, TypedKernel, TypedKernelParam, TypedMatchArm, TypedParam,
+    TypedProgram, TypedStmt,
 };
+
+// ── Nominal maps (thread through resolve_ty without borrow conflicts) ─────────
+
+pub(crate) struct NominalMaps<'a> {
+    structs: &'a HashMap<String, StructDef>,
+    enums: &'a HashMap<String, EnumDef>,
+}
 
 // ── Context passed through body checking ──────────────────────────────────────
 
@@ -31,11 +40,94 @@ pub fn check(
     let mut env = Env::new(builtins, module_aliases.clone());
     let mut errors: Vec<SemaError> = Vec::new();
 
-    // ── Pass 1: collect all fn/kernel signatures ──────────────────────────────
+    // ── Pass 1a: collect struct/enum names ───────────────────────────────────
+    //
+    // We must do this before resolving fn/kernel signatures so that field and
+    // return types referencing user types can resolve.  We also register names
+    // before resolving field types so mutual/forward references work.
+
+    let mut local_structs: HashMap<String, StructDef> = HashMap::new();
+    let mut local_enums: HashMap<String, EnumDef> = HashMap::new();
+
+    for item in &program.items {
+        match &item.kind {
+            ItemKind::Struct { name, .. } => {
+                if local_structs.contains_key(name.as_str()) || local_enums.contains_key(name.as_str()) {
+                    let first = local_structs.get(name.as_str())
+                        .map(|d| d.defined_at)
+                        .or_else(|| local_enums.get(name.as_str()).map(|d| d.defined_at))
+                        .unwrap_or(item.span);
+                    errors.push(SemaError::DuplicateTypeDefinition { name: name.clone(), first, second: item.span });
+                    continue;
+                }
+                local_structs.insert(name.clone(), StructDef { fields: vec![], defined_at: item.span });
+            }
+            ItemKind::Enum { name, .. } => {
+                if local_enums.contains_key(name.as_str()) || local_structs.contains_key(name.as_str()) {
+                    let first = local_enums.get(name.as_str())
+                        .map(|d| d.defined_at)
+                        .or_else(|| local_structs.get(name.as_str()).map(|d| d.defined_at))
+                        .unwrap_or(item.span);
+                    errors.push(SemaError::DuplicateTypeDefinition { name: name.clone(), first, second: item.span });
+                    continue;
+                }
+                local_enums.insert(name.clone(), EnumDef { variants: vec![], defined_at: item.span });
+            }
+            _ => {}
+        }
+    }
+
+    // ── Pass 1b: resolve struct/enum field types ──────────────────────────────
+
+    for item in &program.items {
+        let nominals = NominalMaps { structs: &local_structs, enums: &local_enums };
+        match &item.kind {
+            ItemKind::Struct { name, fields } => {
+                if !local_structs.contains_key(name.as_str()) { continue; }
+                let mut resolved_fields = Vec::new();
+                let mut ok = true;
+                for f in fields {
+                    match resolve_ty(&f.ty, f.span, &nominals, &mut errors) {
+                        Some(ty) => resolved_fields.push((f.name.clone(), ty)),
+                        None => { ok = false; }
+                    }
+                }
+                if ok {
+                    if let Some(def) = local_structs.get_mut(name.as_str()) {
+                        def.fields = resolved_fields;
+                    }
+                }
+            }
+            ItemKind::Enum { name, variants } => {
+                if !local_enums.contains_key(name.as_str()) { continue; }
+                let mut resolved_variants = Vec::new();
+                let mut ok = true;
+                for v in variants {
+                    let mut vfields = Vec::new();
+                    for f in &v.fields {
+                        match resolve_ty(&f.ty, f.span, &nominals, &mut errors) {
+                            Some(ty) => vfields.push((f.name.clone(), ty)),
+                            None => { ok = false; }
+                        }
+                    }
+                    resolved_variants.push(VariantSig { name: v.name.clone(), fields: vfields });
+                }
+                if ok {
+                    if let Some(def) = local_enums.get_mut(name.as_str()) {
+                        def.variants = resolved_variants;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // ── Pass 1c: collect fn/kernel signatures ─────────────────────────────────
 
     let mut has_main = false;
 
     for item in &program.items {
+        let nominals = NominalMaps { structs: &local_structs, enums: &local_enums };
         match &item.kind {
             ItemKind::Fn { name, params, return_ty, .. } => {
                 if let Some(existing) = env.functions.get(name) {
@@ -46,12 +138,12 @@ pub fn check(
                     });
                     continue;
                 }
-                let resolved_params = match resolve_params(params, &mut errors) {
+                let resolved_params = match resolve_params(params, &nominals, &mut errors) {
                     Some(p) => p,
                     None => continue,
                 };
                 let resolved_return = match return_ty {
-                    Some(ty) => match resolve_ty(ty, item.span, &mut errors) {
+                    Some(ty) => match resolve_ty(ty, item.span, &nominals, &mut errors) {
                         Some(t) => t,
                         None => continue,
                     },
@@ -75,11 +167,11 @@ pub fn check(
                     });
                     continue;
                 }
-                let resolved_params = match resolve_kernel_params(params, &mut errors) {
+                let resolved_params = match resolve_kernel_params(params, &nominals, &mut errors) {
                     Some(p) => p,
                     None => continue,
                 };
-                let resolved_return = match resolve_ty(return_ty, item.span, &mut errors) {
+                let resolved_return = match resolve_ty(return_ty, item.span, &nominals, &mut errors) {
                     Some(t) => t,
                     None => continue,
                 };
@@ -89,10 +181,16 @@ pub fn check(
                     defined_at: item.span,
                 });
             }
+            // Struct/Enum: already handled above.
+            ItemKind::Struct { .. } | ItemKind::Enum { .. } => {}
             // Imports are already resolved by the loader — ignore them.
             ItemKind::Import { .. } | ItemKind::FromImport { .. } => {}
         }
     }
+
+    // Move local nominal maps into env for pass-2 body checking.
+    env.structs = local_structs;
+    env.enums = local_enums;
 
     if !has_main {
         errors.push(SemaError::MainNotFound);
@@ -349,6 +447,89 @@ fn check_body(
                 ctx.env.pop_scope();
                 typed.push(TypedStmt::While { condition: tcond, body: tbody });
             }
+            StmtKind::Match { scrutinee, arms } => {
+                let tscrutinee = match check_expr(scrutinee, None, ctx) {
+                    Some(e) => e,
+                    None => return typed,
+                };
+                // Scrutinee must be an enum type.
+                let (enum_name, variants) = match &tscrutinee.ty {
+                    ResolvedTy::Enum { name, variants } => (name.clone(), variants.clone()),
+                    other => {
+                        ctx.errors.push(SemaError::MatchScrutineeNotEnum {
+                            found: other.to_string(),
+                            span: scrutinee.span,
+                        });
+                        return typed;
+                    }
+                };
+                // Exhaustiveness and uniqueness check.
+                let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+                for arm in arms {
+                    if arm.variant == "_" {
+                        ctx.errors.push(SemaError::MatchWildcard { span: arm.span });
+                        return typed;
+                    }
+                    if !seen.insert(arm.variant.clone()) {
+                        ctx.errors.push(SemaError::DuplicateMatchArm { variant: arm.variant.clone(), span: arm.span });
+                        return typed;
+                    }
+                    if !variants.iter().any(|(vn, _)| vn == &arm.variant) {
+                        ctx.errors.push(SemaError::UnknownVariant {
+                            enum_name: enum_name.clone(),
+                            variant: arm.variant.clone(),
+                            span: arm.span,
+                        });
+                        return typed;
+                    }
+                }
+                let missing: Vec<String> = variants.iter()
+                    .filter_map(|(vn, _)| if seen.contains(vn.as_str()) { None } else { Some(vn.clone()) })
+                    .collect();
+                if !missing.is_empty() {
+                    ctx.errors.push(SemaError::NonExhaustiveMatch {
+                        enum_name: enum_name.clone(),
+                        missing,
+                        span: scrutinee.span,
+                    });
+                    return typed;
+                }
+                // Type-check each arm.
+                let mut typed_arms: Vec<TypedMatchArm> = Vec::new();
+                for arm in arms {
+                    let (variant_index, vfields) = variants.iter()
+                        .enumerate()
+                        .find(|(_, (vn, _))| vn == &arm.variant)
+                        .map(|(i, (_, vf))| (i as u32, vf.clone()))
+                        .unwrap();
+                    // Arity check on bindings.
+                    if arm.bindings.len() != vfields.len() {
+                        ctx.errors.push(SemaError::MatchArmArityMismatch {
+                            variant: arm.variant.clone(),
+                            expected: vfields.len(),
+                            found: arm.bindings.len(),
+                            span: arm.span,
+                        });
+                        return typed;
+                    }
+                    ctx.env.push_scope();
+                    let mut bindings_typed: Vec<(String, ResolvedTy)> = Vec::new();
+                    for (bname, (_, fty)) in arm.bindings.iter().zip(vfields.iter()) {
+                        let fpl = if fty.is_tensor() { Some(Placement::Gpu) } else { None };
+                        ctx.env.bind(bname.clone(), fty.clone(), fpl);
+                        bindings_typed.push((bname.clone(), fty.clone()));
+                    }
+                    let arm_body = check_body(&arm.body, ctx);
+                    ctx.env.pop_scope();
+                    typed_arms.push(TypedMatchArm {
+                        variant: arm.variant.clone(),
+                        variant_index,
+                        bindings: bindings_typed,
+                        body: arm_body,
+                    });
+                }
+                typed.push(TypedStmt::Match { scrutinee: tscrutinee, arms: typed_arms });
+            }
         }
     }
     typed
@@ -520,14 +701,160 @@ fn check_unary(
 
 fn check_call(
     callee_expr: &malus_syntax::ast::Expr,
-    args: &[malus_syntax::ast::Expr],
+    args: &[CallArg],
     span: Span,
     ctx: &mut BodyCtx<'_>,
 ) -> Option<TypedExpr> {
-    // Resolve the callee name — either bare `add` or qualified `ops.add`.
+    // ── Struct constructor: Layer(weights=w, bias=b) ──────────────────────────
+    if let ExprKind::Ident(type_name) = &callee_expr.kind {
+        if let Some(sdef) = ctx.env.structs.get(type_name.as_str()).cloned() {
+            let struct_name = type_name.clone();
+            // Build name→arg map; reject positional args in struct constructors.
+            let mut named: std::collections::HashMap<String, &malus_syntax::ast::Expr> = std::collections::HashMap::new();
+            for arg in args {
+                match &arg.name {
+                    Some(n) => { named.insert(n.clone(), &arg.value); }
+                    None => {
+                        ctx.errors.push(SemaError::UnknownConstructorField {
+                            struct_name: struct_name.clone(),
+                            field: "<positional>".to_string(),
+                            span,
+                        });
+                        return None;
+                    }
+                }
+            }
+            // Check for unknown fields.
+            for arg in args {
+                if let Some(n) = &arg.name {
+                    if !sdef.fields.iter().any(|(f, _)| f == n) {
+                        ctx.errors.push(SemaError::UnknownConstructorField {
+                            struct_name: struct_name.clone(),
+                            field: n.clone(),
+                            span: arg.value.span,
+                        });
+                        return None;
+                    }
+                }
+            }
+            // Resolve fields in decl order.
+            let mut fields_out: Vec<TypedExpr> = Vec::new();
+            for (fname, fty) in &sdef.fields {
+                match named.get(fname.as_str()) {
+                    Some(arg_expr) => {
+                        let ta = check_expr(arg_expr, Some(fty), ctx)?;
+                        if ta.ty != *fty {
+                            ctx.errors.push(SemaError::TypeMismatch {
+                                expected: fty.clone(),
+                                found: ta.ty.clone(),
+                                span: arg_expr.span,
+                            });
+                            return None;
+                        }
+                        fields_out.push(ta);
+                    }
+                    None => {
+                        ctx.errors.push(SemaError::MissingField {
+                            struct_name: struct_name.clone(),
+                            field: fname.clone(),
+                            span,
+                        });
+                        return None;
+                    }
+                }
+            }
+            let ty = ResolvedTy::Struct { name: struct_name.clone(), fields: sdef.fields.clone() };
+            return Some(typed_expr(
+                TypedExprKind::StructInit { name: struct_name, fields: fields_out },
+                ty,
+                None,
+                span,
+            ));
+        }
+    }
+
+    // ── Enum variant constructor: Activation.Relu(...) ───────────────────────
+    if let ExprKind::FieldAccess { base, field: variant_name } = &callee_expr.kind {
+        if let ExprKind::Ident(enum_name) = &base.kind {
+            if let Some(edef) = ctx.env.enums.get(enum_name.as_str()).cloned() {
+                let en = enum_name.clone();
+                let vn = variant_name.clone();
+                let variant_index = match edef.variants.iter().position(|v| v.name == vn) {
+                    Some(i) => i as u32,
+                    None => {
+                        ctx.errors.push(SemaError::UnknownVariant {
+                            enum_name: en.clone(),
+                            variant: vn.clone(),
+                            span,
+                        });
+                        return None;
+                    }
+                };
+                let vsig = edef.variants[variant_index as usize].clone();
+                let max_payload_slots = edef.variants.iter().map(|v| v.fields.len()).max().unwrap_or(0);
+                let mut payload_out: Vec<TypedExpr> = Vec::new();
+                if !args.is_empty() {
+                    if args.iter().any(|a| a.name.is_some()) {
+                        let mut named_map: std::collections::HashMap<String, &malus_syntax::ast::Expr> = std::collections::HashMap::new();
+                        for arg in args {
+                            if let Some(n) = &arg.name {
+                                named_map.insert(n.clone(), &arg.value);
+                            }
+                        }
+                        for (fname, fty) in &vsig.fields {
+                            match named_map.get(fname.as_str()) {
+                                Some(aexpr) => { payload_out.push(check_expr(aexpr, Some(fty), ctx)?); }
+                                None => {
+                                    ctx.errors.push(SemaError::MissingField {
+                                        struct_name: format!("{}::{}", en, vn),
+                                        field: fname.clone(),
+                                        span,
+                                    });
+                                    return None;
+                                }
+                            }
+                        }
+                    } else {
+                        if args.len() != vsig.fields.len() {
+                            ctx.errors.push(SemaError::MatchArmArityMismatch {
+                                variant: vn.clone(),
+                                expected: vsig.fields.len(),
+                                found: args.len(),
+                                span,
+                            });
+                            return None;
+                        }
+                        for (arg, (_, fty)) in args.iter().zip(vsig.fields.iter()) {
+                            payload_out.push(check_expr(&arg.value, Some(fty), ctx)?);
+                        }
+                    }
+                }
+                let variants_ty = edef.variants.iter()
+                    .map(|v| (v.name.clone(), v.fields.clone()))
+                    .collect();
+                let ty = ResolvedTy::Enum { name: en.clone(), variants: variants_ty };
+                return Some(typed_expr(
+                    TypedExprKind::EnumInit {
+                        enum_name: en,
+                        variant: vn,
+                        variant_index,
+                        payload: payload_out,
+                        max_payload_slots,
+                    },
+                    ty,
+                    None,
+                    span,
+                ));
+            }
+        }
+    }
+
+    // ── Regular function/kernel/builtin call (positional) ─────────────────────
     // Returns an owned enum so we can release the borrow on ctx.env before
     // calling check_expr (which needs &mut ctx).
     let (callee_name, resolved) = resolve_callee_name(callee_expr, ctx)?;
+    // Strip CallArg wrappers — regular calls are positional.
+    let positional: Vec<&malus_syntax::ast::Expr> = args.iter().map(|a| &a.value).collect();
 
     match resolved {
         ResolvedCallee::Kernel(sig) => {
@@ -538,18 +865,18 @@ fn check_call(
                 });
                 return None;
             }
-            if args.len() != sig.params.len() {
+            if positional.len() != sig.params.len() {
                 ctx.errors.push(SemaError::ArgCountMismatch {
                     callee: callee_name.clone(),
                     expected: sig.params.len(),
-                    found: args.len(),
+                    found: positional.len(),
                     span,
                 });
                 return None;
             }
             let mut typed_args: Vec<TypedExpr> = Vec::new();
             let mut in_flight: Vec<String> = Vec::new();
-            for (arg, param) in args.iter().zip(sig.params.iter()) {
+            for (arg, param) in positional.iter().zip(sig.params.iter()) {
                 let ta = check_expr(arg, Some(&param.ty), ctx)?;
                 if ta.ty != param.ty {
                     ctx.errors.push(SemaError::TypeMismatch {
@@ -575,17 +902,17 @@ fn check_call(
             ))
         }
         ResolvedCallee::Fn(sig) => {
-            if args.len() != sig.params.len() {
+            if positional.len() != sig.params.len() {
                 ctx.errors.push(SemaError::ArgCountMismatch {
                     callee: callee_name.clone(),
                     expected: sig.params.len(),
-                    found: args.len(),
+                    found: positional.len(),
                     span,
                 });
                 return None;
             }
             let mut typed_args: Vec<TypedExpr> = Vec::new();
-            for (arg, param) in args.iter().zip(sig.params.iter()) {
+            for (arg, param) in positional.iter().zip(sig.params.iter()) {
                 let ta = check_expr(arg, Some(&param.ty), ctx)?;
                 if ta.ty != param.ty {
                     ctx.errors.push(SemaError::TypeMismatch {
@@ -611,7 +938,7 @@ fn check_call(
             let typed_args: Vec<TypedExpr> = match &sig.kind {
                 BuiltinKind::Variadic => {
                     let mut out = Vec::new();
-                    for (i, arg) in args.iter().enumerate() {
+                    for (i, arg) in positional.iter().enumerate() {
                         let checked = check_expr(arg, None, ctx)?;
                         // String literals are only valid as the first arg of print/println.
                         if checked.ty == ResolvedTy::Unit {
@@ -628,23 +955,23 @@ fn check_call(
                 }
                 BuiltinKind::ShapeArgs => {
                     let mut out = Vec::new();
-                    for arg in args {
+                    for arg in positional.iter() {
                         out.push(check_expr(arg, Some(&ResolvedTy::Scalar(ScalarTy::I64)), ctx)?);
                     }
                     out
                 }
                 BuiltinKind::Fixed(params) => {
-                    if args.len() != params.len() {
+                    if positional.len() != params.len() {
                         ctx.errors.push(SemaError::ArgCountMismatch {
                             callee: callee_name.clone(),
                             expected: params.len(),
-                            found: args.len(),
+                            found: positional.len(),
                             span,
                         });
                         return None;
                     }
                     let mut out = Vec::new();
-                    for (arg, param_ty) in args.iter().zip(params.iter()) {
+                    for (arg, param_ty) in positional.iter().zip(params.iter()) {
                         out.push(check_expr(arg, Some(param_ty), ctx)?);
                     }
                     out
@@ -746,6 +1073,51 @@ fn check_field_access(
     span: Span,
     ctx: &mut BodyCtx<'_>,
 ) -> Option<TypedExpr> {
+    // Bare enum variant: `Activation.Relu` (no call) → EnumInit with empty payload.
+    if let ExprKind::Ident(enum_name) = &base.kind {
+        if let Some(edef) = ctx.env.enums.get(enum_name.as_str()).cloned() {
+            let en = enum_name.clone();
+            let vn = field.to_string();
+            let variant_index = match edef.variants.iter().position(|v| v.name == vn) {
+                Some(i) => i as u32,
+                None => {
+                    ctx.errors.push(SemaError::UnknownVariant {
+                        enum_name: en.clone(),
+                        variant: vn.clone(),
+                        span,
+                    });
+                    return None;
+                }
+            };
+            let vsig = &edef.variants[variant_index as usize];
+            if !vsig.fields.is_empty() {
+                // Data-carrying variant used without args — treat as constructor call arity error.
+                ctx.errors.push(SemaError::MatchArmArityMismatch {
+                    variant: vn.clone(),
+                    expected: vsig.fields.len(),
+                    found: 0,
+                    span,
+                });
+                return None;
+            }
+            let max_payload_slots = edef.variants.iter().map(|v| v.fields.len()).max().unwrap_or(0);
+            let variants_ty = edef.variants.iter().map(|v| (v.name.clone(), v.fields.clone())).collect();
+            let ty = ResolvedTy::Enum { name: en.clone(), variants: variants_ty };
+            return Some(typed_expr(
+                TypedExprKind::EnumInit {
+                    enum_name: en,
+                    variant: vn,
+                    variant_index,
+                    payload: vec![],
+                    max_payload_slots,
+                },
+                ty,
+                None,
+                span,
+            ));
+        }
+    }
+
     // Field access on a module alias: `ops.add` → callee resolution.
     // In the parser, `ops.add(a, b)` is parsed as Call { callee: FieldAccess(Ident("ops"), "add"), ... }
     // so this path handles the base expression of such a call.
@@ -759,6 +1131,30 @@ fn check_field_access(
             None,
             span,
         ));
+    }
+
+    // Struct field access: `s.field` → type of that field.
+    if let ResolvedTy::Struct { fields, .. } = &tbase.ty {
+        if let Some((_, fty)) = fields.iter().find(|(n, _)| n == field) {
+            let field_ty = fty.clone();
+            let field_placement = if field_ty.is_tensor() { Some(malus_syntax::ast::Placement::Gpu) } else { None };
+            return Some(typed_expr(
+                TypedExprKind::FieldAccess { base: Box::new(tbase), field: field.to_string() },
+                field_ty,
+                field_placement,
+                span,
+            ));
+        }
+        // Report unknown field.
+        let struct_name = if let ResolvedTy::Struct { name, .. } = &tbase.ty {
+            name.clone()
+        } else { unreachable!() };
+        ctx.errors.push(SemaError::UnknownField {
+            struct_name,
+            field: field.to_string(),
+            span,
+        });
+        return None;
     }
 
     let ty = tbase.ty.clone();
@@ -825,7 +1221,12 @@ fn resolve_callee_name(
 
 // ── Type resolution helpers ───────────────────────────────────────────────────
 
-pub fn resolve_ty(ty: &Ty, span: Span, errors: &mut Vec<SemaError>) -> Option<ResolvedTy> {
+pub fn resolve_ty(
+    ty: &Ty,
+    span: Span,
+    nominals: &NominalMaps<'_>,
+    errors: &mut Vec<SemaError>,
+) -> Option<ResolvedTy> {
     match ty {
         Ty::Tensor { dtype } => Some(ResolvedTy::Tensor { dtype: dtype.clone() }),
         Ty::Scalar(s) => Some(ResolvedTy::Scalar(s.clone())),
@@ -833,12 +1234,24 @@ pub fn resolve_ty(ty: &Ty, span: Span, errors: &mut Vec<SemaError>) -> Option<Re
         Ty::Tuple(ts) => {
             let mut resolved = Vec::new();
             for t in ts {
-                resolved.push(resolve_ty(t, span, errors)?);
+                resolved.push(resolve_ty(t, span, nominals, errors)?);
             }
             Some(ResolvedTy::Tuple(resolved))
         }
         Ty::Named(name) if name == "None" => Some(ResolvedTy::Unit),
         Ty::Named(name) => {
+            if let Some(def) = nominals.structs.get(name.as_str()) {
+                return Some(ResolvedTy::Struct {
+                    name: name.clone(),
+                    fields: def.fields.clone(),
+                });
+            }
+            if let Some(def) = nominals.enums.get(name.as_str()) {
+                let variants = def.variants.iter()
+                    .map(|v| (v.name.clone(), v.fields.clone()))
+                    .collect();
+                return Some(ResolvedTy::Enum { name: name.clone(), variants });
+            }
             errors.push(SemaError::UnknownType { name: name.clone(), span });
             None
         }
@@ -847,11 +1260,12 @@ pub fn resolve_ty(ty: &Ty, span: Span, errors: &mut Vec<SemaError>) -> Option<Re
 
 fn resolve_params(
     params: &[malus_syntax::ast::Param],
+    nominals: &NominalMaps<'_>,
     errors: &mut Vec<SemaError>,
 ) -> Option<Vec<ParamSig>> {
     let mut out = Vec::new();
     for p in params {
-        let ty = resolve_ty(&p.ty, p.span, errors)?;
+        let ty = resolve_ty(&p.ty, p.span, nominals, errors)?;
         out.push(ParamSig { name: p.name.clone(), ty });
     }
     Some(out)
@@ -859,11 +1273,12 @@ fn resolve_params(
 
 fn resolve_kernel_params(
     params: &[malus_syntax::ast::KernelParam],
+    nominals: &NominalMaps<'_>,
     errors: &mut Vec<SemaError>,
 ) -> Option<Vec<KernelParamSig>> {
     let mut out = Vec::new();
     for p in params {
-        let ty = resolve_ty(&p.ty, p.span, errors)?;
+        let ty = resolve_ty(&p.ty, p.span, nominals, errors)?;
         out.push(KernelParamSig { inout: p.inout, name: p.name.clone(), ty });
     }
     Some(out)

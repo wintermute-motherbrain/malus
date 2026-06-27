@@ -4,7 +4,7 @@
 
 malus is a compiled ML DSL for Apple Silicon. Python-like syntax, dual compilation pipeline: `fn` bodies → Cranelift JIT (CPU), `kernel` bodies → Metal Shading Language (GPU). The CTMM memory model inserts static `free`/barrier calls at compile time, falling back to reference counting only when lifetimes are structurally ambiguous.
 
-## Current state: M9 done, **M10 is next**
+## Current state: M10 done, **M11 is next**
 
 | Milestone | Status | Crate |
 |---|---|---|
@@ -18,8 +18,8 @@ malus is a compiled ML DSL for Apple Silicon. Python-like syntax, dual compilati
 | M7 — Kernel Thickening (multi-stmt kernels, `let mut`, scalar broadcasting) | ✅ done | `malus-syntax`, `malus-sema`, `malus-codegen-*` |
 | M8 — Core Stdlib (matmul, relu/sigmoid/tanh, transpose, zeros/ones, sum) | ✅ done | `malus-runtime`, `malus-codegen-*` |
 | M9 — Control Flow (if/else, for, while, hierarchical CTMM) | ✅ done | `malus-syntax`, `malus-sema`, `malus-codegen-cpu`, `malus-runtime` |
-| **M10 — Structs + Enums** (structs, data-carrying enums, match) | **← next** | `malus-syntax`, `malus-sema`, `malus-codegen-cpu` |
-| M11 — The 2-Layer MLP (fixed arrays, diagnostics, done-when) | planned | all crates |
+| M10 — Structs + Enums (structs, data-carrying enums, match) | ✅ done | `malus-syntax`, `malus-sema`, `malus-codegen-cpu` |
+| **M11 — The 2-Layer MLP** (fixed arrays, diagnostics, done-when) | **← next** | all crates |
 
 Full milestone specs: `docs/milestones/`. V1 plan overview: `docs/milestones/v1-plan.md`. Architecture decisions: `docs/adr/`. Domain vocabulary: `CONTEXT.md`.
 
@@ -46,21 +46,22 @@ crates/
   malus-syntax/        # lexer, parser, AST  (src/lexer.rs, src/parser.rs, src/ast.rs)
   malus-loader/        # module resolution + flattening  (src/lib.rs)
   malus-sema/          # type checker + CTMM  (src/{check,ctmm,env,builtins,ty,typed_ir,error}.rs)
-  malus-codegen-cpu/   # Cranelift JIT  — M9 complete (src/lib.rs, src/tests.rs)
-  malus-codegen-gpu/   # MSL codegen    — M9 complete (src/lib.rs, src/tests.rs)
-  malus-runtime/       # Metal API      — M9 complete (src/lib.rs, src/metal.rs, src/tests.rs)
+  malus-codegen-cpu/   # Cranelift JIT  — M10 complete (src/lib.rs, src/tests.rs)
+  malus-codegen-gpu/   # MSL codegen    — M10 complete (src/lib.rs, src/tests.rs)
+  malus-runtime/       # Metal API      — M10 complete (src/lib.rs, src/metal.rs, src/tests.rs)
   malus-cli/           # entry point    (src/main.rs)
 examples/
   add_tensors.ml       # MVP golden example
   mlp_forward.ml       # M8 done-when: 2-layer forward pass with relu/matmul/sum/transpose
   control_flow.ml      # M9 done-when: for loop + nested if with tensor ops
+  structs_enums.ml     # M10 done-when: struct + data-carrying enum + match
   import_demo/         # multi-file import demo (main.ml, ops.ml)
 docs/milestones/       # m1–m11 specs, v1-plan.md
 docs/spec/             # language spec (01-overview … 09-modules)
 docs/adr/              # architecture decision records
 ```
 
-## The pipeline (M1–M9 complete)
+## The pipeline (M1–M10 complete)
 
 ```
 .ml source file
@@ -83,9 +84,9 @@ Compiles all MSL to MTLComputePipelineState, cached by kernel_id
 
 `malus-cli/src/main.rs` runs all stages. `compile_and_run` is fully implemented; `fn main()` is JIT-compiled and executed via Cranelift. The `RuntimeSymbols` struct of thirteen `extern "C" fn` pointers is injected by the CLI (real Metal fns from `malus-runtime` on macOS); tests inject mock fns. The `kernel_ids` map (`&HashMap<String, u64>`) is produced by `compile_kernels` and passed to `compile_and_run` so the JIT'd code can bake `u64` kernel ids at `KernelCall` and unary-builtin-dispatch sites.
 
-## Runtime C ABI (M9 state)
+## Runtime C ABI (M10 state)
 
-The thirteen runtime functions are real Metal implementations in `malus-runtime/src/metal.rs`, injected into the JIT via a `RuntimeSymbols` struct. codegen-cpu stays platform-agnostic and Metal-unaware (ADR-0008).
+The thirteen runtime functions are real Metal implementations in `malus-runtime/src/metal.rs`, injected into the JIT via a `RuntimeSymbols` struct. codegen-cpu stays platform-agnostic and Metal-unaware (ADR-0008). Structs and enums are heap-allocated via libc `malloc`/`free` registered directly as JIT symbols (not in `RuntimeSymbols`).
 
 ```c
 i64  tensor_alloc_gpu(i32 dtype_tag, const usize* shape_ptr, usize ndims, const float* data)
@@ -99,7 +100,7 @@ i64  kernel_dispatch(u64 kernel_id, const i64* handles, usize count)
 void gpu_barrier()
 void tensor_print(i64 handle)
 void tensor_free(i64 handle)
-// M9 RC ABI — wired, not called by M9 generated code; consumed by M10.
+// RC ABI — tensor_retain/release used by DropStruct to release tensor fields.
 void tensor_retain(i64 handle)
 void tensor_release(i64 handle)
 ```
@@ -120,11 +121,11 @@ The `i64` handle is a raw pointer to a heap-allocated `TensorBuffer { buffer: me
 
 | Limitation | Fix in |
 |---|---|
-| No structs or enums | M10 |
-| No match expression | M10 |
 | Intermediate temporaries from nested BinOps leak | M11 |
 | No fixed-length arrays | M11 |
 | Plain-string error messages (no spans or source context) | M11 |
+| Enum-payload tensor RC deferred (tag-only enum payloads don't leak; f32 payload leaks its 16-byte malloc) | M11 |
+| Cross-module structs/enums unsupported (loader `exported_names` gap) | M11 |
 | `break`/`continue` statements | Post-V1 |
 | Early `return` inside a control-flow body | Post-V1 |
 | matmul/transpose/sum are CPU loops, not MPS | Post-V1 (ADR-0012) |

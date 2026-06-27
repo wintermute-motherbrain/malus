@@ -92,6 +92,23 @@ pub enum TypedStmt {
     /// Decrement the tensor's reference count; frees when it reaches zero
     /// (`tensor_release`). Not emitted by M9.
     Release { name: String },
+    // ── M10: aggregate types ─────────────────────────────────────────────────
+    /// CTMM: free a struct's heap box and release its tensor fields.
+    /// `tensor_field_indices` are the slot indices (0-based) of fields whose
+    /// type is `Tensor`, so codegen knows which slots to `tensor_release`.
+    DropStruct { name: String, tensor_field_indices: Vec<usize> },
+    /// Exhaustive `match` on an enum binding.
+    Match { scrutinee: TypedExpr, arms: Vec<TypedMatchArm> },
+}
+
+/// One arm of a `match` statement.
+#[derive(Debug, Clone)]
+pub struct TypedMatchArm {
+    pub variant: String,
+    pub variant_index: u32,
+    /// `(local_name, field_type)` in field-declaration order.
+    pub bindings: Vec<(String, ResolvedTy)>,
+    pub body: Vec<TypedStmt>,
 }
 
 // ── Expressions ───────────────────────────────────────────────────────────────
@@ -142,5 +159,20 @@ pub enum TypedExprKind {
     FieldAccess {
         base: Box<TypedExpr>,
         field: String,
+    },
+    // ── M10: aggregate constructors ──────────────────────────────────────────
+    /// Struct construction: fields reordered to declaration order.
+    StructInit {
+        name: String,
+        fields: Vec<TypedExpr>,
+    },
+    /// Enum variant construction.
+    /// `max_payload_slots` = max field count across all variants (for allocation).
+    EnumInit {
+        enum_name: String,
+        variant: String,
+        variant_index: u32,
+        payload: Vec<TypedExpr>,
+        max_payload_slots: usize,
     },
 }

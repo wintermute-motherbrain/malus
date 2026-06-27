@@ -13,8 +13,8 @@ pub use check::check as check_program;
 pub use error::SemaError;
 pub use ty::ResolvedTy;
 pub use typed_ir::{
-    TypedExpr, TypedExprKind, TypedFn, TypedKernel, TypedKernelParam, TypedParam, TypedProgram,
-    TypedStmt,
+    TypedExpr, TypedExprKind, TypedFn, TypedKernel, TypedKernelParam, TypedMatchArm, TypedParam,
+    TypedProgram, TypedStmt,
 };
 
 use std::collections::{HashMap, HashSet};

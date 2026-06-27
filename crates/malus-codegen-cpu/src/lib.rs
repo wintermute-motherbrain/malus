@@ -14,8 +14,37 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{DataDescription, FuncId, Linkage, Module};
 
-use malus_sema::{ResolvedTy, TypedExpr, TypedExprKind, TypedFn, TypedProgram, TypedStmt};
+use malus_sema::{ResolvedTy, TypedExpr, TypedExprKind, TypedFn, TypedMatchArm, TypedProgram, TypedStmt};
 use malus_syntax::ast::{elementwise_builtin_name, scalar_broadcast_builtin_name, BinOp, Lit, ScalarTy, UnaryOp};
+
+// ── libc malloc/free shims (M10 heap allocation for structs/enums) ────────────
+//
+// These are plain C ABI wrappers so the JIT can call the process's libc
+// without depending on malus-runtime (preserving ADR-0008's spirit).
+
+extern "C" fn libc_malloc(size: usize) -> *mut u8 {
+    unsafe { libc_alloc(size) }
+}
+
+extern "C" fn libc_free(ptr: *mut u8) {
+    unsafe { libc_dealloc(ptr) }
+}
+
+#[cfg(target_os = "macos")]
+extern "C" {
+    #[link_name = "malloc"]
+    fn libc_alloc(size: usize) -> *mut u8;
+    #[link_name = "free"]
+    fn libc_dealloc(ptr: *mut u8);
+}
+
+#[cfg(not(target_os = "macos"))]
+extern "C" {
+    #[link_name = "malloc"]
+    fn libc_alloc(size: usize) -> *mut u8;
+    #[link_name = "free"]
+    fn libc_dealloc(ptr: *mut u8);
+}
 
 // ── Runtime symbol injection ─────────────────────────────────────────────────
 
@@ -121,6 +150,8 @@ fn cranelift_type(ty: &ResolvedTy) -> Result<Option<cranelift_codegen::ir::Type>
         ResolvedTy::Bool => Ok(Some(I8)),
         ResolvedTy::Unit => Ok(None),
         ResolvedTy::Tuple(_) => Err(CodegenError::UnsupportedType("tuple".into())),
+        // Structs and enums are heap-allocated; represented as opaque i64 pointer.
+        ResolvedTy::Struct { .. } | ResolvedTy::Enum { .. } => Ok(Some(I64)),
     }
 }
 
@@ -162,6 +193,9 @@ struct Codegen<'m> {
     // M9 RC ABI — wired but not called by M9 generated code.
     rt_tensor_retain: FuncId,
     rt_tensor_release: FuncId,
+    // M10: heap allocation for structs and enums.
+    rt_malloc: FuncId,
+    rt_heap_free: FuncId,
 }
 
 impl<'m> Codegen<'m> {
@@ -415,7 +449,111 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                 self.call_runtime_release(handle);
                 Ok(false)
             }
+
+            // ── M10: aggregate types ──────────────────────────────────────────────
+            TypedStmt::DropStruct { name, tensor_field_indices } => {
+                let ptr = self.use_var(name)?;
+                // Release each tensor field (tensor_release = tensor_free when refcount hits 0).
+                for &slot_idx in tensor_field_indices {
+                    let offset = (slot_idx as i32) * 8;
+                    let field_handle = self.builder.ins().load(I64, cranelift_codegen::ir::MemFlags::trusted(), ptr, offset);
+                    self.call_runtime_release(field_handle);
+                }
+                // Free the struct's heap allocation.
+                self.call_heap_free(ptr);
+                Ok(false)
+            }
+
+            TypedStmt::Match { scrutinee, arms } => {
+                self.lower_match(scrutinee, arms)
+            }
         }
+    }
+
+    fn lower_match(&mut self, scrutinee: &TypedExpr, arms: &[TypedMatchArm]) -> Result<bool, CodegenError> {
+        let scrut_ptr = self.lower_expr(scrutinee)?;
+        // Load the u32 tag stored at offset 0 (as i32 for Cranelift).
+        let tag = self.builder.ins().load(I32, cranelift_codegen::ir::MemFlags::trusted(), scrut_ptr, 0);
+
+        // Create a merge block (only used if at least one arm falls through).
+        let merge_blk = self.builder.create_block();
+        let mut all_diverge = true;
+
+        // Build arm blocks and per-arm end-of-chain fallback block.
+        // Chain: arm0_test → arm0_body | arm1_test → arm1_body | ... | unreachable
+        let mut arm_test_blks: Vec<cranelift_codegen::ir::Block> = Vec::new();
+        for _ in arms {
+            arm_test_blks.push(self.builder.create_block());
+        }
+        let unreachable_blk = self.builder.create_block();
+
+        // Jump into the first test block.
+        if let Some(&first) = arm_test_blks.first() {
+            self.builder.ins().jump(first, &[]);
+        }
+
+        for (i, arm) in arms.iter().enumerate() {
+            let test_blk = arm_test_blks[i];
+            let next_blk = arm_test_blks.get(i + 1).copied().unwrap_or(unreachable_blk);
+            let body_blk = self.builder.create_block();
+
+            self.builder.switch_to_block(test_blk);
+            self.builder.seal_block(test_blk);
+
+            let expected_tag = self.builder.ins().iconst(I32, arm.variant_index as i64);
+            let cmp = self.builder.ins().icmp(
+                cranelift_codegen::ir::condcodes::IntCC::Equal,
+                tag,
+                expected_tag,
+            );
+            self.builder.ins().brif(cmp, body_blk, &[], next_blk, &[]);
+
+            // Arm body.
+            self.builder.switch_to_block(body_blk);
+            self.builder.seal_block(body_blk);
+
+            // Bind payload fields from pointer (offset 8 + j*8 per field).
+            for (j, (binding_name, binding_ty)) in arm.bindings.iter().enumerate() {
+                let offset = 8 + (j as i32) * 8;
+                let cl_ty = match cranelift_type(binding_ty)? {
+                    Some(t) => t,
+                    None => continue,
+                };
+                // Load using the binding's native Cranelift type (matches store in EnumInit).
+                let field_val = self.builder.ins().load(cl_ty, cranelift_codegen::ir::MemFlags::trusted(), scrut_ptr, offset);
+                let var = Variable::from_u32(self.next_var as u32);
+                self.next_var += 1;
+                self.builder.declare_var(var, cl_ty);
+                self.builder.def_var(var, field_val);
+                self.var_map.insert(binding_name.clone(), var);
+            }
+
+            let mut arm_diverges = false;
+            for s in &arm.body {
+                if self.lower_stmt(s)? {
+                    arm_diverges = true;
+                    break;
+                }
+            }
+            if arm_diverges {
+                // Arm ends in return — don't jump to merge.
+            } else {
+                self.builder.ins().jump(merge_blk, &[]);
+                all_diverge = false;
+            }
+        }
+
+        // Unreachable block (match is exhaustive at compile time).
+        self.builder.switch_to_block(unreachable_blk);
+        self.builder.seal_block(unreachable_blk);
+        self.builder.ins().trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
+
+        if !all_diverge {
+            self.builder.switch_to_block(merge_blk);
+            self.builder.seal_block(merge_blk);
+        }
+
+        Ok(all_diverge)
     }
 
     fn use_var(&mut self, name: &str) -> Result<cranelift_codegen::ir::Value, CodegenError> {
@@ -666,9 +804,68 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                     let len_ref = self.import_func(self.codegen.rt_tensor_len);
                     let call = self.builder.ins().call(len_ref, &[handle]);
                     Ok(self.builder.inst_results(call).to_vec()[0])
+                } else if let ResolvedTy::Struct { fields, .. } = &base.ty {
+                    let slot_idx = fields.iter().position(|(n, _)| n == field)
+                        .ok_or_else(|| CodegenError::UnsupportedExpr(format!("struct has no field '{field}'")))?;
+                    let ptr = self.lower_expr(base)?;
+                    let offset = (slot_idx as i32) * 8;
+                    let cl_ty = match cranelift_type(&expr.ty)? {
+                        Some(t) => t,
+                        None => return Err(CodegenError::UnsupportedExpr("unit field access".into())),
+                    };
+                    // Load using the field's native Cranelift type (matches store).
+                    let val = self.builder.ins().load(cl_ty, cranelift_codegen::ir::MemFlags::trusted(), ptr, offset);
+                    Ok(val)
                 } else {
                     Err(CodegenError::UnsupportedExpr(format!("FieldAccess .{field} not yet supported")))
                 }
+            }
+
+            TypedExprKind::StructInit { fields, name } => {
+                let n_slots = fields.len();
+                let size = (n_slots * 8) as i64;
+                let size_val = self.builder.ins().iconst(self.codegen.ptr_type(), size);
+                let ptr = self.call_malloc(size_val);
+                for (i, field_expr) in fields.iter().enumerate() {
+                    let val = self.lower_expr(field_expr)?;
+                    // Store each field in its native Cranelift type at slot i*8.
+                    // Each slot is 8 bytes wide; smaller types leave the upper bytes unused.
+                    self.builder.ins().store(
+                        cranelift_codegen::ir::MemFlags::trusted(),
+                        val,
+                        ptr,
+                        (i as i32) * 8,
+                    );
+                }
+                let _ = name;
+                Ok(ptr)
+            }
+
+            TypedExprKind::EnumInit { variant_index, payload, max_payload_slots, .. } => {
+                // Layout: 8-byte tag slot (i32 tag + 4 bytes padding) + max_payload_slots * 8 bytes.
+                let total_slots = 1 + max_payload_slots;
+                let size = (total_slots * 8) as i64;
+                let size_val = self.builder.ins().iconst(self.codegen.ptr_type(), size);
+                let ptr = self.call_malloc(size_val);
+                // Store u32 tag at offset 0 (as i32).
+                let tag_val = self.builder.ins().iconst(I32, *variant_index as i64);
+                self.builder.ins().store(
+                    cranelift_codegen::ir::MemFlags::trusted(),
+                    tag_val,
+                    ptr,
+                    0,
+                );
+                // Store payload fields at offsets 8 + j*8, each in its native type.
+                for (j, field_expr) in payload.iter().enumerate() {
+                    let val = self.lower_expr(field_expr)?;
+                    self.builder.ins().store(
+                        cranelift_codegen::ir::MemFlags::trusted(),
+                        val,
+                        ptr,
+                        8 + (j as i32) * 8,
+                    );
+                }
+                Ok(ptr)
             }
         }
     }
@@ -951,6 +1148,17 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
         let func_ref = self.import_func(self.codegen.rt_gpu_barrier);
         self.builder.ins().call(func_ref, &[]);
     }
+
+    fn call_malloc(&mut self, size: cranelift_codegen::ir::Value) -> cranelift_codegen::ir::Value {
+        let func_ref = self.import_func(self.codegen.rt_malloc);
+        let call = self.builder.ins().call(func_ref, &[size]);
+        self.builder.inst_results(call).to_vec()[0]
+    }
+
+    fn call_heap_free(&mut self, ptr: cranelift_codegen::ir::Value) {
+        let func_ref = self.import_func(self.codegen.rt_heap_free);
+        self.builder.ins().call(func_ref, &[ptr]);
+    }
 }
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -992,6 +1200,9 @@ pub fn compile_and_run(
     jit_builder.symbol("print_f32",              print_f32                      as *const u8);
     jit_builder.symbol("print_i64",              print_i64                      as *const u8);
     jit_builder.symbol("print_bool",             print_bool                     as *const u8);
+    // libc malloc/free — process symbols, available without malus-runtime.
+    jit_builder.symbol("malloc",                 libc_malloc                    as *const u8);
+    jit_builder.symbol("free",                   libc_free                      as *const u8);
 
     let mut module = JITModule::new(jit_builder);
     let ptr = module.target_config().pointer_type();
@@ -1106,6 +1317,23 @@ pub fn compile_and_run(
         .map_err(|e| CodegenError::JitError(e.to_string()))?;
     let rt_tensor_release = module.declare_function("tensor_release", Linkage::Import, &sig_free)
         .map_err(|e| CodegenError::JitError(e.to_string()))?;
+    // malloc(size: usize) -> *mut u8   (i64 on 64-bit)
+    let sig_malloc = {
+        let mut s = Signature::new(call_conv);
+        s.params.push(AbiParam::new(ptr));
+        s.returns.push(AbiParam::new(I64));
+        s
+    };
+    // free(ptr: *mut u8)
+    let sig_heap_free = {
+        let mut s = Signature::new(call_conv);
+        s.params.push(AbiParam::new(I64));
+        s
+    };
+    let rt_malloc = module.declare_function("malloc", Linkage::Import, &sig_malloc)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
+    let rt_heap_free = module.declare_function("free", Linkage::Import, &sig_heap_free)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
 
     // First pass: declare all user fn signatures.
     let mut func_ids: HashMap<String, FuncId> = HashMap::new();
@@ -1145,6 +1373,8 @@ pub fn compile_and_run(
         rt_print_bool,
         rt_tensor_retain,
         rt_tensor_release,
+        rt_malloc,
+        rt_heap_free,
     };
 
     // Second pass: compile each fn body.

@@ -77,6 +77,42 @@ pub enum Lit {
     Str(String),
 }
 
+// ── Aggregate type definitions ────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FieldDef {
+    pub name: String,
+    pub ty: Ty,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct VariantDef {
+    pub name: String,
+    pub fields: Vec<FieldDef>,
+    pub span: Span,
+}
+
+// ── Call argument (supports keyword args for struct/enum constructors) ─────────
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CallArg {
+    /// `Some(name)` for named args like `weights=w`; `None` for positional.
+    pub name: Option<String>,
+    pub value: Expr,
+}
+
+// ── Match arm ─────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchArm {
+    pub variant: String,
+    /// Positional bindings: bind variant's fields by declaration order.
+    pub bindings: Vec<String>,
+    pub body: Vec<Stmt>,
+    pub span: Span,
+}
+
 // ── Expressions ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]
@@ -91,7 +127,9 @@ pub enum ExprKind {
     Ident(String),
     BinOp { op: BinOp, lhs: Box<Expr>, rhs: Box<Expr> },
     Unary { op: UnaryOp, operand: Box<Expr> },
-    Call { callee: Box<Expr>, args: Vec<Expr> },
+    /// Call or struct/enum constructor — args may be named (struct/enum) or
+    /// positional (regular fn call).
+    Call { callee: Box<Expr>, args: Vec<CallArg> },
     Index { base: Box<Expr>, indices: Vec<Expr> },
     TensorLiteral { placement: Placement, dtype: ScalarTy, elements: Vec<Expr> },
     FieldAccess { base: Box<Expr>, field: String },
@@ -133,6 +171,11 @@ pub enum StmtKind {
     },
     /// `while condition: body`
     While { condition: Expr, body: Vec<Stmt> },
+    /// `match scrutinee: arms`
+    ///
+    /// Exhaustive — every variant must appear exactly once. Arms may bind payload
+    /// fields positionally. `return` is valid as an arm terminator.
+    Match { scrutinee: Expr, arms: Vec<MatchArm> },
 }
 
 // ── Parameters ────────────────────────────────────────────────────────────────
@@ -189,6 +232,16 @@ pub enum ItemKind {
         params: Vec<KernelParam>,
         return_ty: Ty,
         body: Vec<Stmt>,
+    },
+    /// `struct Name: field: Type ...`
+    Struct {
+        name: String,
+        fields: Vec<FieldDef>,
+    },
+    /// `enum Name: Variant / Variant(fields) ...`
+    Enum {
+        name: String,
+        variants: Vec<VariantDef>,
     },
     /// `import models.transformer`
     Import {

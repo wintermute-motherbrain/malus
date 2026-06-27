@@ -165,10 +165,19 @@ fn collect_binops_in_stmt(
         TypedStmt::Assign { expr, .. } => collect_binops_in_expr(expr, tensor_ops, scalar_ops),
         TypedStmt::Return { expr } => collect_binops_in_expr(expr, tensor_ops, scalar_ops),
         TypedStmt::Expr(expr) => collect_binops_in_expr(expr, tensor_ops, scalar_ops),
-        TypedStmt::Drop { .. } | TypedStmt::GpuBarrier
+        TypedStmt::Drop { .. } | TypedStmt::DropStruct { .. } | TypedStmt::GpuBarrier
         | TypedStmt::Retain { .. } | TypedStmt::Release { .. } => {}
         // Kernel bodies cannot contain control flow (V1 constraint).
         TypedStmt::If { .. } | TypedStmt::For { .. } | TypedStmt::While { .. } => {}
+        // Match recurse — relu/sigmoid inside arms must be collected.
+        TypedStmt::Match { scrutinee, arms } => {
+            collect_binops_in_expr(scrutinee, tensor_ops, scalar_ops);
+            for arm in arms {
+                for s in &arm.body {
+                    collect_binops_in_stmt(s, tensor_ops, scalar_ops);
+                }
+            }
+        }
     }
 }
 
@@ -214,6 +223,12 @@ fn collect_binops_in_expr(
         TypedExprKind::FieldAccess { base, .. } => {
             collect_binops_in_expr(base, tensor_ops, scalar_ops);
         }
+        TypedExprKind::StructInit { fields, .. } => {
+            for f in fields { collect_binops_in_expr(f, tensor_ops, scalar_ops); }
+        }
+        TypedExprKind::EnumInit { payload, .. } => {
+            for p in payload { collect_binops_in_expr(p, tensor_ops, scalar_ops); }
+        }
         TypedExprKind::Lit(_) | TypedExprKind::Ident(_) => {}
     }
 }
@@ -224,9 +239,17 @@ fn collect_unary_builtins_in_stmt(stmt: &TypedStmt, out: &mut BTreeSet<String>) 
             collect_unary_builtins_in_expr(expr, out);
         }
         TypedStmt::Expr(expr) => collect_unary_builtins_in_expr(expr, out),
-        TypedStmt::Drop { .. } | TypedStmt::GpuBarrier
+        TypedStmt::Drop { .. } | TypedStmt::DropStruct { .. } | TypedStmt::GpuBarrier
         | TypedStmt::Retain { .. } | TypedStmt::Release { .. } => {}
         TypedStmt::If { .. } | TypedStmt::For { .. } | TypedStmt::While { .. } => {}
+        TypedStmt::Match { scrutinee, arms } => {
+            collect_unary_builtins_in_expr(scrutinee, out);
+            for arm in arms {
+                for s in &arm.body {
+                    collect_unary_builtins_in_stmt(s, out);
+                }
+            }
+        }
     }
 }
 
@@ -262,6 +285,12 @@ fn collect_unary_builtins_in_expr(expr: &TypedExpr, out: &mut BTreeSet<String>) 
             }
         }
         TypedExprKind::FieldAccess { base, .. } => collect_unary_builtins_in_expr(base, out),
+        TypedExprKind::StructInit { fields, .. } => {
+            for f in fields { collect_unary_builtins_in_expr(f, out); }
+        }
+        TypedExprKind::EnumInit { payload, .. } => {
+            for p in payload { collect_unary_builtins_in_expr(p, out); }
+        }
         TypedExprKind::Lit(_) | TypedExprKind::Ident(_) => {}
     }
 }

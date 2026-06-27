@@ -340,6 +340,59 @@ impl Parser {
                     span: Span::new(start.file, start.start as usize, end.start as usize),
                 })
             }
+            TokenKind::Match => {
+                self.advance(); // consume 'match'
+                let scrutinee = self.parse_expr()?;
+                self.expect(&TokenKind::Colon)?;
+                self.expect(&TokenKind::Newline)?;
+                if !matches!(self.current_kind(), TokenKind::Indent) {
+                    return Err(ParseError::new("expected indented match arms", self.current_span()));
+                }
+                self.advance(); // consume INDENT
+                let mut arms = Vec::new();
+                loop {
+                    self.skip_newlines();
+                    if matches!(self.current_kind(), TokenKind::Dedent | TokenKind::Eof) {
+                        break;
+                    }
+                    let arm_start = self.current_span();
+                    let (variant, _) = self.expect_ident()?;
+                    let mut bindings = Vec::new();
+                    if matches!(self.current_kind(), TokenKind::LParen) {
+                        self.advance(); // consume '('
+                        while !matches!(self.current_kind(), TokenKind::RParen | TokenKind::Eof) {
+                            let (binding, _) = self.expect_ident()?;
+                            bindings.push(binding);
+                            if matches!(self.current_kind(), TokenKind::Comma) {
+                                self.advance();
+                            } else {
+                                break;
+                            }
+                        }
+                        self.expect(&TokenKind::RParen)?;
+                    }
+                    self.expect(&TokenKind::Colon)?;
+                    let body = self.parse_body()?;
+                    let arm_end = self.current_span();
+                    arms.push(MatchArm {
+                        variant,
+                        bindings,
+                        body,
+                        span: Span::new(arm_start.file, arm_start.start as usize, arm_end.start as usize),
+                    });
+                }
+                if matches!(self.current_kind(), TokenKind::Dedent) {
+                    self.advance(); // consume DEDENT
+                }
+                if arms.is_empty() {
+                    return Err(ParseError::new("match must have at least one arm", self.current_span()));
+                }
+                let end = self.current_span();
+                Ok(Stmt {
+                    kind: StmtKind::Match { scrutinee, arms },
+                    span: Span::new(start.file, start.start as usize, end.start as usize),
+                })
+            }
             TokenKind::For => {
                 self.advance(); // consume 'for'
                 let (var, _) = self.expect_ident()?; // loop variable
@@ -509,12 +562,25 @@ impl Parser {
 
         loop {
             match self.current_kind().clone() {
-                // Function call: base(args)
+                // Function call or struct/enum constructor: base(args)
                 TokenKind::LParen => {
                     self.advance();
                     let mut args = Vec::new();
                     while !matches!(self.current_kind(), TokenKind::RParen | TokenKind::Eof) {
-                        args.push(self.parse_expr()?);
+                        // Detect named arg: Ident followed immediately by `=` (not `==`).
+                        let arg = if matches!(self.current_kind(), TokenKind::Ident(_))
+                            && self.pos + 1 < self.tokens.len()
+                            && matches!(self.tokens[self.pos + 1].kind, TokenKind::Eq)
+                        {
+                            let (name, _) = self.expect_ident()?;
+                            self.advance(); // consume `=`
+                            let value = self.parse_expr()?;
+                            CallArg { name: Some(name), value }
+                        } else {
+                            let value = self.parse_expr()?;
+                            CallArg { name: None, value }
+                        };
+                        args.push(arg);
                         if matches!(self.current_kind(), TokenKind::Comma) {
                             self.advance();
                         } else {
@@ -712,6 +778,109 @@ impl Parser {
         })
     }
 
+    fn parse_struct(&mut self) -> Result<Item, ParseError> {
+        let start = self.current_span();
+        self.expect(&TokenKind::Struct)?;
+        let (name, _) = self.expect_ident()?;
+        self.expect(&TokenKind::Colon)?;
+        self.expect(&TokenKind::Newline)?;
+        if !matches!(self.current_kind(), TokenKind::Indent) {
+            return Err(ParseError::new("expected indented struct fields", self.current_span()));
+        }
+        self.advance(); // consume INDENT
+        let mut fields = Vec::new();
+        loop {
+            self.skip_newlines();
+            if matches!(self.current_kind(), TokenKind::Dedent | TokenKind::Eof) {
+                break;
+            }
+            let field_start = self.current_span();
+            let (fname, _) = self.expect_ident()?;
+            self.expect(&TokenKind::Colon)?;
+            let ty = self.parse_type()?;
+            let field_end = self.current_span();
+            self.expect_newline_or_eof()?;
+            fields.push(FieldDef {
+                name: fname,
+                ty,
+                span: Span::new(field_start.file, field_start.start as usize, field_end.start as usize),
+            });
+        }
+        if matches!(self.current_kind(), TokenKind::Dedent) {
+            self.advance(); // consume DEDENT
+        }
+        if fields.is_empty() {
+            return Err(ParseError::new("struct must have at least one field", self.current_span()));
+        }
+        let end = self.current_span();
+        Ok(Item {
+            kind: ItemKind::Struct { name, fields },
+            span: Span::new(start.file, start.start as usize, end.start as usize),
+        })
+    }
+
+    fn parse_enum(&mut self) -> Result<Item, ParseError> {
+        let start = self.current_span();
+        self.expect(&TokenKind::Enum)?;
+        let (name, _) = self.expect_ident()?;
+        self.expect(&TokenKind::Colon)?;
+        self.expect(&TokenKind::Newline)?;
+        if !matches!(self.current_kind(), TokenKind::Indent) {
+            return Err(ParseError::new("expected indented enum variants", self.current_span()));
+        }
+        self.advance(); // consume INDENT
+        let mut variants = Vec::new();
+        loop {
+            self.skip_newlines();
+            if matches!(self.current_kind(), TokenKind::Dedent | TokenKind::Eof) {
+                break;
+            }
+            let var_start = self.current_span();
+            let (vname, _) = self.expect_ident()?;
+            // Optional data-carrying fields: Variant(name: Type, ...)
+            let mut vfields = Vec::new();
+            if matches!(self.current_kind(), TokenKind::LParen) {
+                self.advance(); // consume '('
+                while !matches!(self.current_kind(), TokenKind::RParen | TokenKind::Eof) {
+                    let field_start = self.current_span();
+                    let (fname, _) = self.expect_ident()?;
+                    self.expect(&TokenKind::Colon)?;
+                    let ty = self.parse_type()?;
+                    let field_end = self.current_span();
+                    vfields.push(FieldDef {
+                        name: fname,
+                        ty,
+                        span: Span::new(field_start.file, field_start.start as usize, field_end.start as usize),
+                    });
+                    if matches!(self.current_kind(), TokenKind::Comma) {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
+                self.expect(&TokenKind::RParen)?;
+            }
+            let var_end = self.current_span();
+            self.expect_newline_or_eof()?;
+            variants.push(VariantDef {
+                name: vname,
+                fields: vfields,
+                span: Span::new(var_start.file, var_start.start as usize, var_end.start as usize),
+            });
+        }
+        if matches!(self.current_kind(), TokenKind::Dedent) {
+            self.advance(); // consume DEDENT
+        }
+        if variants.is_empty() {
+            return Err(ParseError::new("enum must have at least one variant", self.current_span()));
+        }
+        let end = self.current_span();
+        Ok(Item {
+            kind: ItemKind::Enum { name, variants },
+            span: Span::new(start.file, start.start as usize, end.start as usize),
+        })
+    }
+
     fn parse_program(&mut self) -> Result<Program, ParseError> {
         let mut items = Vec::new();
         self.skip_newlines();
@@ -726,17 +895,19 @@ impl Parser {
             self.skip_newlines();
         }
 
-        // Phase 2: fn and kernel definitions.
+        // Phase 2: fn, kernel, struct, and enum definitions.
         while !self.at_end() {
             match self.current_kind() {
                 TokenKind::Fn     => items.push(self.parse_fn()?),
                 TokenKind::Kernel => items.push(self.parse_kernel()?),
+                TokenKind::Struct => items.push(self.parse_struct()?),
+                TokenKind::Enum   => items.push(self.parse_enum()?),
                 TokenKind::Import | TokenKind::From => return Err(ParseError::new(
                     "import declarations must appear before function and kernel definitions",
                     self.current_span(),
                 )),
                 _ => return Err(ParseError::new(
-                    format!("expected 'fn' or 'kernel', got {:?}", self.current_kind()),
+                    format!("expected 'fn', 'kernel', 'struct', or 'enum', got {:?}", self.current_kind()),
                     self.current_span(),
                 )),
             }

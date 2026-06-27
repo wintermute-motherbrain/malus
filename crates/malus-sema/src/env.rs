@@ -4,6 +4,26 @@ use malus_syntax::Span;
 use crate::builtins::BuiltinSig;
 use crate::ty::ResolvedTy;
 
+// ── Nominal type definitions ───────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct StructDef {
+    pub fields: Vec<(String, ResolvedTy)>,
+    pub defined_at: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct VariantSig {
+    pub name: String,
+    pub fields: Vec<(String, ResolvedTy)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct EnumDef {
+    pub variants: Vec<VariantSig>,
+    pub defined_at: Span,
+}
+
 // ── Signatures ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -54,6 +74,10 @@ pub struct Env {
     pub builtins: HashMap<String, BuiltinSig>,
     /// Qualified import aliases: module name → set of exported names.
     pub module_aliases: HashMap<String, HashSet<String>>,
+    /// User-defined struct types.
+    pub structs: HashMap<String, StructDef>,
+    /// User-defined enum types.
+    pub enums: HashMap<String, EnumDef>,
 }
 
 impl Env {
@@ -68,6 +92,8 @@ impl Env {
             kernels: HashMap::new(),
             builtins,
             module_aliases,
+            structs: HashMap::new(),
+            enums: HashMap::new(),
         }
     }
 

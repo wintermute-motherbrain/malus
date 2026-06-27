@@ -8,6 +8,17 @@ pub enum ResolvedTy {
     Bool,
     Tuple(Vec<ResolvedTy>),
     Unit,
+    /// User-defined product type. Nominal: name determines identity.
+    Struct {
+        name: String,
+        fields: Vec<(String, ResolvedTy)>,
+    },
+    /// User-defined sum type. Nominal: name determines identity.
+    /// `variants` is `(variant_name, [(field_name, field_ty)])`.
+    Enum {
+        name: String,
+        variants: Vec<(String, Vec<(String, ResolvedTy)>)>,
+    },
 }
 
 impl fmt::Display for ResolvedTy {
@@ -27,6 +38,8 @@ impl fmt::Display for ResolvedTy {
                 write!(f, ")")
             }
             ResolvedTy::Unit => write!(f, "None"),
+            ResolvedTy::Struct { name, .. } => write!(f, "{}", name),
+            ResolvedTy::Enum { name, .. } => write!(f, "{}", name),
         }
     }
 }
@@ -39,6 +52,30 @@ impl ResolvedTy {
     pub fn tensor_dtype(&self) -> Option<&ScalarTy> {
         match self {
             ResolvedTy::Tensor { dtype } => Some(dtype),
+            _ => None,
+        }
+    }
+
+    pub fn is_struct(&self) -> bool {
+        matches!(self, ResolvedTy::Struct { .. })
+    }
+
+    /// Returns the fields of a struct type.
+    pub fn struct_fields(&self) -> Option<&[(String, ResolvedTy)]> {
+        match self {
+            ResolvedTy::Struct { fields, .. } => Some(fields),
+            _ => None,
+        }
+    }
+
+    pub fn is_enum(&self) -> bool {
+        matches!(self, ResolvedTy::Enum { .. })
+    }
+
+    /// Returns the variants of an enum type.
+    pub fn enum_variants(&self) -> Option<&[(String, Vec<(String, ResolvedTy)>)]> {
+        match self {
+            ResolvedTy::Enum { variants, .. } => Some(variants),
             _ => None,
         }
     }

@@ -45,6 +45,26 @@ fn print_item(out: &mut String, item: &Item) {
                 print_stmt(out, stmt, 1);
             }
         }
+        ItemKind::Struct { name, fields } => {
+            writeln!(out, "struct {name}:").unwrap();
+            for f in fields {
+                writeln!(out, "    {}: {}", f.name, print_ty(&f.ty)).unwrap();
+            }
+        }
+        ItemKind::Enum { name, variants } => {
+            writeln!(out, "enum {name}:").unwrap();
+            for v in variants {
+                if v.fields.is_empty() {
+                    writeln!(out, "    {}", v.name).unwrap();
+                } else {
+                    let fstr = v.fields.iter()
+                        .map(|f| format!("{}: {}", f.name, print_ty(&f.ty)))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    writeln!(out, "    {}({})", v.name, fstr).unwrap();
+                }
+            }
+        }
     }
 }
 
@@ -84,6 +104,18 @@ fn print_stmt(out: &mut String, stmt: &Stmt, depth: usize) {
             writeln!(out, "{indent}while {}:", print_expr(condition)).unwrap();
             for s in body { print_stmt(out, s, depth + 1); }
         }
+        StmtKind::Match { scrutinee, arms } => {
+            writeln!(out, "{indent}match {}:", print_expr(scrutinee)).unwrap();
+            for arm in arms {
+                let binding_str = if arm.bindings.is_empty() {
+                    String::new()
+                } else {
+                    format!("({})", arm.bindings.join(", "))
+                };
+                writeln!(out, "{}    {}{}:", indent, arm.variant, binding_str).unwrap();
+                for s in &arm.body { print_stmt(out, s, depth + 2); }
+            }
+        }
     }
 }
 
@@ -105,7 +137,12 @@ fn print_expr(expr: &Expr) -> String {
             }
         }
         ExprKind::Call { callee, args } => {
-            let args_str = args.iter().map(print_expr).collect::<Vec<_>>().join(", ");
+            let args_str = args.iter().map(|a| {
+                match &a.name {
+                    Some(n) => format!("{}={}", n, print_expr(&a.value)),
+                    None => print_expr(&a.value),
+                }
+            }).collect::<Vec<_>>().join(", ");
             format!("{}({})", print_expr(callee), args_str)
         }
         ExprKind::Index { base, indices } => {
@@ -275,6 +312,20 @@ mod tests {
                             return_ty,
                             body: body.into_iter().map(|s| erase_stmt(s, z)).collect(),
                         },
+                    ItemKind::Struct { name, fields } =>
+                        ItemKind::Struct {
+                            name,
+                            fields: fields.into_iter().map(|f| FieldDef { span: z, ..f }).collect(),
+                        },
+                    ItemKind::Enum { name, variants } =>
+                        ItemKind::Enum {
+                            name,
+                            variants: variants.into_iter().map(|v| VariantDef {
+                                span: z,
+                                fields: v.fields.into_iter().map(|f| FieldDef { span: z, ..f }).collect(),
+                                ..v
+                            }).collect(),
+                        },
                 },
             }).collect(),
         }
@@ -312,6 +363,15 @@ mod tests {
                         condition: erase_expr(condition, z),
                         body: body.into_iter().map(|s| erase_stmt(s, z)).collect(),
                     },
+                StmtKind::Match { scrutinee, arms } =>
+                    StmtKind::Match {
+                        scrutinee: erase_expr(scrutinee, z),
+                        arms: arms.into_iter().map(|arm| MatchArm {
+                            span: z,
+                            body: arm.body.into_iter().map(|s| erase_stmt(s, z)).collect(),
+                            ..arm
+                        }).collect(),
+                    },
             },
         }
     }
@@ -330,7 +390,7 @@ mod tests {
             },
             ExprKind::Call { callee, args } => ExprKind::Call {
                 callee: Box::new(erase_expr(*callee, z)),
-                args: args.into_iter().map(|a| erase_expr(a, z)).collect(),
+                args: args.into_iter().map(|a| CallArg { value: erase_expr(a.value, z), ..a }).collect(),
             },
             ExprKind::Index { base, indices } => ExprKind::Index {
                 base: Box::new(erase_expr(*base, z)),

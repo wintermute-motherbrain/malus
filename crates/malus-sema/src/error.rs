@@ -19,6 +19,17 @@ pub enum SemaError {
     FormatArgCountMismatch { callee: String, placeholders: usize, args: usize, span: Span },
     StringLiteralOutsidePrint { span: Span },
     AssignToImmutable { name: String, span: Span },
+    // ── M10: aggregate types ─────────────────────────────────────────────────
+    UnknownField { struct_name: String, field: String, span: Span },
+    UnknownVariant { enum_name: String, variant: String, span: Span },
+    NonExhaustiveMatch { enum_name: String, missing: Vec<String>, span: Span },
+    DuplicateMatchArm { variant: String, span: Span },
+    MatchWildcard { span: Span },
+    MatchArmArityMismatch { variant: String, expected: usize, found: usize, span: Span },
+    MissingField { struct_name: String, field: String, span: Span },
+    UnknownConstructorField { struct_name: String, field: String, span: Span },
+    DuplicateTypeDefinition { name: String, first: Span, second: Span },
+    MatchScrutineeNotEnum { found: String, span: Span },
 }
 
 impl fmt::Display for SemaError {
@@ -54,6 +65,26 @@ impl fmt::Display for SemaError {
                 write!(f, "string literals are only valid as the first argument of print/println"),
             SemaError::AssignToImmutable { name, .. } =>
                 write!(f, "cannot assign to '{}' because it is not declared `let mut`", name),
+            SemaError::UnknownField { struct_name, field, .. } =>
+                write!(f, "struct '{}' has no field '{}'", struct_name, field),
+            SemaError::UnknownVariant { enum_name, variant, .. } =>
+                write!(f, "enum '{}' has no variant '{}'", enum_name, variant),
+            SemaError::NonExhaustiveMatch { enum_name, missing, .. } =>
+                write!(f, "non-exhaustive match on '{}': missing variants {:?}", enum_name, missing),
+            SemaError::DuplicateMatchArm { variant, .. } =>
+                write!(f, "duplicate match arm for variant '{}'", variant),
+            SemaError::MatchWildcard { .. } =>
+                write!(f, "wildcard '_' arms are not supported in V1 match — list every variant explicitly"),
+            SemaError::MatchArmArityMismatch { variant, expected, found, .. } =>
+                write!(f, "variant '{}' has {} field(s) but arm binds {}", variant, expected, found),
+            SemaError::MissingField { struct_name, field, .. } =>
+                write!(f, "struct '{}' requires field '{}' but it was not provided", struct_name, field),
+            SemaError::UnknownConstructorField { struct_name, field, .. } =>
+                write!(f, "struct '{}' has no field '{}'", struct_name, field),
+            SemaError::DuplicateTypeDefinition { name, .. } =>
+                write!(f, "duplicate type definition '{}'", name),
+            SemaError::MatchScrutineeNotEnum { found, .. } =>
+                write!(f, "match scrutinee must be an enum type, got {}", found),
         }
     }
 }

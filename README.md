@@ -51,14 +51,16 @@ See [`examples/relu_backward.ml`](./examples/relu_backward.ml) for a gradient ke
 - `let mut` + reassignment — mutable tensor bindings with safe old-value freeing; CTMM handles the barrier before the free
 - Scalar broadcasting — `a * 0.5` and `0.5 * a` dispatch purpose-built GPU kernels; no ABI change required
 - Built-in element-wise kernels — `a + b` in a `fn` body synthesizes and dispatches a `malus_add` kernel automatically
+- Core math stdlib — `matmul`, `relu`, `sigmoid`, `tanh`, `exp`, `log`, `sqrt`, `abs`, `transpose`, `zeros`, `ones`, `sum`
+- Control flow — `if`/`else`, `for`, `while` with hierarchical CTMM drop placement
+- Structs + data-carrying enums + `match` — user-defined product/sum types with keyword construction and exhaustive match
 - Multi-file imports — `import ops` / `from ops import add`
 - Format-string printing — `println("loss: {}", tensor)`
 
 **Coming next:**
 
-- Core math stdlib — matmul, relu, sigmoid, transpose, zeros/ones, sum
-- Control flow — `if`/`else`, `for`, `while`
-- Structs + enums + match
+- Fixed-length arrays with iteration
+- Better diagnostics (source spans, structured errors)
 - V1 done-when: a manually-differentiated 2-layer MLP running on Metal
 
 ## Project structure
@@ -73,13 +75,16 @@ crates/
   malus-runtime/      # Metal API bindings, tensor ops, memory management
   malus-cli/          # script runner, entry point
 docs/
-  adr/                # architecture decision records (ADR-0001 through ADR-0011)
+  adr/                # architecture decision records (ADR-0001 through ADR-0014)
   milestones/         # milestone specs (M1–M11) and V1 plan
   spec/               # language spec
 examples/
   add_tensors.ml      # basic kernel dispatch
   relu_backward.ml    # gradient kernel, let mut accumulation, scalar broadcast
   scalar_ops.ml       # scalar arithmetic
+  mlp_forward.ml      # 2-layer forward pass with relu/matmul/sum/transpose
+  control_flow.ml     # for loop + nested if with tensor ops
+  structs_enums.ml    # struct + data-carrying enum + match
   import_demo/        # multi-file import
 CONTEXT.md            # domain glossary
 ```
