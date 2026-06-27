@@ -69,6 +69,18 @@ _Avoid_: Tensor shape, static shape
 The CTMM compile-time set of tensor bindings produced or consumed by a GPU-producing expression (`KernelCall`, tensor `BinOp`, or GPU-returning `Call`) since the last `GpuBarrier`. Any CPU-side access of a binding in the pending set triggers a barrier insertion.
 _Avoid_: GPU-active set
 
+**Broadcasting**:
+NumPy right-aligned shape-compatibility rule for tensor arithmetic. Two shapes are broadcast-compatible if, right-aligned, each dimension pair is either equal, 1 (expanded to match the other), or absent (treated as 1). Example: `[4,8] + [1,8]` → `[4,8]`. Added in M16.
+_Avoid_: shape broadcasting (fine informally), implicit replication
+
+**Axis reduction**:
+A reduction op (`sum`, `mean`, `max`, `var`) applied over a specific tensor axis, optionally preserving the reduced dimension as size 1 (`keepdim=true`). Distinct from V1's whole-tensor `sum` (which always returns a `[1]` tensor). Added in M16.
+_Avoid_: reduce, fold
+
+**Index tensor**:
+A `Tensor<i32>` or `Tensor<i64>` used as an index into another tensor (e.g. for embedding lookup). Not differentiable — integer tensors are never `Variable`. Added in M19 as a narrow dtype carve-out; full non-f32 float compute generality is post-V3.
+_Avoid_: integer tensor (fine informally, but "index tensor" conveys the use)
+
 ### Kernel mechanics
 
 **Launch configuration**:
@@ -95,6 +107,40 @@ _Avoid_: Builtin kernel, intrinsic kernel, stdlib kernel
 The type regime inside a kernel body. Tensor parameters are bound as their *element* scalar type (`f32`, not `Tensor<f32>`). The body is checked as per-thread scalar math; the final `return` expression must have the return tensor's element type. Codegen emits `x[tid]` for params and bare `name` for `let`-bound locals. This means kernel-body comparison operators yield the operand's scalar dtype (a float mask), not `Bool`. `fn`-body BinOp rules and scalar-broadcast rules do not apply inside kernels.
 _Avoid_: Scalar-space, thread-space, per-element computation
 
+### Autograd
+
+**Variable**:
+A grad-tracked tensor. Distinct from `Tensor` — the compiler always manages `Variable` lifetimes with reference counting (type-directed RC), while `Tensor` keeps static Drop. `Variable` values record their forward ops onto the global tape; `backward(loss)` accumulates gradients into leaf `.grad` slots. Constructed with `variable(t: Tensor<f32>)`.
+_Avoid_: program "variable" (lowercase), "Tensor.requires_grad", "Tensor with grad"
+
+**Tape**:
+A global thread-local define-by-run record. Each differentiable op on `Variable` values pushes a `TapeNode` holding saved inputs and a VJP closure. `backward(loss)` walks the tape in reverse and clears it on completion. See ADR-0015.
+_Avoid_: gradient graph, computation graph
+
+**VJP (Vector-Jacobian Product)**:
+The per-op backward rule used by `backward`. Given the output gradient, computes the input gradients. All VJPs for V1/V2 ops are hardcoded in `malus-runtime/src/tape.rs`.
+_Avoid_: backward pass, gradient function
+
+**`backward`**:
+A builtin that walks the tape in reverse from a scalar-valued `Variable` (the loss), accumulates gradients into each leaf's `.grad` slot, releases saved tensors, and clears the tape.
+_Avoid_: backpropagation (fine informally, not a technical term here)
+
+**`.grad`**:
+A field accessor on a leaf `Variable<f32>` that returns the accumulated gradient as a plain `Tensor<f32>`. Zero (or a zeros tensor) if `backward` has not yet been called. Cleared by `zero_grad`.
+_Avoid_: gradient tensor, derivative
+
+**`no_grad`**:
+A scoped region (`with no_grad: body`) that suspends tape recording. `Variable` ops inside the body execute their forward computation but push no `TapeNode`. Used for the optimizer update step and for inference. `Variable` RC semantics are unchanged inside `no_grad`.
+_Avoid_: detach, inference mode
+
+**Leaf Variable**:
+A `Variable` created directly by the user with `variable(t)`. Accumulates `.grad` on `backward`. Counterpart to intermediate Variables, which are produced by ops on other Variables and have no `.grad`.
+_Avoid_: parameter, weight (informal descriptions, not technical terms)
+
+**`zero_grad`**:
+A variadic builtin that resets the accumulated `.grad` of each passed `Variable` to a zeros tensor of the same shape. Called at the start of each training step to clear gradients before the next `backward`.
+_Avoid_: clear gradients, reset gradients
+
 ### Types (V1)
 
 **Struct**:
@@ -116,3 +162,13 @@ _Avoid_: List, dynamic array, vector
 **`let mut` / reassignment** (V1):
 A mutable binding declared with `let mut x = expr`. Can be reassigned with `x = new_val`. CTMM treats reassignment as: drop the old value (if tensor, emit `tensor_free` or `tensor_release`), then bind the new value. Prevents the shadowing-in-loops problem where `let x = x + delta` inside a loop scopes the new `x` to the loop body.
 _Avoid_: Mutable variable (fine as informal description; just not a technical term)
+
+### Optimization
+
+**AdamW**:
+The Adam optimizer with decoupled weight decay, implemented in malus source as a stdlib construct (`examples/stdlib/adamw.ml`). Uses per-parameter moment buffers (`m`, `v`) updated via lvalue assignment. Added in M20.
+_Avoid_: Adam, SGD with weight decay (different algorithms)
+
+**Lvalue assignment**:
+An assignment whose target is an indexed element (`a[i] = e`) or a struct field (`s.field = e`) rather than a bare name. Added in M20. CTMM drops the old element/field value before binding the new one.
+_Avoid_: in-place update, indexed assignment (fine informally)

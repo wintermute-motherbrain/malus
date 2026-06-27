@@ -4,7 +4,7 @@
 
 malus is a compiled ML DSL for Apple Silicon. Python-like syntax, dual compilation pipeline: `fn` bodies → Cranelift JIT (CPU), `kernel` bodies → Metal Shading Language (GPU). The CTMM memory model inserts static `free`/barrier calls at compile time, falling back to reference counting only when lifetimes are structurally ambiguous.
 
-## Current state: **M11 done — V1 complete**
+## Current state: **M11 done — V1 complete; V2 (autograd) and V3 (nanoGPT) planned**
 
 | Milestone | Status | Crate |
 |---|---|---|
@@ -20,8 +20,50 @@ malus is a compiled ML DSL for Apple Silicon. Python-like syntax, dual compilati
 | M9 — Control Flow (if/else, for, while, hierarchical CTMM) | ✅ done | `malus-syntax`, `malus-sema`, `malus-codegen-cpu`, `malus-runtime` |
 | M10 — Structs + Enums (structs, data-carrying enums, match) | ✅ done | `malus-syntax`, `malus-sema`, `malus-codegen-cpu` |
 | M11 — The 2-Layer MLP (fixed arrays, 2-D literals, diagnostics, XOR) | ✅ done | all crates |
+| **V2 — Autograd** | | |
+| M12 — Hardening (enum-payload UAF, zero-length crash, break/continue) | 🔲 planned | `malus-syntax`, `malus-sema`, `malus-codegen-cpu`, `malus-runtime` |
+| M13 — The `Variable` Type (type-directed RC, dormant retain/release ABI activated) | 🔲 planned | `malus-syntax`, `malus-sema`, `malus-codegen-cpu` |
+| M14 — The Tape + `backward()` (global tape, VJPs for all V1 ops, `no_grad`) | 🔲 planned | `malus-runtime`, `malus-sema`, `malus-codegen-cpu` |
+| M15 — Differentiable Stdlib + Capstone (`zero_grad`, V2 XOR capstone) | 🔲 planned | all crates |
+| **V3 — nanoGPT** | | |
+| M16 — Broadcasting + Axis Reductions (NumPy broadcast, `mean`/`var`/`max` over axis) | 🔲 planned | `malus-syntax`, `malus-sema`, `malus-codegen-cpu`, `malus-runtime` |
+| M17 — Shapes + Batched Matmul (`reshape`/`view`, `transpose(dims)`, 3-D matmul) | 🔲 planned | `malus-syntax`, `malus-sema`, `malus-codegen-cpu`, `malus-runtime` |
+| M18 — Transformer Stdlib (`softmax`, `layernorm`, `gelu`, `cross_entropy`, causal mask) | 🔲 planned | `malus-sema`, `malus-codegen-cpu`, `malus-runtime` |
+| M19 — Embeddings + Index Tensors (i32/i64 tensors, `gather`, `randn`/Philox) | 🔲 planned | all crates |
+| M20 — Lvalue Assignment + AdamW (`a[i]=e`, `s.f=e`, stdlib AdamW) | 🔲 planned | `malus-syntax`, `malus-sema`, `malus-codegen-cpu` |
+| M21 — MPS Migration (`matmul` + reductions → MPS, pending tensors) | 🔲 planned | `malus-runtime` |
+| M22 — Data I/O + nanoGPT Capstone (`read_file`, char tokenization, transformer) | 🔲 planned | all crates |
 
-Full milestone specs: `docs/milestones/`. V1 plan overview: `docs/milestones/v1-plan.md`. Architecture decisions: `docs/adr/`. Domain vocabulary: `CONTEXT.md`.
+Full milestone specs: `docs/milestones/`. V1 plan: `docs/milestones/v1-plan.md`. V2 plan: `docs/milestones/v2-plan.md`. V3 plan: `docs/milestones/v3-plan.md`. Architecture decisions: `docs/adr/`. Domain vocabulary: `CONTEXT.md`.
+
+## V2 Design Decisions
+
+These decisions were made during V2 planning. Do not re-litigate them without user input.
+
+| Decision | Choice | Rationale |
+|---|---|---|
+| Autograd architecture | Define-by-run runtime tape | Literal micrograd north-star; one VJP per op; activates RC machinery already in the ABI/IR. See ADR-0015. |
+| Grad typing | Distinct `Variable` type | CTMM needs a compile-time type-directed signal to choose static `free` vs RC `release`. `Tensor` keeps static Drop everywhere. See ADR-0016. |
+| Tape control | Global thread-local tape + scoped `no_grad` | micrograd/PyTorch model; no viral tape threading; fits `OnceLock<MetalContext>` pattern. |
+| VJP authorship | Built-in Rust VJPs; `custom_grad` deferred | All ops to nanoGPT have analytic VJPs; nothing on the critical path needs user-defined grads. |
+| CTMM/RC scope | Type-directed RC on `Variable` only | General dataflow-liveness RC fallback stays deferred; correctness comes from the type. |
+| `.grad` type | Plain `Tensor<f32>` | No double-backward in V2; gradient tensors stay outside the tape and eligible for static Drop. |
+| Tape clearing | Auto-clear after `backward` | PyTorch `retain_graph=False` default prevents unbounded tape growth across steps. |
+| `Variable` name | `Variable` | Most recognizable autodiff term; capital-V type reads distinctly from lowercase program variables. |
+
+## V3 Design Decisions
+
+These decisions were made during V3 planning. Do not re-litigate them without user input.
+
+| Decision | Choice | Rationale |
+|---|---|---|
+| V3 capstone | Char GPT on tiny Shakespeare via real file I/O | Faithful nanoGPT demo (train + sample); file I/O accepted (ADR-0018). |
+| MPS migration scope | `matmul` + transformer reductions (M21) | Eager-CPU matmul makes the transformer capstone unrunnably slow; amends ADR-0012. See ADR-0017. |
+| Optimizer | Lvalue assignment + stdlib AdamW (M20) | Retires V1 language gap; proves language composes into a real optimizer. |
+| Index tensor dtype | i32/i64 only | Narrow carve-out for embedding lookup; full f16/bf16 compute generality stays deferred. |
+| Broadcasting | NumPy right-aligned (M16) | Retires the `ones41 @ b` bias-broadcast trick. |
+| Axis reductions | `keepdim` parameter (M16) | Required for layernorm and softmax normalization. |
+| File I/O scope | Minimal `read_file` + 3 string primitives | Capstone needs real data; I/O scope strictly fenced. See ADR-0018. |
 
 ## V1 Design Decisions
 
@@ -120,17 +162,26 @@ The `i64` handle is a raw pointer to a heap-allocated `TensorBuffer { buffer: me
 
 **kernel_dispatch:** looks up the `MTLComputePipelineState` by `kernel_id`, allocates an output buffer matching the first input's dtype and shape, encodes a compute pass (`setComputePipelineState`, `setBuffer` per input + output, `dispatchThreads:threadsPerThreadgroup:`), does NOT commit (commit happens in `gpu_barrier`).
 
-## Known Limitations (Post-V1)
+## Known Limitations
 
-| Limitation | Notes |
-|---|---|
-| Cross-module structs/enums unsupported (loader `exported_names` gap) | Post-V1 |
-| `break`/`continue` statements | Post-V1 |
-| ScalarBroadcast IR node (scalar-tensor BinOps work inline; no dedicated typed node) | Post-V1 |
-| matmul/transpose/sum are CPU loops, not MPS | Post-V1 (ADR-0012) |
-| Non-f32 dtypes panic | Post-V1 |
-| Zero-length tensors crash Metal | Post-V1 |
-| CTMM barrier coalescing is conservative | Post-V1 |
+| Limitation | Status | Notes |
+|---|---|---|
+| Enum-payload match-binding use-after-free | M12 | Tensor extracted from match arm aliases DropEnum memory; fix: retain-on-escape |
+| `break`/`continue` statements | M12 | Not yet a keyword; needs CTMM unwind pass analogous to early-return |
+| Zero-length tensors crash Metal | M12 | `kernel_dispatch` with `out_len==0` encodes a zero threadgroup; needs early-return guard |
+| NumPy-style broadcasting | M16 | Element-count must match today; right-aligned broadcast deferred |
+| Axis reductions (`mean`, `var`, `max` with keepdim) | M16 | Only whole-tensor `sum` exists |
+| `reshape`/`view`, batched/3-D matmul | M17 | matmul is 2-D only |
+| Transformer stdlib (softmax, layernorm, GELU, cross-entropy) | M18 | Not yet implemented |
+| Index tensors, `gather`/embedding, `randn` | M19 | Only f32 tensors today |
+| Lvalue assignment (`a[i]=e`, `s.f=e`) | M20 | `Assign.target` is a bare name only |
+| matmul/transpose/sum are CPU loops, not MPS | M21 (ADR-0017 amends ADR-0012) | Correct but slow for transformer scale |
+| File I/O / data loading | M22 (ADR-0018) | No `read_file` yet |
+| Non-f32 compute dtypes (f16, bf16) | Post-V3 | Only i32/i64 for index tensors added in M19 |
+| Cross-module structs/enums unsupported (loader `exported_names` gap) | Post-V3 | `malus-loader/src/lib.rs:189-201` |
+| ScalarBroadcast IR node | Post-V3 | Inline scalar-broadcast BinOps work; dedicated IR node deferred |
+| CTMM barrier coalescing is conservative | Post-V3 | ADR-0009 "Consequences" |
+| General dataflow-liveness RC fallback | Post-V3 | Type-directed RC on `Variable` supersedes this for autograd; true dataflow RC remains deferred |
 
 ## Coding conventions
 
