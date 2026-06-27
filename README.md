@@ -39,27 +39,33 @@ fn add(a: Tensor<f32>, b: Tensor<f32>) -> Tensor<f32>:
     return a + b
 ```
 
-See [`examples/showcase.ml`](./examples/showcase.ml) for a full demonstration of every MVP capability.
+See [`examples/relu_backward.ml`](./examples/relu_backward.ml) for a gradient kernel with mutable accumulation and scalar broadcasting.
 
-## Status: v0.1 MVP complete
+## Status
 
-The v0.1 MVP proves the core dual-pipeline model end-to-end:
+**Working today:**
 
-- [x] M1 — Lexer, parser, AST, pretty-printer, module loader
-- [x] M2 — Type checker (`Tensor<dtype>`, scalars, `bool`, tuples), CTMM last-use analysis
-- [x] M3 — Cranelift JIT for `fn` bodies
-- [x] M4 — Metal runtime (shared buffers, sync barriers, kernel dispatch)
-- [x] M5 — MSL codegen for `kernel` bodies (element-wise ops)
-- [x] M5.1 — Built-in element-wise kernels for `fn`-body BinOp (`a + b` dispatches `malus_add`)
-- [x] M6 — End-to-end: `malus examples/add_tensors.ml` prints `[6, 8, 10, 12]`
+- Dual-pipeline compilation — `fn` bodies JIT via Cranelift, `kernel` bodies compiled to MSL and dispatched on Metal
+- CTMM memory model — static tensor `free` and GPU barrier insertion at compile time, no GC overhead
+- Multi-statement kernel bodies — `let` bindings, comparison ops (producing float masks), and float literals inside `kernel`
+- `let mut` + reassignment — mutable tensor bindings with safe old-value freeing; CTMM handles the barrier before the free
+- Scalar broadcasting — `a * 0.5` and `0.5 * a` dispatch purpose-built GPU kernels; no ABI change required
+- Built-in element-wise kernels — `a + b` in a `fn` body synthesizes and dispatches a `malus_add` kernel automatically
+- Multi-file imports — `import ops` / `from ops import add`
+- Format-string printing — `println("loss: {}", tensor)`
 
-Next: M7 — v1 features (zeros/ones, scalar broadcasting, RNG).
+**Coming next:**
+
+- Core math stdlib — matmul, relu, sigmoid, transpose, zeros/ones, sum
+- Control flow — `if`/`else`, `for`, `while`
+- Structs + enums + match
+- V1 done-when: a manually-differentiated 2-layer MLP running on Metal
 
 ## Project structure
 
 ```
 crates/
-  malus-syntax/       # lexer, parser, AST
+  malus-syntax/       # lexer, parser, AST, pretty-printer
   malus-loader/       # module resolution + flattening
   malus-sema/         # type checker, CTMM (last-use + barrier insertion)
   malus-codegen-cpu/  # Cranelift JIT for fn bodies
@@ -67,10 +73,14 @@ crates/
   malus-runtime/      # Metal API bindings, tensor ops, memory management
   malus-cli/          # script runner, entry point
 docs/
-  adr/                # architecture decision records
-  milestones/         # milestone specs (M1–M7)
+  adr/                # architecture decision records (ADR-0001 through ADR-0011)
+  milestones/         # milestone specs (M1–M11) and V1 plan
   spec/               # language spec
-examples/             # malus source files
+examples/
+  add_tensors.ml      # basic kernel dispatch
+  relu_backward.ml    # gradient kernel, let mut accumulation, scalar broadcast
+  scalar_ops.ml       # scalar arithmetic
+  import_demo/        # multi-file import
 CONTEXT.md            # domain glossary
 ```
 
