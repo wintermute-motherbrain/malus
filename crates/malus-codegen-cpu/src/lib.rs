@@ -374,6 +374,11 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                         else_term = self.lower_stmt(s)?;
                     }
                     if !else_term { self.builder.ins().jump(merge_blk, &[]); }
+
+                    if then_term && else_term {
+                        // merge_blk has no predecessors — don't switch into it.
+                        return Ok(true);
+                    }
                 } else {
                     self.builder.ins().brif(cond_val, then_blk, &[], merge_blk, &[]);
 
