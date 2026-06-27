@@ -123,6 +123,14 @@ Run it and fix integration bugs. Likely problem areas based on the CTMM gaps:
 
 The actual done-when file. Once the example runs correctly and loss decreases, M11 is complete.
 
+### 5. Early `return` Inside Control Flow Bodies
+
+M9 deferred `return` inside `for`/`while`/`if` bodies. M11 adds it.
+
+**CTMM:** At each `return` inside a nested scope, walk the chain of enclosing scopes and emit `Drop` (or `Release` for RC-managed bindings) for all live tensor bindings that do not appear in the return expression. This is a "scope unwind" pass — similar to how Rust's drop-elaboration works before early returns.
+
+**Sema:** `return` is already parsed and type-checked; no AST or IR changes needed. The only change is in `ctmm.rs`: detect `TypedStmt::Return` inside nested bodies and emit the unwind drops before it.
+
 ## Out of Scope
 
 - SafeTensors loading (deferred — the MLP uses `ones`/`zeros` for initialization)

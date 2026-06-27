@@ -32,7 +32,7 @@ A tensor lifetime that cannot be resolved at compile time — specifically, when
 _Avoid_: dynamic lifetime, heap lifetime
 
 **RC fallback**:
-When CTMM cannot statically determine the drop point (structurally ambiguous lifetime, or tensor flowing through a conditional branch), it falls back to reference counting. `tensor_retain` increments the refcount; `tensor_release` decrements it and frees when zero. The fast path (no RC) is preserved for all statically resolvable lifetimes. See ADR-0002.
+When CTMM cannot statically determine the drop point — specifically when a tensor is stored in a heap-allocated container (struct field, fixed-length array element) — it falls back to reference counting. `tensor_retain` increments the refcount; `tensor_release` decrements it and frees when zero. The fast path (no RC) is preserved for all statically resolvable lifetimes, including tensors that flow through `if`/`else`/`for`/`while` bodies (handled by hierarchical scope analysis — see ADR-0014). See ADR-0002.
 _Avoid_: garbage collection, ARC
 
 **Static drop**:
