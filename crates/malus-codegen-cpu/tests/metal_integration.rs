@@ -10,11 +10,17 @@ static METAL_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn real_symbols() -> RuntimeSymbols {
     RuntimeSymbols {
-        tensor_alloc_gpu: malus_runtime::tensor_alloc_gpu,
-        tensor_free: malus_runtime::tensor_free,
-        tensor_print: malus_runtime::tensor_print,
-        kernel_dispatch: malus_runtime::kernel_dispatch,
-        gpu_barrier: malus_runtime::gpu_barrier,
+        tensor_alloc_gpu:       malus_runtime::tensor_alloc_gpu,
+        tensor_free:            malus_runtime::tensor_free,
+        tensor_print:           malus_runtime::tensor_print,
+        kernel_dispatch:        malus_runtime::kernel_dispatch,
+        gpu_barrier:            malus_runtime::gpu_barrier,
+        tensor_alloc_zeros_gpu: malus_runtime::tensor_alloc_zeros_gpu,
+        tensor_alloc_ones_gpu:  malus_runtime::tensor_alloc_ones_gpu,
+        tensor_matmul:          malus_runtime::tensor_matmul,
+        tensor_transpose:       malus_runtime::tensor_transpose,
+        tensor_sum:             malus_runtime::tensor_sum,
+        tensor_len:             malus_runtime::tensor_len,
     }
 }
 

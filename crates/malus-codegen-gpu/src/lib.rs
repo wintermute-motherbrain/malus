@@ -84,6 +84,9 @@ impl From<HashMap<u64, String>> for KernelRegistry {
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
+// Unary math builtin names (sorted alphabetically for BTreeSet determinism).
+const UNARY_BUILTIN_NAMES: &[&str] = &["abs", "exp", "log", "relu", "sigmoid", "sqrt", "tanh"];
+
 pub fn compile_kernels(
     program: &TypedProgram,
 ) -> Result<(KernelRegistry, HashMap<String, u64>), CodegenError> {
@@ -104,10 +107,13 @@ pub fn compile_kernels(
     let mut tensor_ops: BTreeSet<BinOp> = BTreeSet::new();
     // Scalar-broadcast builtins: (op, scalar_on_right).
     let mut scalar_ops: BTreeSet<(BinOp, bool)> = BTreeSet::new();
+    // Unary math builtins used in fn bodies.
+    let mut unary_ops: BTreeSet<String> = BTreeSet::new();
 
     for f in &program.fns {
         for stmt in &f.body {
             collect_binops_in_stmt(stmt, &mut tensor_ops, &mut scalar_ops);
+            collect_unary_builtins_in_stmt(stmt, &mut unary_ops);
         }
     }
 
@@ -130,6 +136,18 @@ pub fn compile_kernels(
         let kernel_id = next_id;
         next_id += 1;
         let msl = synthesize_scalar_builtin(*op, *scalar_on_right, kernel_id)?;
+        registry.insert(kernel_id, msl);
+        name_to_id.insert(name.to_string(), kernel_id);
+    }
+
+    // Unary math builtins (sorted, appended after tensor/scalar builtins per ADR-0010).
+    for name in &unary_ops {
+        if name_to_id.contains_key(name.as_str()) {
+            continue;
+        }
+        let kernel_id = next_id;
+        next_id += 1;
+        let msl = synthesize_unary_builtin(name, kernel_id)?;
         registry.insert(kernel_id, msl);
         name_to_id.insert(name.to_string(), kernel_id);
     }
@@ -195,6 +213,71 @@ fn collect_binops_in_expr(
         }
         TypedExprKind::Lit(_) | TypedExprKind::Ident(_) => {}
     }
+}
+
+fn collect_unary_builtins_in_stmt(stmt: &TypedStmt, out: &mut BTreeSet<String>) {
+    match stmt {
+        TypedStmt::Let { expr, .. } | TypedStmt::Assign { expr, .. } | TypedStmt::Return { expr } => {
+            collect_unary_builtins_in_expr(expr, out);
+        }
+        TypedStmt::Expr(expr) => collect_unary_builtins_in_expr(expr, out),
+        TypedStmt::Drop { .. } | TypedStmt::GpuBarrier => {}
+    }
+}
+
+fn collect_unary_builtins_in_expr(expr: &TypedExpr, out: &mut BTreeSet<String>) {
+    match &expr.kind {
+        TypedExprKind::Call { callee, args } => {
+            if UNARY_BUILTIN_NAMES.contains(&callee.as_str()) {
+                out.insert(callee.clone());
+            }
+            for a in args {
+                collect_unary_builtins_in_expr(a, out);
+            }
+        }
+        TypedExprKind::BinOp { lhs, rhs, .. } => {
+            collect_unary_builtins_in_expr(lhs, out);
+            collect_unary_builtins_in_expr(rhs, out);
+        }
+        TypedExprKind::Unary { operand, .. } => collect_unary_builtins_in_expr(operand, out),
+        TypedExprKind::KernelCall { args, .. } => {
+            for a in args {
+                collect_unary_builtins_in_expr(a, out);
+            }
+        }
+        TypedExprKind::TensorLiteral { elements, .. } => {
+            for e in elements {
+                collect_unary_builtins_in_expr(e, out);
+            }
+        }
+        TypedExprKind::Index { base, indices } => {
+            collect_unary_builtins_in_expr(base, out);
+            for i in indices {
+                collect_unary_builtins_in_expr(i, out);
+            }
+        }
+        TypedExprKind::FieldAccess { base, .. } => collect_unary_builtins_in_expr(base, out),
+        TypedExprKind::Lit(_) | TypedExprKind::Ident(_) => {}
+    }
+}
+
+fn synthesize_unary_builtin(name: &str, kernel_id: u64) -> Result<String, CodegenError> {
+    let expr = match name {
+        "relu"    => "fmax(0.0f, a[tid])".to_string(),
+        "sigmoid" => "1.0f / (1.0f + exp(-a[tid]))".to_string(),
+        "tanh"    => "tanh(a[tid])".to_string(),
+        "exp"     => "exp(a[tid])".to_string(),
+        "log"     => "log(a[tid])".to_string(),
+        "sqrt"    => "sqrt(a[tid])".to_string(),
+        "abs"     => "fabs(a[tid])".to_string(),
+        _ => return Err(CodegenError::UnsupportedKernelBody(
+            format!("unknown unary builtin: {name}")
+        )),
+    };
+    Ok(format!(
+        "#include <metal_stdlib>\nusing namespace metal;\n\nkernel void malus_kernel_{}(\n    device float* a [[buffer(0)]],\n    device float* out [[buffer(1)]],\n    uint tid [[thread_position_in_grid]]\n) {{\n    out[tid] = {};\n}}\n",
+        kernel_id, expr,
+    ))
 }
 
 fn synthesize_elementwise_builtin(op: BinOp, kernel_id: u64) -> Result<String, CodegenError> {

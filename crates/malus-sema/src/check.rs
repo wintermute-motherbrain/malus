@@ -684,8 +684,18 @@ fn check_field_access(
     // Field access on a module alias: `ops.add` → callee resolution.
     // In the parser, `ops.add(a, b)` is parsed as Call { callee: FieldAccess(Ident("ops"), "add"), ... }
     // so this path handles the base expression of such a call.
-    // For now, produce a placeholder — actual resolution happens in check_call via resolve_callee_expr.
     let tbase = check_expr(base, None, ctx)?;
+
+    // .len on a tensor returns the element count as i64.
+    if field == "len" && tbase.ty.is_tensor() {
+        return Some(typed_expr(
+            TypedExprKind::FieldAccess { base: Box::new(tbase), field: field.to_string() },
+            ResolvedTy::Scalar(ScalarTy::I64),
+            None,
+            span,
+        ));
+    }
+
     let ty = tbase.ty.clone();
     let placement = tbase.placement;
     Some(typed_expr(

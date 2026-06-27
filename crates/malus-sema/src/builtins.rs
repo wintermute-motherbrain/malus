@@ -51,5 +51,31 @@ pub fn register_builtins() -> HashMap<String, BuiltinSig> {
         return_placement: Some(Placement::Gpu),
     });
 
+    // Unary math builtins — dispatched as built-in GPU kernels (one tensor in, same-shape tensor out).
+    // return_placement: Some(Gpu) is load-bearing: CTMM marks results pending so barriers are
+    // inserted before any CPU read (e.g. tensor_print after exp(x)).
+    let tensor_f32 = ResolvedTy::Tensor { dtype: ScalarTy::F32 };
+    for name in &["relu", "sigmoid", "tanh", "exp", "log", "sqrt", "abs"] {
+        m.insert(name.to_string(), BuiltinSig {
+            kind: BuiltinKind::Fixed(vec![tensor_f32.clone()]),
+            return_ty: tensor_f32.clone(),
+            return_placement: Some(Placement::Gpu),
+        });
+    }
+
+    // transpose(t) -> Tensor<f32> — eager CPU op, 2-D only in V1
+    m.insert("transpose".to_string(), BuiltinSig {
+        kind: BuiltinKind::Fixed(vec![tensor_f32.clone()]),
+        return_ty: tensor_f32.clone(),
+        return_placement: Some(Placement::Gpu),
+    });
+
+    // sum(t) -> Tensor<f32> — eager CPU op, returns a 1-element [1] tensor
+    m.insert("sum".to_string(), BuiltinSig {
+        kind: BuiltinKind::Fixed(vec![tensor_f32.clone()]),
+        return_ty: tensor_f32,
+        return_placement: Some(Placement::Gpu),
+    });
+
     m
 }

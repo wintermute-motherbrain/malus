@@ -78,6 +78,7 @@ pub struct TensorBuffer {
     pub buffer: metal::Buffer,
     pub dtype: Dtype,
     pub len: usize,
+    pub shape: Vec<usize>,
 }
 
 // ── Runtime init: compile all MSL kernels ─────────────────────────────────────
@@ -105,12 +106,18 @@ pub fn runtime_init(registry: &HashMap<u64, String>) {
 // ── Tensor allocation ─────────────────────────────────────────────────────────
 
 #[no_mangle]
-pub extern "C" fn tensor_alloc_gpu(dtype: i32, len: i64, data: *const f32) -> i64 {
+pub extern "C" fn tensor_alloc_gpu(
+    dtype: i32,
+    shape_ptr: *const usize,
+    ndims: usize,
+    data: *const f32,
+) -> i64 {
     let dt = Dtype::from_tag(dtype);
     if dt != Dtype::F32 {
         panic!("malus: non-f32 dtypes not yet implemented (got dtype tag {dtype})");
     }
-    let n = len as usize;
+    let shape = unsafe { std::slice::from_raw_parts(shape_ptr, ndims).to_vec() };
+    let n: usize = shape.iter().product();
     let byte_len = n * dt.element_size();
 
     let ctx = context();
@@ -129,8 +136,22 @@ pub extern "C" fn tensor_alloc_gpu(dtype: i32, len: i64, data: *const f32) -> i6
         }
     }
 
-    let tb = Box::new(TensorBuffer { buffer, dtype: dt, len: n });
+    let tb = Box::new(TensorBuffer { buffer, dtype: dt, len: n, shape });
     Box::into_raw(tb) as i64
+}
+
+#[no_mangle]
+pub extern "C" fn tensor_alloc_zeros_gpu(shape_ptr: *const usize, ndims: usize) -> i64 {
+    // Metal allocates zero-initialized StorageModeShared buffers by default.
+    tensor_alloc_gpu(0, shape_ptr, ndims, std::ptr::null())
+}
+
+#[no_mangle]
+pub extern "C" fn tensor_alloc_ones_gpu(shape_ptr: *const usize, ndims: usize) -> i64 {
+    let shape = unsafe { std::slice::from_raw_parts(shape_ptr, ndims) };
+    let n: usize = shape.iter().product();
+    let ones_data: Vec<f32> = vec![1.0f32; n];
+    tensor_alloc_gpu(0, shape_ptr, ndims, ones_data.as_ptr())
 }
 
 #[no_mangle]
@@ -162,6 +183,12 @@ pub extern "C" fn tensor_print(handle: i64) {
     print!("]");
 }
 
+#[no_mangle]
+pub extern "C" fn tensor_len(handle: i64) -> i64 {
+    let tb = unsafe { &*(handle as *const TensorBuffer) };
+    tb.len as i64
+}
+
 // ── GPU barrier ───────────────────────────────────────────────────────────────
 
 #[no_mangle]
@@ -172,6 +199,79 @@ pub extern "C" fn gpu_barrier() {
         cmd_buf.commit();
         cmd_buf.wait_until_completed();
     }
+}
+
+// ── Eager CPU ops (matmul, transpose, sum) ────────────────────────────────────
+//
+// These commit any pending GPU work before reading shared buffers on the CPU,
+// then compute in plain Rust and return a ready (non-pending) output tensor.
+// Migration to MPS is deferred to post-V1 (see ADR-0012).
+
+#[no_mangle]
+pub extern "C" fn tensor_matmul(handle_a: i64, handle_b: i64) -> i64 {
+    gpu_barrier();
+    let a = unsafe { &*(handle_a as *const TensorBuffer) };
+    let b = unsafe { &*(handle_b as *const TensorBuffer) };
+
+    if a.shape.len() != 2 {
+        panic!("malus: tensor_matmul requires a 2-D tensor, got shape {:?} for first arg", a.shape);
+    }
+    if b.shape.len() != 2 {
+        panic!("malus: tensor_matmul requires a 2-D tensor, got shape {:?} for second arg", b.shape);
+    }
+    let (m, k) = (a.shape[0], a.shape[1]);
+    let (k2, n) = (b.shape[0], b.shape[1]);
+    if k != k2 {
+        panic!("malus: tensor_matmul dim mismatch: {:?} @ {:?}", a.shape, b.shape);
+    }
+
+    let a_data = unsafe { std::slice::from_raw_parts(a.buffer.contents() as *const f32, a.len) };
+    let b_data = unsafe { std::slice::from_raw_parts(b.buffer.contents() as *const f32, b.len) };
+
+    let mut out_data = vec![0.0f32; m * n];
+    for i in 0..m {
+        for j in 0..n {
+            for kk in 0..k {
+                out_data[i * n + j] += a_data[i * k + kk] * b_data[kk * n + j];
+            }
+        }
+    }
+
+    let out_shape = [m, n];
+    tensor_alloc_gpu(0, out_shape.as_ptr(), 2, out_data.as_ptr())
+}
+
+#[no_mangle]
+pub extern "C" fn tensor_transpose(handle: i64) -> i64 {
+    gpu_barrier();
+    let tb = unsafe { &*(handle as *const TensorBuffer) };
+
+    if tb.shape.len() != 2 {
+        panic!("malus: tensor_transpose requires a 2-D tensor, got shape {:?}", tb.shape);
+    }
+    let m = tb.shape[0];
+    let n = tb.shape[1];
+
+    let in_data = unsafe { std::slice::from_raw_parts(tb.buffer.contents() as *const f32, tb.len) };
+    let mut out_data = vec![0.0f32; tb.len];
+    for i in 0..m {
+        for j in 0..n {
+            out_data[j * m + i] = in_data[i * n + j];
+        }
+    }
+
+    let out_shape = [n, m];
+    tensor_alloc_gpu(0, out_shape.as_ptr(), 2, out_data.as_ptr())
+}
+
+#[no_mangle]
+pub extern "C" fn tensor_sum(handle: i64) -> i64 {
+    gpu_barrier();
+    let tb = unsafe { &*(handle as *const TensorBuffer) };
+    let data = unsafe { std::slice::from_raw_parts(tb.buffer.contents() as *const f32, tb.len) };
+    let total: f32 = data.iter().sum();
+    let shape = [1usize];
+    tensor_alloc_gpu(0, shape.as_ptr(), 1, &total)
 }
 
 // ── Kernel dispatch ───────────────────────────────────────────────────────────
@@ -197,9 +297,14 @@ pub extern "C" fn kernel_dispatch(kernel_id: u64, handles: *const i64, count: us
 
     let first = &inputs[0];
     let out_dtype = first.dtype;
-    let out_len = first.len;
+    let out_shape = first.shape.clone();
 
-    let output_handle = tensor_alloc_gpu(out_dtype.to_tag(), out_len as i64, std::ptr::null());
+    let output_handle = tensor_alloc_gpu(
+        out_dtype.to_tag(),
+        out_shape.as_ptr(),
+        out_shape.len(),
+        std::ptr::null(),
+    );
     let output_tb = unsafe { &*(output_handle as *const TensorBuffer) };
 
     let mut guard = ctx.current_command_buffer.lock().unwrap();
@@ -221,6 +326,7 @@ pub extern "C" fn kernel_dispatch(kernel_id: u64, handles: *const i64, count: us
     }
     encoder.set_buffer(count as NSUInteger, Some(&output_tb.buffer), 0);
 
+    let out_len = output_tb.len;
     let grid_size = MTLSize::new(out_len as NSUInteger, 1, 1);
     let max_threads = pipeline.max_total_threads_per_threadgroup();
     let threadgroup_size = MTLSize::new(

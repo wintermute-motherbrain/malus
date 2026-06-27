@@ -21,11 +21,17 @@ use malus_syntax::ast::{elementwise_builtin_name, scalar_broadcast_builtin_name,
 
 #[repr(C)]
 pub struct RuntimeSymbols {
-    pub tensor_alloc_gpu: extern "C" fn(i32, i64, *const f32) -> i64,
-    pub tensor_free:      extern "C" fn(i64),
-    pub tensor_print:     extern "C" fn(i64),
-    pub kernel_dispatch:  extern "C" fn(u64, *const i64, usize) -> i64,
-    pub gpu_barrier:      extern "C" fn(),
+    pub tensor_alloc_gpu:       extern "C" fn(i32, *const usize, usize, *const f32) -> i64,
+    pub tensor_free:            extern "C" fn(i64),
+    pub tensor_print:           extern "C" fn(i64),
+    pub kernel_dispatch:        extern "C" fn(u64, *const i64, usize) -> i64,
+    pub gpu_barrier:            extern "C" fn(),
+    pub tensor_alloc_zeros_gpu: extern "C" fn(*const usize, usize) -> i64,
+    pub tensor_alloc_ones_gpu:  extern "C" fn(*const usize, usize) -> i64,
+    pub tensor_matmul:          extern "C" fn(i64, i64) -> i64,
+    pub tensor_transpose:       extern "C" fn(i64) -> i64,
+    pub tensor_sum:             extern "C" fn(i64) -> i64,
+    pub tensor_len:             extern "C" fn(i64) -> i64,
 }
 
 // ── Error ─────────────────────────────────────────────────────────────────────
@@ -140,6 +146,12 @@ struct Codegen<'m> {
     rt_tensor_free: FuncId,
     rt_kernel_dispatch: FuncId,
     rt_gpu_barrier: FuncId,
+    rt_tensor_alloc_zeros_gpu: FuncId,
+    rt_tensor_alloc_ones_gpu: FuncId,
+    rt_tensor_matmul: FuncId,
+    rt_tensor_transpose: FuncId,
+    rt_tensor_sum: FuncId,
+    rt_tensor_len: FuncId,
     rt_print_cstr: FuncId,
     rt_print_f32: FuncId,
     rt_print_i64: FuncId,
@@ -330,11 +342,17 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
 
             TypedExprKind::BinOp { op, lhs, rhs } => {
                 match (&lhs.ty, &rhs.ty) {
-                    // tensor ⊕ tensor — dispatch to element-wise builtin kernel
+                    // tensor ⊕ tensor — matmul or element-wise builtin kernel
                     (ResolvedTy::Tensor { dtype: ld }, ResolvedTy::Tensor { dtype: rd })
                         if ld == rd && *ld == ScalarTy::F32 =>
                     {
-                        if let Some(name) = elementwise_builtin_name(op) {
+                        if *op == BinOp::Matmul {
+                            let a = self.lower_expr(lhs)?;
+                            let b = self.lower_expr(rhs)?;
+                            let matmul_ref = self.import_func(self.codegen.rt_tensor_matmul);
+                            let call = self.builder.ins().call(matmul_ref, &[a, b]);
+                            Ok(self.builder.inst_results(call).to_vec()[0])
+                        } else if let Some(name) = elementwise_builtin_name(op) {
                             self.lower_kernel_dispatch(name, &[lhs.as_ref(), rhs.as_ref()])
                         } else {
                             Err(CodegenError::UnsupportedExpr(format!("binop {:?} on tensors not supported", op)))
@@ -436,6 +454,15 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                     }
 
                     Ok(self.builder.ins().iconst(I64, 0))
+                } else if self.codegen.kernel_ids.contains_key(callee.as_str()) {
+                    // Unary math builtins (relu, sigmoid, tanh, exp, log, sqrt, abs)
+                    // dispatched as built-in GPU kernels via kernel_dispatch.
+                    let arg_refs: Vec<&TypedExpr> = args.iter().collect();
+                    self.lower_kernel_dispatch(callee, &arg_refs)
+                } else if callee == "zeros" || callee == "ones" {
+                    self.lower_zeros_ones(callee, args)
+                } else if callee == "transpose" || callee == "sum" {
+                    self.lower_eager_cpu_op(callee, args)
                 } else {
                     let func_id = self.codegen.func_ids.get(callee)
                         .copied()
@@ -463,7 +490,7 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
             TypedExprKind::TensorLiteral { dtype, elements, .. } => {
                 let len = elements.len() as u32;
                 // Stack slot for f32 elements (len * 4 bytes, 4-byte aligned).
-                let slot = self.builder.create_sized_stack_slot(
+                let data_slot = self.builder.create_sized_stack_slot(
                     cranelift_codegen::ir::StackSlotData::new(
                         cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
                         len * 4,
@@ -479,15 +506,27 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                         }
                         _ => val,
                     };
-                    self.builder.ins().stack_store(f32_val, slot, (i as i32) * 4);
+                    self.builder.ins().stack_store(f32_val, data_slot, (i as i32) * 4);
                 }
 
-                let data_ptr = self.builder.ins().stack_addr(self.codegen.ptr_type(), slot, 0);
+                // Shape slot: one usize (8 bytes, 8-byte aligned) holding the element count.
+                let shape_slot = self.builder.create_sized_stack_slot(
+                    cranelift_codegen::ir::StackSlotData::new(
+                        cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                        8,
+                        3,
+                    )
+                );
+                let len_as_usize = self.builder.ins().iconst(I64, len as i64);
+                self.builder.ins().stack_store(len_as_usize, shape_slot, 0);
+
+                let data_ptr  = self.builder.ins().stack_addr(self.codegen.ptr_type(), data_slot, 0);
+                let shape_ptr = self.builder.ins().stack_addr(self.codegen.ptr_type(), shape_slot, 0);
                 let dtype_val = self.builder.ins().iconst(I32, dtype_tag(dtype) as i64);
-                let len_val = self.builder.ins().iconst(I64, len as i64);
+                let ndims_val = self.builder.ins().iconst(self.codegen.ptr_type(), 1);
 
                 let alloc_ref = self.import_func(self.codegen.rt_tensor_alloc_gpu);
-                let call = self.builder.ins().call(alloc_ref, &[dtype_val, len_val, data_ptr]);
+                let call = self.builder.ins().call(alloc_ref, &[dtype_val, shape_ptr, ndims_val, data_ptr]);
                 let results = self.builder.inst_results(call).to_vec();
                 Ok(results[0])
             }
@@ -495,8 +534,16 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
             TypedExprKind::Index { .. } => {
                 Err(CodegenError::UnsupportedExpr("Index not yet supported".into()))
             }
-            TypedExprKind::FieldAccess { .. } => {
-                Err(CodegenError::UnsupportedExpr("FieldAccess not yet supported".into()))
+
+            TypedExprKind::FieldAccess { base, field } => {
+                if field == "len" && base.ty.is_tensor() {
+                    let handle = self.lower_expr(base)?;
+                    let len_ref = self.import_func(self.codegen.rt_tensor_len);
+                    let call = self.builder.ins().call(len_ref, &[handle]);
+                    Ok(self.builder.inst_results(call).to_vec()[0])
+                } else {
+                    Err(CodegenError::UnsupportedExpr(format!("FieldAccess .{field} not yet supported")))
+                }
             }
         }
     }
@@ -557,7 +604,7 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                 let cmp = if float { self.builder.ins().fcmp(FloatCC::GreaterThanOrEqual, l, r) } else { self.builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, l, r) };
                 Ok(self.builder.ins().bmask(I8, cmp))
             }
-            BinOp::Matmul => Err(CodegenError::UnsupportedExpr("Matmul not supported in host fns".into())),
+            BinOp::Matmul => Err(CodegenError::UnsupportedExpr("Matmul requires tensor operands".into())),
             BinOp::And | BinOp::Or => Err(CodegenError::UnsupportedExpr("And/Or on scalars not supported".into())),
         }
     }
@@ -648,20 +695,82 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
             }
             _ => return Err(CodegenError::UnsupportedExpr("non-scalar in materialize_scalar_tensor".into())),
         };
-        // Stack-allocate a 1-element f32 array.
-        let slot = self.builder.create_sized_stack_slot(
+        // Stack-allocate a 1-element f32 data buffer.
+        let data_slot = self.builder.create_sized_stack_slot(
             cranelift_codegen::ir::StackSlotData::new(
                 cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
                 4,
                 2,
             )
         );
-        self.builder.ins().stack_store(f32_val, slot, 0);
-        let data_ptr = self.builder.ins().stack_addr(self.codegen.ptr_type(), slot, 0);
+        self.builder.ins().stack_store(f32_val, data_slot, 0);
+
+        // Shape slot: [1] as usize.
+        let shape_slot = self.builder.create_sized_stack_slot(
+            cranelift_codegen::ir::StackSlotData::new(
+                cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                8,
+                3,
+            )
+        );
+        let one_usize = self.builder.ins().iconst(I64, 1);
+        self.builder.ins().stack_store(one_usize, shape_slot, 0);
+
+        let data_ptr  = self.builder.ins().stack_addr(self.codegen.ptr_type(), data_slot, 0);
+        let shape_ptr = self.builder.ins().stack_addr(self.codegen.ptr_type(), shape_slot, 0);
         let dtype_val = self.builder.ins().iconst(I32, 0); // F32 = tag 0
-        let len_val   = self.builder.ins().iconst(I64, 1);
+        let ndims_val = self.builder.ins().iconst(self.codegen.ptr_type(), 1);
         let alloc_ref = self.import_func(self.codegen.rt_tensor_alloc_gpu);
-        let call = self.builder.ins().call(alloc_ref, &[dtype_val, len_val, data_ptr]);
+        let call = self.builder.ins().call(alloc_ref, &[dtype_val, shape_ptr, ndims_val, data_ptr]);
+        Ok(self.builder.inst_results(call).to_vec()[0])
+    }
+
+    fn lower_zeros_ones(
+        &mut self,
+        name: &str,
+        args: &[TypedExpr],
+    ) -> Result<cranelift_codegen::ir::Value, CodegenError> {
+        let n = args.len() as u32;
+        // Shape slot: n usize elements (8 bytes each), 8-byte aligned.
+        let slot = self.builder.create_sized_stack_slot(
+            cranelift_codegen::ir::StackSlotData::new(
+                cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                n * 8,
+                3,
+            )
+        );
+        for (i, arg) in args.iter().enumerate() {
+            let val = self.lower_expr(arg)?;
+            self.builder.ins().stack_store(val, slot, (i as i32) * 8);
+        }
+        let shape_ptr = self.builder.ins().stack_addr(self.codegen.ptr_type(), slot, 0);
+        let ndims_val = self.builder.ins().iconst(self.codegen.ptr_type(), n as i64);
+        let func_ref = if name == "zeros" {
+            self.import_func(self.codegen.rt_tensor_alloc_zeros_gpu)
+        } else {
+            self.import_func(self.codegen.rt_tensor_alloc_ones_gpu)
+        };
+        let call = self.builder.ins().call(func_ref, &[shape_ptr, ndims_val]);
+        Ok(self.builder.inst_results(call).to_vec()[0])
+    }
+
+    fn lower_eager_cpu_op(
+        &mut self,
+        name: &str,
+        args: &[TypedExpr],
+    ) -> Result<cranelift_codegen::ir::Value, CodegenError> {
+        if args.len() != 1 {
+            return Err(CodegenError::UnsupportedExpr(
+                format!("{name} expects exactly one tensor argument"),
+            ));
+        }
+        let handle = self.lower_expr(&args[0])?;
+        let func_ref = if name == "transpose" {
+            self.import_func(self.codegen.rt_tensor_transpose)
+        } else {
+            self.import_func(self.codegen.rt_tensor_sum)
+        };
+        let call = self.builder.ins().call(func_ref, &[handle]);
         Ok(self.builder.inst_results(call).to_vec()[0])
     }
 
@@ -731,26 +840,57 @@ pub fn compile_and_run(
         .map_err(|e| CodegenError::JitError(e.to_string()))?;
 
     let mut jit_builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
-    jit_builder.symbol("tensor_alloc_gpu", symbols.tensor_alloc_gpu as *const u8);
-    jit_builder.symbol("tensor_print",     symbols.tensor_print     as *const u8);
-    jit_builder.symbol("tensor_free",      symbols.tensor_free      as *const u8);
-    jit_builder.symbol("kernel_dispatch",  symbols.kernel_dispatch  as *const u8);
-    jit_builder.symbol("gpu_barrier",      symbols.gpu_barrier      as *const u8);
-    jit_builder.symbol("print_cstr",       print_cstr       as *const u8);
-    jit_builder.symbol("print_f32",        print_f32        as *const u8);
-    jit_builder.symbol("print_i64",        print_i64        as *const u8);
-    jit_builder.symbol("print_bool",       print_bool       as *const u8);
+    jit_builder.symbol("tensor_alloc_gpu",       symbols.tensor_alloc_gpu       as *const u8);
+    jit_builder.symbol("tensor_print",           symbols.tensor_print           as *const u8);
+    jit_builder.symbol("tensor_free",            symbols.tensor_free            as *const u8);
+    jit_builder.symbol("kernel_dispatch",        symbols.kernel_dispatch        as *const u8);
+    jit_builder.symbol("gpu_barrier",            symbols.gpu_barrier            as *const u8);
+    jit_builder.symbol("tensor_alloc_zeros_gpu", symbols.tensor_alloc_zeros_gpu as *const u8);
+    jit_builder.symbol("tensor_alloc_ones_gpu",  symbols.tensor_alloc_ones_gpu  as *const u8);
+    jit_builder.symbol("tensor_matmul",          symbols.tensor_matmul          as *const u8);
+    jit_builder.symbol("tensor_transpose",       symbols.tensor_transpose       as *const u8);
+    jit_builder.symbol("tensor_sum",             symbols.tensor_sum             as *const u8);
+    jit_builder.symbol("tensor_len",             symbols.tensor_len             as *const u8);
+    jit_builder.symbol("print_cstr",             print_cstr                     as *const u8);
+    jit_builder.symbol("print_f32",              print_f32                      as *const u8);
+    jit_builder.symbol("print_i64",              print_i64                      as *const u8);
+    jit_builder.symbol("print_bool",             print_bool                     as *const u8);
 
     let mut module = JITModule::new(jit_builder);
     let ptr = module.target_config().pointer_type();
     let call_conv = module.target_config().default_call_conv;
 
     // Declare runtime extern signatures.
+    // tensor_alloc_gpu(dtype: i32, shape_ptr: *const usize, ndims: usize, data: *const f32) -> i64
     let sig_alloc = {
         let mut s = Signature::new(call_conv);
-        s.params.push(AbiParam::new(I32));
+        s.params.push(AbiParam::new(I32));  // dtype_tag
+        s.params.push(AbiParam::new(ptr));  // shape_ptr
+        s.params.push(AbiParam::new(ptr));  // ndims
+        s.params.push(AbiParam::new(ptr));  // data
+        s.returns.push(AbiParam::new(I64));
+        s
+    };
+    // tensor_alloc_{zeros,ones}_gpu(shape_ptr: *const usize, ndims: usize) -> i64
+    let sig_alloc_shape = {
+        let mut s = Signature::new(call_conv);
+        s.params.push(AbiParam::new(ptr));  // shape_ptr
+        s.params.push(AbiParam::new(ptr));  // ndims
+        s.returns.push(AbiParam::new(I64));
+        s
+    };
+    // tensor_{matmul}(a: i64, b: i64) -> i64
+    let sig_binop_tensor = {
+        let mut s = Signature::new(call_conv);
         s.params.push(AbiParam::new(I64));
-        s.params.push(AbiParam::new(ptr));
+        s.params.push(AbiParam::new(I64));
+        s.returns.push(AbiParam::new(I64));
+        s
+    };
+    // tensor_{transpose,sum,len,print,free}(h: i64) -> i64
+    let sig_unary_tensor_ret = {
+        let mut s = Signature::new(call_conv);
+        s.params.push(AbiParam::new(I64));
         s.returns.push(AbiParam::new(I64));
         s
     };
@@ -804,6 +944,18 @@ pub fn compile_and_run(
         .map_err(|e| CodegenError::JitError(e.to_string()))?;
     let rt_gpu_barrier = module.declare_function("gpu_barrier", Linkage::Import, &sig_barrier)
         .map_err(|e| CodegenError::JitError(e.to_string()))?;
+    let rt_tensor_alloc_zeros_gpu = module.declare_function("tensor_alloc_zeros_gpu", Linkage::Import, &sig_alloc_shape)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
+    let rt_tensor_alloc_ones_gpu = module.declare_function("tensor_alloc_ones_gpu", Linkage::Import, &sig_alloc_shape)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
+    let rt_tensor_matmul = module.declare_function("tensor_matmul", Linkage::Import, &sig_binop_tensor)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
+    let rt_tensor_transpose = module.declare_function("tensor_transpose", Linkage::Import, &sig_unary_tensor_ret)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
+    let rt_tensor_sum = module.declare_function("tensor_sum", Linkage::Import, &sig_unary_tensor_ret)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
+    let rt_tensor_len = module.declare_function("tensor_len", Linkage::Import, &sig_unary_tensor_ret)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
     let rt_print_cstr = module.declare_function("print_cstr", Linkage::Import, &sig_print_cstr)
         .map_err(|e| CodegenError::JitError(e.to_string()))?;
     let rt_print_f32 = module.declare_function("print_f32", Linkage::Import, &sig_print_f32)
@@ -839,6 +991,12 @@ pub fn compile_and_run(
         rt_tensor_free,
         rt_kernel_dispatch,
         rt_gpu_barrier,
+        rt_tensor_alloc_zeros_gpu,
+        rt_tensor_alloc_ones_gpu,
+        rt_tensor_matmul,
+        rt_tensor_transpose,
+        rt_tensor_sum,
+        rt_tensor_len,
         rt_print_cstr,
         rt_print_f32,
         rt_print_i64,

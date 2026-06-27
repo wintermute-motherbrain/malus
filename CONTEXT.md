@@ -57,6 +57,14 @@ _Avoid_: Pending input, GPU-active tensor
 A tensor produced by a kernel whose GPU work has not yet been committed. CPU reads of a pending tensor return stale data unless preceded by a GPU barrier.
 _Avoid_: Pending output, uncommitted tensor
 
+**Ready tensor**:
+A tensor whose data is already materialized in the `StorageModeShared` buffer and safe to read on the CPU without a barrier. Produced by eager CPU-side stdlib ops (`tensor_matmul`, `tensor_transpose`, `tensor_sum`, `tensor_alloc_zeros_gpu`, `tensor_alloc_ones_gpu`). Counterpart to pending tensor.
+_Avoid_: CPU tensor, completed tensor
+
+**Shape metadata**:
+The `shape: Vec<usize>` field on `TensorBuffer`, recording the n-dimensional extent of a tensor (invariant: `len == shape.iter().product()`). Runtime-only — absent from the type system, which is dtype-only. Validated at runtime by ops that require specific rank (e.g. `tensor_matmul` requires 2-D). See ADR-0013.
+_Avoid_: Tensor shape, static shape
+
 **Pending set**:
 The CTMM compile-time set of tensor bindings produced or consumed by a GPU-producing expression (`KernelCall`, tensor `BinOp`, or GPU-returning `Call`) since the last `GpuBarrier`. Any CPU-side access of a binding in the pending set triggers a barrier insertion.
 _Avoid_: GPU-active set
