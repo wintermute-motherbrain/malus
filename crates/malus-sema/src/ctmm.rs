@@ -16,8 +16,8 @@ fn annotate_body(body: &mut Vec<TypedStmt>) {
     hoist_gpu_producing_returns(body);
     let local_bindings = collect_local_bindings(body);
     let escaping = collect_escaping(body);
+    insert_assign_drops(body, &local_bindings, &escaping);
     let last_uses = find_last_uses(body, &local_bindings, &escaping);
-
     insert_drops(body, &last_uses);
     insert_barriers(body);
 }
@@ -38,6 +38,32 @@ fn hoist_gpu_subexprs(body: &mut Vec<TypedStmt>) {
                 let expr = hoist_gpu_in_expr(expr, &mut hoisted, &mut counter);
                 result.extend(hoisted);
                 result.push(TypedStmt::Let { name, expr });
+            }
+            TypedStmt::Assign { name, expr } => {
+                let mut hoisted = Vec::new();
+                let expr = hoist_gpu_in_expr(expr, &mut hoisted, &mut counter);
+                // D6 guard: if the RHS is still GPU-producing and yields a tensor,
+                // hoist it into a temp so the old binding can be safely dropped before
+                // the Assign writes the new value. This prevents use-after-free when
+                // the RHS references the Assign target (e.g. `acc = acc + delta`).
+                let expr = if is_gpu_producing(&expr) && expr.ty.is_tensor() {
+                    let tmp_name = format!("__malus_tmp_{}", counter);
+                    counter += 1;
+                    let ty = expr.ty.clone();
+                    let placement = expr.placement;
+                    let span = expr.span;
+                    hoisted.push(TypedStmt::Let { name: tmp_name.clone(), expr });
+                    TypedExpr {
+                        kind: TypedExprKind::Ident(tmp_name),
+                        ty,
+                        placement,
+                        span,
+                    }
+                } else {
+                    expr
+                };
+                result.extend(hoisted);
+                result.push(TypedStmt::Assign { name, expr });
             }
             TypedStmt::Return { expr } => {
                 let mut hoisted = Vec::new();
@@ -194,6 +220,30 @@ fn hoist_gpu_producing_returns(body: &mut Vec<TypedStmt>) {
     }
 }
 
+// ── Phase 0: Assign old-value drops ──────────────────────────────────────────
+
+/// Insert Drop{name} immediately before each Assign to a local tensor binding.
+/// This frees the old tensor allocation before the Assign writes the new value.
+/// Must run after hoist_gpu_subexprs (which ensures the Assign RHS no longer
+/// references the target, making the early Drop safe) and before find_last_uses.
+fn insert_assign_drops(
+    body: &mut Vec<TypedStmt>,
+    locals: &HashSet<String>,
+    escaping: &HashSet<String>,
+) {
+    let mut i = 0;
+    while i < body.len() {
+        if let TypedStmt::Assign { name, expr } = &body[i] {
+            if locals.contains(name) && !escaping.contains(name) && expr.ty.is_tensor() {
+                let name = name.clone();
+                body.insert(i, TypedStmt::Drop { name });
+                i += 1; // skip past the Drop we just inserted
+            }
+        }
+        i += 1;
+    }
+}
+
 // ── Phase 1: Drop insertion ───────────────────────────────────────────────────
 
 fn insert_drops(body: &mut Vec<TypedStmt>, last_uses: &HashMap<String, usize>) {
@@ -223,6 +273,17 @@ fn insert_barriers(body: &mut Vec<TypedStmt>) {
     while i < body.len() {
         if matches!(body[i], TypedStmt::GpuBarrier) {
             pending.clear();
+            i += 1;
+            continue;
+        }
+
+        // Drop of an in-flight name requires a barrier before freeing.
+        if let TypedStmt::Drop { name } = &body[i] {
+            if pending.contains(name.as_str()) {
+                body.insert(i, TypedStmt::GpuBarrier);
+                pending.clear();
+                i += 1; // skip barrier
+            }
             i += 1;
             continue;
         }
@@ -259,7 +320,7 @@ fn extract_gpu_producing_expr(stmt: &TypedStmt) -> Option<(Vec<String>, Option<S
         TypedStmt::Let { name, expr } => (expr, Some(name.clone())),
         TypedStmt::Expr(expr) => (expr, None),
         TypedStmt::Return { expr } => (expr, None),
-        TypedStmt::Drop { .. } | TypedStmt::GpuBarrier => return None,
+        TypedStmt::Drop { .. } | TypedStmt::GpuBarrier | TypedStmt::Assign { .. } => return None,
     };
     match &expr.kind {
         TypedExprKind::KernelCall { in_flight, .. } => {
@@ -295,6 +356,14 @@ fn collect_escaping(body: &[TypedStmt]) -> HashSet<String> {
         if let TypedStmt::Return { expr } = stmt {
             collect_idents_in_expr(expr, &mut escaping);
         }
+        // A tensor ident that is the RHS of an Assign is "moved" into the target.
+        // The target's final Drop will free the allocation, so the source temp
+        // must NOT be separately dropped (that would be a double-free).
+        if let TypedStmt::Assign { expr, .. } = stmt {
+            if expr.ty.is_tensor() {
+                collect_idents_in_expr(expr, &mut escaping);
+            }
+        }
     }
     escaping
 }
@@ -322,6 +391,7 @@ fn find_last_uses(
 fn collect_idents_in_stmt(stmt: &TypedStmt, out: &mut HashSet<String>) {
     match stmt {
         TypedStmt::Let { expr, .. } => collect_idents_in_expr(expr, out),
+        TypedStmt::Assign { expr, .. } => collect_idents_in_expr(expr, out),
         TypedStmt::Return { expr } => collect_idents_in_expr(expr, out),
         TypedStmt::Expr(expr) => collect_idents_in_expr(expr, out),
         TypedStmt::Drop { .. } | TypedStmt::GpuBarrier => {}

@@ -117,6 +117,7 @@ Run it and fix integration bugs. Likely problem areas based on the CTMM gaps:
 - **Barrier insertion around matmul:** `tensor_matmul` is a runtime call that schedules GPU work. CTMM's `is_gpu_producing` in `ctmm.rs` must recognize `tensor_matmul` calls as GPU-producing so barriers are inserted correctly.
 - **Nested GPU expressions in the backward pass:** `grad_output @ transpose(model.w2)` — the `transpose` result is a temporary that must be freed after the matmul. CTMM hoisting (`hoist_gpu_subexprs`) must handle `tensor_matmul` and `tensor_transpose` the same way it handles `KernelCall`.
 - **Chained BinOps still leaking temporaries:** The `ctmm-v1-gaps.md` gap about unbound temporaries in nested BinOps (`a + b * c`) applies to the training step expressions like `model.w1 - lr * grads.w1`. Fix any remaining leaks.
+- **Scalar-broadcast 1-element tensor temps leak (M7 gap):** `a * 0.5` materializes a 1-element GPU tensor for `0.5` via `tensor_alloc_gpu`, but this temp is invisible to CTMM (created inline in codegen-cpu) and is never freed. Fix alongside the chained-BinOp temp leak — both require CTMM-visible temp nodes or a post-dispatch sweep.
 
 ### 4. Write examples/mlp.ml
 

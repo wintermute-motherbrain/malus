@@ -148,14 +148,27 @@ pub fn check(
 
                 env.push_scope();
                 for p in &sig.params {
-                    env.bind(p.name.clone(), p.ty.clone(), Some(Placement::Gpu));
+                    // Element-space: inside the kernel body, tensor params are seen as
+                    // their element scalar type. The external signature stays Tensor.
+                    let elem_ty = match &p.ty {
+                        ResolvedTy::Tensor { dtype } => ResolvedTy::Scalar(dtype.clone()),
+                        other => other.clone(),
+                    };
+                    env.bind(p.name.clone(), elem_ty, Some(Placement::Gpu));
                 }
+
+                // Element-space: kernel body returns the element scalar type; the
+                // external return type (Tensor<dtype>) is used for callers.
+                let kernel_return_ty = match &sig.return_ty {
+                    ResolvedTy::Tensor { dtype } => ResolvedTy::Scalar(dtype.clone()),
+                    other => other.clone(),
+                };
 
                 let mut body_errors: Vec<SemaError> = Vec::new();
                 let mut ctx = BodyCtx {
                     env: &mut env,
                     errors: &mut body_errors,
-                    return_ty: sig.return_ty.clone(),
+                    return_ty: kernel_return_ty,
                     in_kernel: true,
                 };
                 let typed_body = check_body(body, &mut ctx);
@@ -217,6 +230,50 @@ fn check_body(
                             });
                         }
                         typed.push(TypedStmt::Return { expr: texpr });
+                    }
+                    None => return typed,
+                }
+            }
+            malus_syntax::ast::StmtKind::LetMut { name, expr } => {
+                match check_expr(expr, None, ctx) {
+                    Some(texpr) => {
+                        let ty = texpr.ty.clone();
+                        let placement = texpr.placement;
+                        typed.push(TypedStmt::Let { name: name.clone(), expr: texpr });
+                        ctx.env.bind_mutable(name.clone(), ty, placement);
+                    }
+                    None => return typed,
+                }
+            }
+            malus_syntax::ast::StmtKind::Assign { target, expr } => {
+                let target_ty = match ctx.env.lookup_binding(target) {
+                    Some((ty, _)) => ty.clone(),
+                    None => {
+                        ctx.errors.push(SemaError::UnknownIdent {
+                            name: target.clone(),
+                            span: stmt.span,
+                        });
+                        return typed;
+                    }
+                };
+                if !ctx.env.is_mutable(target) {
+                    ctx.errors.push(SemaError::AssignToImmutable {
+                        name: target.clone(),
+                        span: stmt.span,
+                    });
+                    return typed;
+                }
+                match check_expr(expr, Some(&target_ty), ctx) {
+                    Some(texpr) => {
+                        if texpr.ty != target_ty {
+                            ctx.errors.push(SemaError::TypeMismatch {
+                                expected: target_ty,
+                                found: texpr.ty.clone(),
+                                span: expr.span,
+                            });
+                            return typed;
+                        }
+                        typed.push(TypedStmt::Assign { name: target.clone(), expr: texpr });
                     }
                     None => return typed,
                 }
@@ -323,23 +380,50 @@ fn check_binop(
             return None;
         }
     } else if tlhs.ty != trhs.ty {
-        ctx.errors.push(SemaError::TypeMismatch {
-            expected: tlhs.ty.clone(),
-            found: trhs.ty.clone(),
-            span,
-        });
-        return None;
+        // Allow scalar broadcast in fn bodies: Tensor<dtype> op Scalar(same dtype)
+        // for arithmetic ops. Reject comparisons and matmul with mixed types.
+        let is_broadcast = matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div)
+            && match (&tlhs.ty, &trhs.ty) {
+                (ResolvedTy::Tensor { dtype: td }, ResolvedTy::Scalar(sd)) => td == sd,
+                (ResolvedTy::Scalar(sd), ResolvedTy::Tensor { dtype: td }) => sd == td,
+                _ => false,
+            };
+        if !is_broadcast {
+            ctx.errors.push(SemaError::TypeMismatch {
+                expected: tlhs.ty.clone(),
+                found: trhs.ty.clone(),
+                span,
+            });
+            return None;
+        }
     }
 
     let result_ty = match op {
         BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq => {
-            ResolvedTy::Bool
+            if ctx.in_kernel {
+                // Element-space: comparison yields the operand's scalar dtype (the mask).
+                // MSL bool-to-float implicit; no Bool type inside kernel bodies.
+                tlhs.ty.clone()
+            } else {
+                ResolvedTy::Bool
+            }
         }
         BinOp::And | BinOp::Or => ResolvedTy::Bool,
-        _ => tlhs.ty.clone(),
+        _ => {
+            // For scalar broadcast, result is the tensor type regardless of operand order.
+            match (&tlhs.ty, &trhs.ty) {
+                (ResolvedTy::Scalar(_), ResolvedTy::Tensor { .. }) => trhs.ty.clone(),
+                _ => tlhs.ty.clone(),
+            }
+        }
     };
 
-    let placement = tlhs.placement;
+    // Placement: prefer the tensor operand's placement for scalar-broadcast ops.
+    let placement = match (&tlhs.placement, &trhs.placement) {
+        (None, Some(p)) => Some(*p),
+        (Some(p), _) => Some(*p),
+        _ => None,
+    };
     Some(typed_expr(
         TypedExprKind::BinOp {
             op: op.clone(),

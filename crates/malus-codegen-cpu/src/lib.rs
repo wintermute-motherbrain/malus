@@ -15,7 +15,7 @@ use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{DataDescription, FuncId, Linkage, Module};
 
 use malus_sema::{ResolvedTy, TypedExpr, TypedExprKind, TypedFn, TypedProgram, TypedStmt};
-use malus_syntax::ast::{elementwise_builtin_name, BinOp, Lit, ScalarTy, UnaryOp};
+use malus_syntax::ast::{elementwise_builtin_name, scalar_broadcast_builtin_name, BinOp, Lit, ScalarTy, UnaryOp};
 
 // ── Runtime symbol injection ─────────────────────────────────────────────────
 
@@ -265,6 +265,15 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                 Ok(false)
             }
 
+            TypedStmt::Assign { name, expr } => {
+                let val = self.lower_expr(expr)?;
+                let var = self.var_map.get(name)
+                    .copied()
+                    .ok_or_else(|| CodegenError::UnsupportedExpr(format!("assign to unknown variable: {name}")))?;
+                self.builder.def_var(var, val);
+                Ok(false)
+            }
+
             TypedStmt::GpuBarrier => {
                 self.call_runtime_barrier();
                 Ok(false)
@@ -320,23 +329,47 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
             TypedExprKind::Ident(name) => self.use_var(name),
 
             TypedExprKind::BinOp { op, lhs, rhs } => {
-                match &lhs.ty {
-                    ResolvedTy::Tensor { dtype } if *dtype == ScalarTy::F32 => {
+                match (&lhs.ty, &rhs.ty) {
+                    // tensor ⊕ tensor — dispatch to element-wise builtin kernel
+                    (ResolvedTy::Tensor { dtype: ld }, ResolvedTy::Tensor { dtype: rd })
+                        if ld == rd && *ld == ScalarTy::F32 =>
+                    {
                         if let Some(name) = elementwise_builtin_name(op) {
                             self.lower_kernel_dispatch(name, &[lhs.as_ref(), rhs.as_ref()])
                         } else {
                             Err(CodegenError::UnsupportedExpr(format!("binop {:?} on tensors not supported", op)))
                         }
                     }
-                    ResolvedTy::Tensor { .. } => Err(CodegenError::UnsupportedExpr(
-                        "non-f32 tensor BinOp not yet supported".into()
-                    )),
-                    ResolvedTy::Scalar(s) => {
+                    (ResolvedTy::Tensor { .. }, ResolvedTy::Tensor { .. }) => {
+                        Err(CodegenError::UnsupportedExpr("non-f32 tensor BinOp not yet supported".into()))
+                    }
+                    // tensor ⊕ scalar — materialize scalar as 1-elem tensor, dispatch scalar builtin
+                    (ResolvedTy::Tensor { dtype }, ResolvedTy::Scalar(sd)) if dtype == sd && *dtype == ScalarTy::F32 => {
+                        if let Some(name) = scalar_broadcast_builtin_name(op, true) {
+                            let tensor_handle = self.lower_expr(lhs)?;
+                            let scalar_handle = self.materialize_scalar_tensor(rhs)?;
+                            self.lower_kernel_dispatch_with_handles(name, &[tensor_handle, scalar_handle])
+                        } else {
+                            Err(CodegenError::UnsupportedExpr(format!("scalar broadcast {:?} not supported", op)))
+                        }
+                    }
+                    // scalar ⊕ tensor — scalar-on-left: buffer layout is [tensor, scalar, out]
+                    (ResolvedTy::Scalar(sd), ResolvedTy::Tensor { dtype }) if sd == dtype && *dtype == ScalarTy::F32 => {
+                        if let Some(name) = scalar_broadcast_builtin_name(op, false) {
+                            let tensor_handle = self.lower_expr(rhs)?;
+                            let scalar_handle = self.materialize_scalar_tensor(lhs)?;
+                            self.lower_kernel_dispatch_with_handles(name, &[tensor_handle, scalar_handle])
+                        } else {
+                            Err(CodegenError::UnsupportedExpr(format!("scalar broadcast {:?} (reversed) not supported", op)))
+                        }
+                    }
+                    // scalar ⊕ scalar
+                    (ResolvedTy::Scalar(s), _) => {
                         let l = self.lower_expr(lhs)?;
                         let r = self.lower_expr(rhs)?;
                         self.lower_scalar_binop(op, l, r, s)
                     }
-                    ResolvedTy::Bool => {
+                    (ResolvedTy::Bool, _) => {
                         let l = self.lower_expr(lhs)?;
                         let r = self.lower_expr(rhs)?;
                         self.lower_bool_binop(op, l, r)
@@ -594,6 +627,70 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
             )),
         }
         Ok(())
+    }
+
+    /// Allocate a single-element GPU tensor holding a scalar value.
+    /// Used for scalar-broadcast dispatch. The caller is responsible for
+    /// ensuring the scalar is f32 (V1 only supports f32 broadcasting).
+    /// The returned handle leaks — it will be freed as part of the M11 temp cleanup.
+    fn materialize_scalar_tensor(
+        &mut self,
+        scalar_expr: &malus_sema::TypedExpr,
+    ) -> Result<cranelift_codegen::ir::Value, CodegenError> {
+        let scalar_val = self.lower_expr(scalar_expr)?;
+        // Widen to f32 if needed.
+        let f32_val = match &scalar_expr.ty {
+            ResolvedTy::Scalar(s) if is_float_scalar(s) => scalar_val,
+            ResolvedTy::Scalar(s) => {
+                let t = scalar_cranelift_type(s);
+                let wide = if t == I64 { scalar_val } else { self.builder.ins().sextend(I64, scalar_val) };
+                self.builder.ins().fcvt_from_sint(F32, wide)
+            }
+            _ => return Err(CodegenError::UnsupportedExpr("non-scalar in materialize_scalar_tensor".into())),
+        };
+        // Stack-allocate a 1-element f32 array.
+        let slot = self.builder.create_sized_stack_slot(
+            cranelift_codegen::ir::StackSlotData::new(
+                cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                4,
+                2,
+            )
+        );
+        self.builder.ins().stack_store(f32_val, slot, 0);
+        let data_ptr = self.builder.ins().stack_addr(self.codegen.ptr_type(), slot, 0);
+        let dtype_val = self.builder.ins().iconst(I32, 0); // F32 = tag 0
+        let len_val   = self.builder.ins().iconst(I64, 1);
+        let alloc_ref = self.import_func(self.codegen.rt_tensor_alloc_gpu);
+        let call = self.builder.ins().call(alloc_ref, &[dtype_val, len_val, data_ptr]);
+        Ok(self.builder.inst_results(call).to_vec()[0])
+    }
+
+    /// Dispatch a kernel using pre-computed Cranelift Value handles.
+    /// Used when an argument was materialized inline (e.g. scalar-broadcast temp).
+    fn lower_kernel_dispatch_with_handles(
+        &mut self,
+        callee: &str,
+        handles: &[cranelift_codegen::ir::Value],
+    ) -> Result<cranelift_codegen::ir::Value, CodegenError> {
+        let kernel_id = *self.codegen.kernel_ids.get(callee)
+            .ok_or_else(|| CodegenError::UnknownKernel { name: callee.to_string() })?;
+        let n = handles.len() as u32;
+        let slot = self.builder.create_sized_stack_slot(
+            cranelift_codegen::ir::StackSlotData::new(
+                cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                n * 8,
+                3,
+            )
+        );
+        for (i, &val) in handles.iter().enumerate() {
+            self.builder.ins().stack_store(val, slot, (i as i32) * 8);
+        }
+        let id_val = self.builder.ins().iconst(I64, kernel_id as i64);
+        let handles_ptr = self.builder.ins().stack_addr(self.codegen.ptr_type(), slot, 0);
+        let n_val = self.builder.ins().iconst(self.codegen.ptr_type(), n as i64);
+        let dispatch_ref = self.import_func(self.codegen.rt_kernel_dispatch);
+        let call = self.builder.ins().call(dispatch_ref, &[id_val, handles_ptr, n_val]);
+        Ok(self.builder.inst_results(call).to_vec()[0])
     }
 
     fn call_runtime_print(&mut self, handle: cranelift_codegen::ir::Value) {

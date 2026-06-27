@@ -375,6 +375,8 @@ impl<'src> Lexer<'src> {
             "import" => TokenKind::Import,
             "kernel" => TokenKind::Kernel,
             "let"    => TokenKind::Let,
+            "mut"    => TokenKind::Mut,
+            "match"  => TokenKind::Match,
             "return" => TokenKind::Return,
             "if"     => TokenKind::If,
             "else"   => TokenKind::Else,

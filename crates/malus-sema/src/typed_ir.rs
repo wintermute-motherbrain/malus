@@ -48,6 +48,9 @@ pub struct TypedKernel {
 #[derive(Debug, Clone)]
 pub enum TypedStmt {
     Let { name: String, expr: TypedExpr },
+    /// Reassignment of a `let mut` binding. The old value is dropped by CTMM
+    /// before this stmt executes; this stmt performs a pure rebind.
+    Assign { name: String, expr: TypedExpr },
     Return { expr: TypedExpr },
     Expr(TypedExpr),
     /// CTMM: free this binding's tensor allocation.

@@ -47,6 +47,8 @@ pub enum Callee<'a> {
 pub struct Env {
     /// Local variable bindings: name → (type, optional placement).
     bindings: Vec<HashMap<String, (ResolvedTy, Option<Placement>)>>,
+    /// Names bound with `let mut` — checked at Assign sites.
+    mutable_names: HashSet<String>,
     pub functions: HashMap<String, FnSig>,
     pub kernels: HashMap<String, KernelSig>,
     pub builtins: HashMap<String, BuiltinSig>,
@@ -61,6 +63,7 @@ impl Env {
     ) -> Self {
         Env {
             bindings: vec![HashMap::new()],
+            mutable_names: HashSet::new(),
             functions: HashMap::new(),
             kernels: HashMap::new(),
             builtins,
@@ -82,6 +85,15 @@ impl Env {
         if let Some(scope) = self.bindings.last_mut() {
             scope.insert(name, (ty, placement));
         }
+    }
+
+    pub fn bind_mutable(&mut self, name: String, ty: ResolvedTy, placement: Option<Placement>) {
+        self.mutable_names.insert(name.clone());
+        self.bind(name, ty, placement);
+    }
+
+    pub fn is_mutable(&self, name: &str) -> bool {
+        self.mutable_names.contains(name)
     }
 
     pub fn lookup_binding(&self, name: &str) -> Option<&(ResolvedTy, Option<Placement>)> {

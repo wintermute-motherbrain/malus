@@ -83,6 +83,10 @@ _Avoid_: Mutable parameter, write parameter
 An MSL kernel synthesized by `malus-codegen-gpu` for a primitive arithmetic operator (`malus_add`, `malus_sub`, `malus_mul`, `malus_div`), dispatched via `kernel_dispatch` with a sequential `kernel_id` appended after user kernels. Indistinguishable from a user kernel at runtime.
 _Avoid_: Builtin kernel, intrinsic kernel, stdlib kernel
 
+**Element-space (kernel body)**:
+The type regime inside a kernel body. Tensor parameters are bound as their *element* scalar type (`f32`, not `Tensor<f32>`). The body is checked as per-thread scalar math; the final `return` expression must have the return tensor's element type. Codegen emits `x[tid]` for params and bare `name` for `let`-bound locals. This means kernel-body comparison operators yield the operand's scalar dtype (a float mask), not `Bool`. `fn`-body BinOp rules and scalar-broadcast rules do not apply inside kernels.
+_Avoid_: Scalar-space, thread-space, per-element computation
+
 ### Types (V1)
 
 **Struct**:

@@ -12,6 +12,8 @@ pub enum TokenKind {
     Fn,
     Kernel,
     Let,
+    Mut,
+    Match,
     Return,
     If,
     Else,

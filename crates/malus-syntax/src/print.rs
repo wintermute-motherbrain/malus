@@ -56,6 +56,12 @@ fn print_stmt(out: &mut String, stmt: &Stmt, depth: usize) {
         StmtKind::Let { name, expr } => {
             writeln!(out, "{indent}let {name} = {}", print_expr(expr)).unwrap();
         }
+        StmtKind::LetMut { name, expr } => {
+            writeln!(out, "{indent}let mut {name} = {}", print_expr(expr)).unwrap();
+        }
+        StmtKind::Assign { target, expr } => {
+            writeln!(out, "{indent}{target} = {}", print_expr(expr)).unwrap();
+        }
         StmtKind::Return { expr } => {
             writeln!(out, "{indent}return {}", print_expr(expr)).unwrap();
         }
@@ -264,6 +270,10 @@ mod tests {
             kind: match s.kind {
                 StmtKind::Let { name, expr } =>
                     StmtKind::Let { name, expr: erase_expr(expr, z) },
+                StmtKind::LetMut { name, expr } =>
+                    StmtKind::LetMut { name, expr: erase_expr(expr, z) },
+                StmtKind::Assign { target, expr } =>
+                    StmtKind::Assign { target, expr: erase_expr(expr, z) },
                 StmtKind::Return { expr } =>
                     StmtKind::Return { expr: erase_expr(expr, z) },
                 StmtKind::Expr(expr) =>

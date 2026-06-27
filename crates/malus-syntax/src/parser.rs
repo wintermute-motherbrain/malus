@@ -273,13 +273,24 @@ impl Parser {
         match self.current_kind().clone() {
             TokenKind::Let => {
                 self.advance();
+                let mutable = if self.current_kind() == &TokenKind::Mut {
+                    self.advance();
+                    true
+                } else {
+                    false
+                };
                 let (name, _) = self.expect_ident()?;
                 self.expect(&TokenKind::Eq)?;
                 let expr = self.parse_expr()?;
                 let end = expr.span;
                 self.expect_newline_or_eof()?;
+                let kind = if mutable {
+                    StmtKind::LetMut { name, expr }
+                } else {
+                    StmtKind::Let { name, expr }
+                };
                 Ok(Stmt {
-                    kind: StmtKind::Let { name, expr },
+                    kind,
                     span: Span::new(start.file, start.start as usize, end.end as usize),
                 })
             }
@@ -295,6 +306,20 @@ impl Parser {
             }
             _ => {
                 let expr = self.parse_expr()?;
+                // Check for assignment: <ident> = <expr>
+                if let ExprKind::Ident(target) = &expr.kind {
+                    if self.current_kind() == &TokenKind::Eq {
+                        let target = target.clone();
+                        self.advance();
+                        let rhs = self.parse_expr()?;
+                        let end = rhs.span;
+                        self.expect_newline_or_eof()?;
+                        return Ok(Stmt {
+                            kind: StmtKind::Assign { target, expr: rhs },
+                            span: Span::new(start.file, start.start as usize, end.end as usize),
+                        });
+                    }
+                }
                 let end = expr.span;
                 self.expect_newline_or_eof()?;
                 Ok(Stmt {

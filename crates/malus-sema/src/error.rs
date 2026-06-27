@@ -18,6 +18,7 @@ pub enum SemaError {
     UnknownType { name: String, span: Span },
     FormatArgCountMismatch { callee: String, placeholders: usize, args: usize, span: Span },
     StringLiteralOutsidePrint { span: Span },
+    AssignToImmutable { name: String, span: Span },
 }
 
 impl fmt::Display for SemaError {
@@ -51,6 +52,8 @@ impl fmt::Display for SemaError {
                 write!(f, "'{}' format string has {} placeholder(s) but {} value arg(s) provided", callee, placeholders, args),
             SemaError::StringLiteralOutsidePrint { .. } =>
                 write!(f, "string literals are only valid as the first argument of print/println"),
+            SemaError::AssignToImmutable { name, .. } =>
+                write!(f, "cannot assign to '{}' because it is not declared `let mut`", name),
         }
     }
 }

@@ -1,7 +1,9 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use malus_sema::{TypedExpr, TypedExprKind, TypedKernel, TypedProgram, TypedStmt};
-use malus_syntax::ast::{elementwise_builtin_name, BinOp, ScalarTy, UnaryOp};
+use malus_sema::{ResolvedTy, TypedExpr, TypedExprKind, TypedKernel, TypedProgram, TypedStmt};
+use malus_syntax::ast::{
+    elementwise_builtin_name, scalar_broadcast_builtin_name, BinOp, Lit, ScalarTy, UnaryOp,
+};
 
 #[cfg(test)]
 mod tests;
@@ -98,18 +100,36 @@ pub fn compile_kernels(
         name_to_id.insert(kernel.name.clone(), kernel_id);
     }
 
-    let mut builtins = BTreeSet::new();
+    // Tensor-tensor element-wise builtins (ADR-0010: appended after user kernels).
+    let mut tensor_ops: BTreeSet<BinOp> = BTreeSet::new();
+    // Scalar-broadcast builtins: (op, scalar_on_right).
+    let mut scalar_ops: BTreeSet<(BinOp, bool)> = BTreeSet::new();
+
     for f in &program.fns {
         for stmt in &f.body {
-            collect_tensor_binops_in_stmt(stmt, &mut builtins);
+            collect_binops_in_stmt(stmt, &mut tensor_ops, &mut scalar_ops);
         }
     }
-    for op in &builtins {
+
+    for op in &tensor_ops {
         let name = elementwise_builtin_name(op)
             .expect("collected op must have a builtin name");
         let kernel_id = next_id;
         next_id += 1;
-        let msl = synthesize_builtin(*op, kernel_id)?;
+        let msl = synthesize_elementwise_builtin(*op, kernel_id)?;
+        registry.insert(kernel_id, msl);
+        name_to_id.insert(name.to_string(), kernel_id);
+    }
+
+    for (op, scalar_on_right) in &scalar_ops {
+        let name = scalar_broadcast_builtin_name(op, *scalar_on_right)
+            .expect("collected scalar op must have a builtin name");
+        if name_to_id.contains_key(name) {
+            continue; // commutative: both orderings share the same kernel
+        }
+        let kernel_id = next_id;
+        next_id += 1;
+        let msl = synthesize_scalar_builtin(*op, *scalar_on_right, kernel_id)?;
         registry.insert(kernel_id, msl);
         name_to_id.insert(name.to_string(), kernel_id);
     }
@@ -117,60 +137,91 @@ pub fn compile_kernels(
     Ok((registry, name_to_id))
 }
 
-fn collect_tensor_binops_in_stmt(stmt: &TypedStmt, out: &mut BTreeSet<BinOp>) {
+fn collect_binops_in_stmt(
+    stmt: &TypedStmt,
+    tensor_ops: &mut BTreeSet<BinOp>,
+    scalar_ops: &mut BTreeSet<(BinOp, bool)>,
+) {
     match stmt {
-        TypedStmt::Let { expr, .. } => collect_tensor_binops_in_expr(expr, out),
-        TypedStmt::Return { expr } => collect_tensor_binops_in_expr(expr, out),
-        TypedStmt::Expr(expr) => collect_tensor_binops_in_expr(expr, out),
+        TypedStmt::Let { expr, .. } => collect_binops_in_expr(expr, tensor_ops, scalar_ops),
+        TypedStmt::Assign { expr, .. } => collect_binops_in_expr(expr, tensor_ops, scalar_ops),
+        TypedStmt::Return { expr } => collect_binops_in_expr(expr, tensor_ops, scalar_ops),
+        TypedStmt::Expr(expr) => collect_binops_in_expr(expr, tensor_ops, scalar_ops),
         TypedStmt::Drop { .. } | TypedStmt::GpuBarrier => {}
     }
 }
 
-fn collect_tensor_binops_in_expr(expr: &TypedExpr, out: &mut BTreeSet<BinOp>) {
+fn collect_binops_in_expr(
+    expr: &TypedExpr,
+    tensor_ops: &mut BTreeSet<BinOp>,
+    scalar_ops: &mut BTreeSet<(BinOp, bool)>,
+) {
     match &expr.kind {
         TypedExprKind::BinOp { op, lhs, rhs } => {
-            if lhs.ty.is_tensor() && elementwise_builtin_name(op).is_some() {
-                out.insert(op.clone());
+            if lhs.ty.is_tensor() && rhs.ty.is_tensor() {
+                if elementwise_builtin_name(op).is_some() {
+                    tensor_ops.insert(*op);
+                }
+            } else if lhs.ty.is_tensor() && matches!(rhs.ty, ResolvedTy::Scalar(_)) {
+                if scalar_broadcast_builtin_name(op, true).is_some() {
+                    scalar_ops.insert((*op, true));
+                }
+            } else if matches!(lhs.ty, ResolvedTy::Scalar(_)) && rhs.ty.is_tensor() {
+                if scalar_broadcast_builtin_name(op, false).is_some() {
+                    scalar_ops.insert((*op, false));
+                }
             }
-            collect_tensor_binops_in_expr(lhs, out);
-            collect_tensor_binops_in_expr(rhs, out);
+            collect_binops_in_expr(lhs, tensor_ops, scalar_ops);
+            collect_binops_in_expr(rhs, tensor_ops, scalar_ops);
         }
         TypedExprKind::Unary { operand, .. } => {
-            collect_tensor_binops_in_expr(operand, out);
+            collect_binops_in_expr(operand, tensor_ops, scalar_ops);
         }
         TypedExprKind::Call { args, .. } => {
-            for a in args {
-                collect_tensor_binops_in_expr(a, out);
-            }
+            for a in args { collect_binops_in_expr(a, tensor_ops, scalar_ops); }
         }
         TypedExprKind::KernelCall { args, .. } => {
-            for a in args {
-                collect_tensor_binops_in_expr(a, out);
-            }
+            for a in args { collect_binops_in_expr(a, tensor_ops, scalar_ops); }
         }
         TypedExprKind::TensorLiteral { elements, .. } => {
-            for e in elements {
-                collect_tensor_binops_in_expr(e, out);
-            }
+            for e in elements { collect_binops_in_expr(e, tensor_ops, scalar_ops); }
         }
         TypedExprKind::Index { base, indices } => {
-            collect_tensor_binops_in_expr(base, out);
-            for i in indices {
-                collect_tensor_binops_in_expr(i, out);
-            }
+            collect_binops_in_expr(base, tensor_ops, scalar_ops);
+            for i in indices { collect_binops_in_expr(i, tensor_ops, scalar_ops); }
         }
         TypedExprKind::FieldAccess { base, .. } => {
-            collect_tensor_binops_in_expr(base, out);
+            collect_binops_in_expr(base, tensor_ops, scalar_ops);
         }
         TypedExprKind::Lit(_) | TypedExprKind::Ident(_) => {}
     }
 }
 
-fn synthesize_builtin(op: BinOp, kernel_id: u64) -> Result<String, CodegenError> {
+fn synthesize_elementwise_builtin(op: BinOp, kernel_id: u64) -> Result<String, CodegenError> {
     let msl_op = binop_to_msl(&op)?;
     Ok(format!(
         "#include <metal_stdlib>\nusing namespace metal;\n\nkernel void malus_kernel_{}(\n    device float* a [[buffer(0)]],\n    device float* b [[buffer(1)]],\n    device float* out [[buffer(2)]],\n    uint tid [[thread_position_in_grid]]\n) {{\n    out[tid] = (a[tid] {} b[tid]);\n}}\n",
         kernel_id, msl_op,
+    ))
+}
+
+/// Synthesize a scalar-broadcast builtin. Layout: a@0, scalar_val@1, out@2.
+/// For `scalar_on_right=true`: `out = a op scalar_val[0]`.
+/// For `scalar_on_right=false` (reversed): `out = scalar_val[0] op a`.
+fn synthesize_scalar_builtin(
+    op: BinOp,
+    scalar_on_right: bool,
+    kernel_id: u64,
+) -> Result<String, CodegenError> {
+    let msl_op = binop_to_msl(&op)?;
+    let expr = if scalar_on_right {
+        format!("(a[tid] {} scalar_val[0])", msl_op)
+    } else {
+        format!("(scalar_val[0] {} a[tid])", msl_op)
+    };
+    Ok(format!(
+        "#include <metal_stdlib>\nusing namespace metal;\n\nkernel void malus_kernel_{}(\n    device float* a [[buffer(0)]],\n    device float* scalar_val [[buffer(1)]],\n    device float* out [[buffer(2)]],\n    uint tid [[thread_position_in_grid]]\n) {{\n    out[tid] = {};\n}}\n",
+        kernel_id, expr,
     ))
 }
 
@@ -222,25 +273,62 @@ fn lower_kernel_body(
     body: &[TypedStmt],
     param_names: &HashSet<String>,
 ) -> Result<String, CodegenError> {
-    match body {
-        [TypedStmt::Return { expr }] => {
-            let expr_msl = lower_expr(expr, param_names)?;
-            Ok(format!("out[tid] = {};", expr_msl))
-        }
-        _ => Err(CodegenError::UnsupportedKernelBody(
-            "kernel body must be a single return statement".into(),
-        )),
+    if body.is_empty() {
+        return Err(CodegenError::UnsupportedKernelBody(
+            "kernel body must not be empty".into(),
+        ));
     }
+
+    let mut local_names: HashSet<String> = HashSet::new();
+    let mut lines: Vec<String> = Vec::new();
+
+    for (i, stmt) in body.iter().enumerate() {
+        let is_last = i == body.len() - 1;
+        match stmt {
+            TypedStmt::Let { name, expr } => {
+                if is_last {
+                    return Err(CodegenError::UnsupportedKernelBody(
+                        "kernel body must end with a return statement".into(),
+                    ));
+                }
+                let msl_ty = resolved_scalar_to_msl(&expr.ty)?;
+                let expr_msl = lower_expr(expr, param_names, &local_names)?;
+                lines.push(format!("{} {} = {};", msl_ty, name, expr_msl));
+                local_names.insert(name.clone());
+            }
+            TypedStmt::Return { expr } => {
+                if !is_last {
+                    return Err(CodegenError::UnsupportedKernelBody(
+                        "return must be the last statement in kernel body".into(),
+                    ));
+                }
+                let expr_msl = lower_expr(expr, param_names, &local_names)?;
+                lines.push(format!("out[tid] = {};", expr_msl));
+            }
+            _ => {
+                return Err(CodegenError::UnsupportedKernelBody(
+                    "only let bindings and a final return are allowed in kernel bodies".into(),
+                ));
+            }
+        }
+    }
+
+    Ok(lines.join("\n    "))
 }
 
 fn lower_expr(
     expr: &TypedExpr,
     param_names: &HashSet<String>,
+    local_names: &HashSet<String>,
 ) -> Result<String, CodegenError> {
     match &expr.kind {
         TypedExprKind::Ident(name) => {
             if param_names.contains(name) {
+                // Tensor parameters: index by thread id (element-space).
                 Ok(format!("{}[tid]", name))
+            } else if local_names.contains(name) {
+                // Let-bound locals: scalar value, no indexing.
+                Ok(name.clone())
             } else {
                 Err(CodegenError::UnsupportedKernelBody(format!(
                     "unknown identifier in kernel: {}", name
@@ -248,25 +336,36 @@ fn lower_expr(
             }
         }
 
+        TypedExprKind::Lit(lit) => match lit {
+            Lit::Float(f) => Ok(format!("{:?}f", f)),
+            Lit::Int(n) => Ok(format!("{}", n)),
+            Lit::Bool(_) => Err(CodegenError::UnsupportedKernelBody(
+                "bool literals not supported in kernel bodies (comparisons yield float masks)".into(),
+            )),
+            Lit::Str(_) => Err(CodegenError::UnsupportedKernelBody(
+                "string literals not supported in kernel bodies".into(),
+            )),
+        },
+
         TypedExprKind::BinOp { op, lhs, rhs } => {
-            let l = lower_expr(lhs, param_names)?;
-            let r = lower_expr(rhs, param_names)?;
+            let l = lower_expr(lhs, param_names, local_names)?;
+            let r = lower_expr(rhs, param_names, local_names)?;
             let msl_op = binop_to_msl(op)?;
             Ok(format!("({} {} {})", l, msl_op, r))
         }
 
         TypedExprKind::Unary { op, operand } => {
-            let val = lower_expr(operand, param_names)?;
+            let val = lower_expr(operand, param_names, local_names)?;
             match op {
                 UnaryOp::Neg => Ok(format!("(-{})", val)),
                 UnaryOp::Not => Err(CodegenError::UnsupportedKernelBody(
-                    "bitwise not on tensors not supported".into(),
+                    "bitwise not not supported in kernel bodies".into(),
                 )),
             }
         }
 
         _ => Err(CodegenError::UnsupportedKernelBody(format!(
-            "unsupported expression in kernel body"
+            "unsupported expression kind in kernel body"
         ))),
     }
 }
@@ -277,11 +376,27 @@ fn binop_to_msl(op: &BinOp) -> Result<&'static str, CodegenError> {
         BinOp::Sub => Ok("-"),
         BinOp::Mul => Ok("*"),
         BinOp::Div => Ok("/"),
+        BinOp::Eq    => Ok("=="),
+        BinOp::NotEq => Ok("!="),
+        BinOp::Lt    => Ok("<"),
+        BinOp::LtEq  => Ok("<="),
+        BinOp::Gt    => Ok(">"),
+        BinOp::GtEq  => Ok(">="),
         BinOp::Matmul => Err(CodegenError::UnsupportedKernelBody(
             "matmul is not element-wise".into(),
         )),
         _ => Err(CodegenError::UnsupportedKernelBody(format!(
             "unsupported binop in kernel: {:?}", op
+        ))),
+    }
+}
+
+/// Map a resolved scalar type to its MSL type name.
+fn resolved_scalar_to_msl(ty: &ResolvedTy) -> Result<&'static str, CodegenError> {
+    match ty {
+        ResolvedTy::Scalar(s) => Ok(dtype_to_msl(s)),
+        _ => Err(CodegenError::UnsupportedKernelBody(format!(
+            "expected scalar type for kernel local, got: {}", ty
         ))),
     }
 }

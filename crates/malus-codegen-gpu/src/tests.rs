@@ -290,3 +290,159 @@ fn main():
     assert!(!name_to_id.contains_key("malus_matmul"));
     assert!(name_to_id.is_empty());
 }
+
+// ── M7: multi-statement kernel bodies ────────────────────────────────────────
+
+#[test]
+fn test_multistmt_kernel_let_then_return() {
+    let src = r#"
+kernel relu_backward(grad_out: Tensor<f32>, x: Tensor<f32>) -> Tensor<f32>:
+    let mask = x > 0.0
+    return grad_out * mask
+
+fn main():
+    let g = Tensor.gpu<f32>([1.0, 2.0])
+    let x = Tensor.gpu<f32>([1.0, -1.0])
+    let d = relu_backward(g, x)
+    println(d)
+"#;
+    let (registry, name_to_id) = compile_src(src).expect("should compile");
+    let id = name_to_id["relu_backward"];
+    let msl = registry.msl_for(id).unwrap();
+    // Let binding: compare produces a float mask in element-space
+    assert!(msl.contains("float mask = (x[tid] > 0.0f);"), "expected mask = (x[tid] > 0.0f) in MSL, got:\n{msl}");
+    // Return: multiply grad_out by mask (local, no indexing)
+    assert!(msl.contains("out[tid] = (grad_out[tid] * mask);"), "expected out[tid] = (grad_out[tid] * mask) in MSL, got:\n{msl}");
+}
+
+#[test]
+fn test_kernel_comparison_ops_in_msl() {
+    let src = r#"
+kernel cmp_kernel(a: Tensor<f32>, b: Tensor<f32>) -> Tensor<f32>:
+    let lt_mask = a < b
+    return lt_mask
+
+fn main():
+    let a = Tensor.gpu<f32>([1.0, 2.0])
+    let b = Tensor.gpu<f32>([2.0, 1.0])
+    let c = cmp_kernel(a, b)
+    println(c)
+"#;
+    let (registry, name_to_id) = compile_src(src).expect("should compile");
+    let msl = registry.msl_for(name_to_id["cmp_kernel"]).unwrap();
+    assert!(msl.contains("(a[tid] < b[tid])"), "< comparison should appear in MSL, got:\n{msl}");
+}
+
+#[test]
+fn test_kernel_float_literal_in_msl() {
+    let src = r#"
+kernel scale(a: Tensor<f32>) -> Tensor<f32>:
+    let half = 0.5
+    return a * half
+
+fn main():
+    let a = Tensor.gpu<f32>([1.0, 2.0])
+    let b = scale(a)
+    println(b)
+"#;
+    let (registry, name_to_id) = compile_src(src).expect("should compile");
+    let msl = registry.msl_for(name_to_id["scale"]).unwrap();
+    assert!(msl.contains("0.5f"), "float literal should emit as 0.5f in MSL, got:\n{msl}");
+    assert!(msl.contains("float half = 0.5f;"), "let binding should emit correctly, got:\n{msl}");
+}
+
+// ── M7: scalar-broadcast builtin synthesis ───────────────────────────────────
+
+#[test]
+fn test_scalar_broadcast_mul_synthesized() {
+    let src = r#"
+fn main():
+    let a = Tensor.gpu<f32>([1.0, 2.0])
+    let scaled = a * 0.5
+    println(scaled)
+"#;
+    let (registry, name_to_id) = compile_src(src).expect("should compile");
+    assert!(name_to_id.contains_key("malus_mul_scalar"), "malus_mul_scalar should be synthesized");
+    let id = name_to_id["malus_mul_scalar"];
+    let msl = registry.msl_for(id).unwrap();
+    assert!(msl.contains("device float* a [[buffer(0)]]"), "tensor param at buffer(0)");
+    assert!(msl.contains("device float* scalar_val [[buffer(1)]]"), "scalar param at buffer(1)");
+    assert!(msl.contains("device float* out [[buffer(2)]]"), "output at buffer(2)");
+    assert!(msl.contains("(a[tid] * scalar_val[0])"), "MSL body should multiply a[tid] by scalar_val[0]");
+}
+
+#[test]
+fn test_scalar_broadcast_add_synthesized() {
+    let src = r#"
+fn main():
+    let a = Tensor.gpu<f32>([1.0, 2.0])
+    let b = a + 1.0
+    println(b)
+"#;
+    let (_registry, name_to_id) = compile_src(src).expect("should compile");
+    assert!(name_to_id.contains_key("malus_add_scalar"));
+}
+
+#[test]
+fn test_scalar_broadcast_commutative_dedup() {
+    // Both `a + 0.5` and `0.5 + a` use the same kernel malus_add_scalar.
+    let src = r#"
+fn main():
+    let a = Tensor.gpu<f32>([1.0, 2.0])
+    let b = a + 0.5
+    let c = 0.5 + a
+    println(b)
+    println(c)
+"#;
+    let (registry, name_to_id) = compile_src(src).expect("should compile");
+    // Only one malus_add_scalar kernel (commutative dedup).
+    let add_scalar_count = name_to_id.keys().filter(|k| k.as_str() == "malus_add_scalar").count();
+    assert_eq!(add_scalar_count, 1, "malus_add_scalar should appear exactly once");
+    let id = name_to_id["malus_add_scalar"];
+    assert!(registry.msl_for(id).is_some());
+}
+
+#[test]
+fn test_scalar_broadcast_sub_div_both_orders() {
+    // sub and div are non-commutative: both orders produce distinct kernels.
+    let src = r#"
+fn main():
+    let a = Tensor.gpu<f32>([1.0, 2.0])
+    let b = a - 1.0
+    let c = 1.0 - a
+    let d = a / 2.0
+    println(b)
+    println(c)
+    println(d)
+"#;
+    let (_registry, name_to_id) = compile_src(src).expect("should compile");
+    assert!(name_to_id.contains_key("malus_sub_scalar"),  "tensor - scalar should produce malus_sub_scalar");
+    assert!(name_to_id.contains_key("malus_rsub_scalar"), "scalar - tensor should produce malus_rsub_scalar");
+    assert!(name_to_id.contains_key("malus_div_scalar"),  "tensor / scalar should produce malus_div_scalar");
+}
+
+#[test]
+fn test_scalar_builtin_ids_after_user_and_tensor_tensor_kernels() {
+    // User kernel first, then tensor-tensor builtin, then scalar builtins (ADR-0010 ordering).
+    let src = r#"
+kernel copy(a: Tensor<f32>) -> Tensor<f32>:
+    return a
+
+fn main():
+    let a = Tensor.gpu<f32>([1.0, 2.0])
+    let b = Tensor.gpu<f32>([3.0, 4.0])
+    let c = copy(a)
+    let d = a + b
+    let e = a * 0.5
+    println(c)
+    println(d)
+    println(e)
+"#;
+    let (_registry, name_to_id) = compile_src(src).expect("should compile");
+    let copy_id  = name_to_id["copy"];
+    let add_id   = name_to_id["malus_add"];
+    let mul_s_id = name_to_id["malus_mul_scalar"];
+    // User kernel < tensor-tensor builtin < scalar builtin
+    assert!(copy_id  < add_id,   "user kernel id ({copy_id}) < tensor-tensor builtin id ({add_id})");
+    assert!(add_id   < mul_s_id, "tensor-tensor builtin id ({add_id}) < scalar builtin id ({mul_s_id})");
+}

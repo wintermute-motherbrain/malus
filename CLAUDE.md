@@ -4,7 +4,7 @@
 
 malus is a compiled ML DSL for Apple Silicon. Python-like syntax, dual compilation pipeline: `fn` bodies → Cranelift JIT (CPU), `kernel` bodies → Metal Shading Language (GPU). The CTMM memory model inserts static `free`/barrier calls at compile time, falling back to reference counting only when lifetimes are structurally ambiguous.
 
-## Current state: M6 done, **M7 is next**
+## Current state: M7 done, **M8 is next**
 
 | Milestone | Status | Crate |
 |---|---|---|
@@ -15,8 +15,8 @@ malus is a compiled ML DSL for Apple Silicon. Python-like syntax, dual compilati
 | M5 — GPU Codegen (MSL for `kernel` bodies) | ✅ done | `malus-codegen-gpu` |
 | M5.1 — Built-in element-wise kernels for fn-body BinOp | ✅ done | `malus-codegen-gpu`, `malus-codegen-cpu` |
 | M6 — Integration (end-to-end CLI) | ✅ done | `malus-cli` |
-| **M7 — Kernel Thickening** (multi-stmt kernels, `let mut`, scalar broadcasting) | **← next** | `malus-syntax`, `malus-sema`, `malus-codegen-*` |
-| M8 — Core Stdlib (matmul, relu/sigmoid/tanh, transpose, zeros/ones, sum) | planned | `malus-runtime`, `malus-codegen-*` |
+| M7 — Kernel Thickening (multi-stmt kernels, `let mut`, scalar broadcasting) | ✅ done | `malus-syntax`, `malus-sema`, `malus-codegen-*` |
+| **M8 — Core Stdlib** (matmul, relu/sigmoid/tanh, transpose, zeros/ones, sum) | **← next** | `malus-runtime`, `malus-codegen-*` |
 | M9 — Control Flow (if/else, for, while, CTMM RC fallback) | planned | `malus-syntax`, `malus-sema`, `malus-codegen-cpu`, `malus-runtime` |
 | M10 — Structs + Enums (structs, data-carrying enums, match) | planned | `malus-syntax`, `malus-sema`, `malus-codegen-cpu` |
 | M11 — The 2-Layer MLP (fixed arrays, diagnostics, done-when) | planned | all crates |
@@ -94,8 +94,7 @@ void tensor_free(i64 handle)
 The `i64` handle is a raw pointer to a heap-allocated `TensorBuffer { buffer: metal::Buffer, dtype: Dtype, len: usize }` wrapping a real `MTLBuffer` (`StorageModeShared`). The runtime owns it; `tensor_free` drops the box.
 
 **Planned ABI additions:**
-- M7: `tensor_alloc_gpu` signature changes to accept shape; scalar-broadcast built-in kernels added
-- M8: `tensor_matmul`, `tensor_transpose`, `tensor_sum`, `tensor_alloc_zeros_gpu`, `tensor_alloc_ones_gpu`, `tensor_len` added to RuntimeSymbols
+- M8: `tensor_alloc_gpu` signature changes to accept shape; `tensor_matmul`, `tensor_transpose`, `tensor_sum`, `tensor_alloc_zeros_gpu`, `tensor_alloc_ones_gpu`, `tensor_len` added to RuntimeSymbols
 - M9: `tensor_retain`, `tensor_release` added; `TensorBuffer` gains `ref_count: AtomicUsize`
 
 **dtype_tag** uses `ScalarTy` enum discriminant order: F32=0, F16=1, Bf16=2, I8=3, I16=4, I32=5, I64=6, U8=7, U16=8, U32=9, U64=10. `malus-runtime` defines an independent `Dtype` enum with `from_tag(i32)`/`to_tag() -> i32`; a drift-detection test asserts all 11 mappings. **V1 supports f32 only** — non-f32 panics per ADR-0006.
@@ -110,9 +109,6 @@ The `i64` handle is a raw pointer to a heap-allocated `TensorBuffer { buffer: me
 
 | Limitation | Fix in |
 |---|---|
-| Kernel bodies must be a single `Return` statement | M7 |
-| Scalar broadcasting (`a * factor`) rejected by sema | M7 |
-| `let mut` / reassignment not supported | M7 |
 | `zeros` / `ones` return `UnsupportedExpr` | M8 |
 | Matmul (`@`) not implemented in codegen-cpu | M8 |
 | No relu, sigmoid, exp, log, sqrt, abs builtins | M8 |

@@ -373,3 +373,134 @@ fn main():
     let has_barrier = add_fn.body.iter().any(|s| matches!(s, TypedStmt::GpuBarrier));
     assert!(!has_barrier, "scalar BinOp must not trigger GPU barrier insertion");
 }
+
+// ── M7: let mut + reassignment ───────────────────────────────────────────────
+
+#[test]
+fn test_let_mut_and_assign_ok() {
+    let src = r#"
+fn main():
+    let mut acc = Tensor.gpu<f32>([0.0, 0.0])
+    let delta = Tensor.gpu<f32>([1.0, 2.0])
+    acc = acc + delta
+    print(acc)
+"#;
+    let typed = check_src(src).expect("let mut + reassignment should type-check");
+    let main = typed.fns.iter().find(|f| f.name == "main").unwrap();
+    let has_assign = main.body.iter().any(|s| matches!(s, TypedStmt::Assign { name, .. } if name == "acc"));
+    assert!(has_assign, "TypedStmt::Assign for acc should be present");
+}
+
+#[test]
+fn test_assign_to_immutable_rejected() {
+    let src = r#"
+fn main():
+    let acc = Tensor.gpu<f32>([0.0])
+    let delta = Tensor.gpu<f32>([1.0])
+    acc = acc + delta
+    print(acc)
+"#;
+    let errors = check_src(src).expect_err("assign to immutable let should fail");
+    assert!(
+        errors.iter().any(|e| matches!(e, SemaError::AssignToImmutable { name, .. } if name == "acc")),
+        "expected AssignToImmutable(acc), got: {:?}", errors
+    );
+}
+
+#[test]
+fn test_assign_type_mismatch_rejected() {
+    let src = r#"
+fn main():
+    let mut acc = Tensor.gpu<f32>([0.0])
+    acc = 1.0
+    print(acc)
+"#;
+    let errors = check_src(src).expect_err("type mismatch in assign should fail");
+    assert!(errors.iter().any(|e| matches!(e, SemaError::TypeMismatch { .. })),
+        "expected TypeMismatch, got: {:?}", errors);
+}
+
+#[test]
+fn test_assign_inserts_drop_before_rebind() {
+    let src = r#"
+fn main():
+    let mut acc = Tensor.gpu<f32>([0.0, 0.0])
+    let delta = Tensor.gpu<f32>([1.0, 2.0])
+    acc = acc + delta
+    print(acc)
+"#;
+    let typed = check_src(src).expect("should type-check");
+    let main = typed.fns.iter().find(|f| f.name == "main").unwrap();
+    // A Drop{acc} should appear before the Assign{acc} to free the old allocation.
+    let drop_before_assign = {
+        let mut saw_drop = false;
+        let mut saw_assign = false;
+        for stmt in &main.body {
+            if matches!(stmt, TypedStmt::Drop { name } if name == "acc") {
+                saw_drop = true;
+            }
+            if matches!(stmt, TypedStmt::Assign { name, .. } if name == "acc") {
+                if saw_drop { saw_assign = true; }
+            }
+        }
+        saw_assign
+    };
+    assert!(drop_before_assign, "Drop(acc) must appear before Assign(acc)");
+}
+
+// ── M7: scalar broadcasting ───────────────────────────────────────────────────
+
+#[test]
+fn test_tensor_mul_scalar_ok() {
+    let src = r#"
+fn main():
+    let a = Tensor.gpu<f32>([1.0, 2.0, 3.0])
+    let scaled = a * 0.5
+    print(scaled)
+"#;
+    let typed = check_src(src).expect("tensor * scalar should type-check");
+    let main = typed.fns.iter().find(|f| f.name == "main").unwrap();
+    let scaled = main.body.iter().find(|s| matches!(s, TypedStmt::Let { name, .. } if name == "scaled"));
+    assert!(scaled.is_some(), "let scaled should be present");
+    if let Some(TypedStmt::Let { expr, .. }) = scaled {
+        assert!(matches!(expr.ty, crate::ResolvedTy::Tensor { .. }), "scaled should be Tensor");
+    }
+}
+
+#[test]
+fn test_scalar_mul_tensor_ok() {
+    let src = r#"
+fn main():
+    let a = Tensor.gpu<f32>([1.0, 2.0])
+    let scaled = 2.0 * a
+    print(scaled)
+"#;
+    let typed = check_src(src).expect("scalar * tensor should type-check");
+    let main = typed.fns.iter().find(|f| f.name == "main").unwrap();
+    let scaled = main.body.iter().find(|s| matches!(s, TypedStmt::Let { name, .. } if name == "scaled"));
+    assert!(scaled.is_some(), "let scaled should be present");
+}
+
+// ── M7: multi-statement kernel bodies + comparisons ──────────────────────────
+
+#[test]
+fn test_multi_stmt_kernel_with_comparison_ok() {
+    let src = r#"
+kernel relu_backward(grad_out: Tensor<f32>, x: Tensor<f32>) -> Tensor<f32>:
+    let mask = x > 0.0
+    return grad_out * mask
+
+fn main():
+    let g = Tensor.gpu<f32>([1.0, 2.0, 3.0])
+    let x = Tensor.gpu<f32>([1.0, -1.0, 0.5])
+    let d = relu_backward(g, x)
+    print(d)
+"#;
+    let typed = check_src(src).expect("relu_backward should type-check");
+    assert_eq!(typed.kernels.len(), 1);
+    let k = &typed.kernels[0];
+    assert_eq!(k.body.len(), 2, "kernel body should have 2 stmts: let mask + return");
+    // First stmt is Let{mask}, second is Return
+    assert!(matches!(&k.body[0], TypedStmt::Let { name, .. } if name == "mask"));
+    assert!(matches!(&k.body[1], TypedStmt::Return { .. }));
+}

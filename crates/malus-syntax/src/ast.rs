@@ -54,6 +54,19 @@ pub fn elementwise_builtin_name(op: &BinOp) -> Option<&'static str> {
     }
 }
 
+/// Builtin kernel name for scalar-broadcast ops: `Tensor op Scalar` or `Scalar op Tensor`.
+/// `scalar_on_right` = true means `tensor op scalar` (e.g. `a * 0.5`).
+/// For commutative ops (Add, Mul), `scalar_on_right=false` canonicalises to the right form.
+pub fn scalar_broadcast_builtin_name(op: &BinOp, scalar_on_right: bool) -> Option<&'static str> {
+    match op {
+        BinOp::Add => Some("malus_add_scalar"),
+        BinOp::Sub => if scalar_on_right { Some("malus_sub_scalar") } else { Some("malus_rsub_scalar") },
+        BinOp::Mul => Some("malus_mul_scalar"),
+        BinOp::Div => if scalar_on_right { Some("malus_div_scalar") } else { Some("malus_rdiv_scalar") },
+        _ => None,
+    }
+}
+
 // ── Literals ──────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]
@@ -95,6 +108,8 @@ pub struct Stmt {
 #[derive(Debug, Clone, PartialEq)]
 pub enum StmtKind {
     Let { name: String, expr: Expr },
+    LetMut { name: String, expr: Expr },
+    Assign { target: String, expr: Expr },
     Return { expr: Expr },
     Expr(Expr),
 }

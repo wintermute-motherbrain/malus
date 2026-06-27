@@ -64,9 +64,10 @@ Kernel body constraint that stays: the final statement must be `Return`. No cont
 - Add `TypedStmt::Assign { name: String, expr: TypedExpr }` (LetMut maps to existing `TypedStmt::Let`; mutability is a sema concern, not IR)
 
 **CTMM** (`malus-sema/src/ctmm.rs`):
-- Reassignment of a tensor binding = drop the old value + bind the new one
-- In `find_last_uses`, treat an `Assign` to name `x` as: `x`'s last use is the point just before this `Assign` statement (if `x` holds a tensor), then `x` is re-bound
-- In `insert_drops`, an `Assign` that replaces a tensor binding should emit a `Drop` for the old binding immediately before the `Assign`
+- Reassignment of a tensor binding = drop the old value + bind the new one.
+- The naïve "emit Drop immediately before Assign" is a use-after-free when the RHS reads the target (e.g. `acc = acc + delta` — the old `acc` is read by `acc + delta`). See ADR-0011.
+- Correct approach: `hoist_gpu_subexprs` runs first and hoists `acc + delta` into a temp (`let __t0 = acc + delta; acc = __t0`), eliminating the self-reference. Then `insert_assign_drops` emits `Drop{acc}` before the Assign safely.
+- The hoisted temp's allocation is "moved" into `acc` — `collect_escaping` marks it as escaping so it gets no separate Drop (the target's final Drop frees it).
 
 **Codegen-cpu** (`malus-codegen-cpu/src/lib.rs`):
 - `LetMut` declares a Cranelift variable the same way `Let` does
@@ -84,18 +85,18 @@ This is M5.2 — specced but never implemented.
 ```
 Extend the `else if` to allow `Tensor<dtype> op Scalar(dtype)` and `Scalar(dtype) op Tensor<dtype>` for arithmetic ops (`Add`, `Sub`, `Mul`, `Div`). Result type is `Tensor<dtype>`. Reject comparison ops and matmul with mixed tensor+scalar.
 
-**Codegen-gpu** — synthesize `malus_add_scalar`, `malus_sub_scalar`, `malus_mul_scalar`, `malus_div_scalar` built-in kernels. Pattern:
+**Codegen-gpu** — synthesize six scalar-broadcast built-in kernels (see D7 in grilling session). Buffer layout: `a@0, scalar_val@1, out@2`. Pattern:
 ```msl
-kernel void malus_mul_scalar(
+kernel void malus_kernel_N(
     device float* a [[buffer(0)]],
-    device float* out [[buffer(1)]],
-    device float* scalar_val [[buffer(2)]],  // single-element buffer
+    device float* scalar_val [[buffer(1)]],  // single-element buffer
+    device float* out [[buffer(2)]],
     uint tid [[thread_position_in_grid]]
 ) {
-    out[tid] = a[tid] * scalar_val[0];
+    out[tid] = (a[tid] * scalar_val[0]);
 }
 ```
-Follow the same `elementwise_builtin_name` + sequential ID pattern from M5.1 (ADR-0010).
+The six kernels: `malus_add_scalar`, `malus_mul_scalar` (commutative; scalar-on-left uses the same kernel), `malus_sub_scalar`/`malus_div_scalar` (tensor-left), `malus_rsub_scalar`/`malus_rdiv_scalar` (scalar-left reversed). Follow the same sequential ID pattern from M5.1 (ADR-0010).
 
 **Codegen-cpu** — detect `BinOp` where one operand is `Tensor` and the other is `Scalar`. Wrap the scalar in a single-element `tensor_alloc_gpu` call, then dispatch to the scalar broadcast built-in kernel.
 
