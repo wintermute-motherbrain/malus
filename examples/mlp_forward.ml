@@ -7,7 +7,7 @@ fn main():
     let w1 = ones(3, 4)
     let w2 = ones(4, 2)
     let out = forward(x, w1, w2)
-    println("forward output: {}", out)
+    println("forward output: {} of length {}", out, out.len)
     let s = sum(out)
     println("sum: {}", s)
     let wt = transpose(w1)
