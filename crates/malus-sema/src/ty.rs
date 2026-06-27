@@ -19,6 +19,8 @@ pub enum ResolvedTy {
         name: String,
         variants: Vec<(String, Vec<(String, ResolvedTy)>)>,
     },
+    /// Fixed-length homogeneous array `Array<T, N>`.
+    Array { elem: Box<ResolvedTy>, len: usize },
 }
 
 impl fmt::Display for ResolvedTy {
@@ -40,6 +42,7 @@ impl fmt::Display for ResolvedTy {
             ResolvedTy::Unit => write!(f, "None"),
             ResolvedTy::Struct { name, .. } => write!(f, "{}", name),
             ResolvedTy::Enum { name, .. } => write!(f, "{}", name),
+            ResolvedTy::Array { elem, len } => write!(f, "Array<{}, {}>", elem, len),
         }
     }
 }
@@ -76,6 +79,24 @@ impl ResolvedTy {
     pub fn enum_variants(&self) -> Option<&[(String, Vec<(String, ResolvedTy)>)]> {
         match self {
             ResolvedTy::Enum { variants, .. } => Some(variants),
+            _ => None,
+        }
+    }
+
+    pub fn is_array(&self) -> bool {
+        matches!(self, ResolvedTy::Array { .. })
+    }
+
+    pub fn array_elem(&self) -> Option<&ResolvedTy> {
+        match self {
+            ResolvedTy::Array { elem, .. } => Some(elem),
+            _ => None,
+        }
+    }
+
+    pub fn array_len(&self) -> Option<usize> {
+        match self {
+            ResolvedTy::Array { len, .. } => Some(*len),
             _ => None,
         }
     }

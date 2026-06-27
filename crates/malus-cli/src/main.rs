@@ -1,7 +1,9 @@
-// Entry point for the `malus` CLI.
-// Usage:
-//   malus <script.ml>   — JIT-compile and run a script
-//   malus               — drop into the interactive REPL (v1)
+use ariadne::{sources, Color, Label, Report, ReportKind};
+use malus_loader::LoadError;
+use malus_sema::SemaError;
+use malus_syntax::FileId;
+use std::collections::HashMap;
+use std::path::PathBuf;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -11,20 +13,84 @@ fn main() {
     }
 }
 
+fn path_str(srcs: &HashMap<FileId, (PathBuf, String)>, fid: FileId) -> String {
+    srcs.get(&fid)
+        .map(|(p, _)| p.display().to_string())
+        .unwrap_or_else(|| "<unknown>".into())
+}
+
+fn src_pairs(srcs: &HashMap<FileId, (PathBuf, String)>) -> Vec<(String, String)> {
+    srcs.values()
+        .map(|(p, s)| (p.display().to_string(), s.clone()))
+        .collect()
+}
+
+fn emit_sema_error(e: &SemaError, srcs: &HashMap<FileId, (PathBuf, String)>) {
+    let Some(s) = e.primary_span() else {
+        eprintln!("error: {e}");
+        return;
+    };
+
+    let fname = path_str(srcs, s.file);
+    let mut b = Report::build(ReportKind::Error, fname.clone(), s.start as usize)
+        .with_message(format!("{e}"))
+        .with_label(
+            Label::new((fname.clone(), s.start as usize..s.end as usize))
+                .with_message(e.label())
+                .with_color(Color::Red),
+        );
+
+    if let Some(s2) = e.secondary_span() {
+        let fname2 = path_str(srcs, s2.file);
+        b = b.with_label(
+            Label::new((fname2, s2.start as usize..s2.end as usize))
+                .with_message("previously defined here")
+                .with_color(Color::Yellow),
+        );
+    }
+
+    if let Some(note) = e.note() {
+        b = b.with_note(note);
+    }
+
+    b.finish().eprint(sources(src_pairs(srcs))).unwrap();
+}
+
+fn emit_load_error(e: &LoadError) {
+    match e {
+        LoadError::Parse { error, path, source } => {
+            let fname = path.display().to_string();
+            let s = error.span;
+            Report::build(ReportKind::Error, fname.clone(), s.start as usize)
+                .with_message(format!("parse error: {error}"))
+                .with_label(
+                    Label::new((fname.clone(), s.start as usize..s.end as usize))
+                        .with_message("unexpected token here")
+                        .with_color(Color::Red),
+                )
+                .finish()
+                .eprint(sources([(fname, source.clone())]))
+                .unwrap();
+        }
+        other => eprintln!("error: {other}"),
+    }
+}
+
 fn run_script(path: &str) {
     let abs = std::path::Path::new(path);
     let loaded = match malus_loader::ModuleLoader::new().load(abs) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("malus: {}", e);
+            emit_load_error(&e);
             std::process::exit(1);
         }
     };
+
     let typed = match malus_sema::check(&loaded.program, &loaded.module_aliases) {
         Ok(t) => t,
         Err(errors) => {
             for e in &errors {
-                eprintln!("malus: {}", e);
+                emit_sema_error(e, &loaded.sources);
             }
             std::process::exit(1);
         }
@@ -35,7 +101,7 @@ fn run_script(path: &str) {
         let (registry, kernel_ids) = match malus_codegen_gpu::compile_kernels(&typed) {
             Ok(result) => result,
             Err(e) => {
-                eprintln!("malus: {}", e);
+                eprintln!("error: {e}");
                 std::process::exit(1);
             }
         };
@@ -58,7 +124,7 @@ fn run_script(path: &str) {
             tensor_release:         malus_runtime::tensor_release,
         };
         if let Err(e) = malus_codegen_cpu::compile_and_run(&typed, &symbols, &kernel_ids) {
-            eprintln!("malus: {}", e);
+            eprintln!("error: {e}");
             std::process::exit(1);
         }
     }
@@ -66,12 +132,12 @@ fn run_script(path: &str) {
     #[cfg(not(target_os = "macos"))]
     {
         let _ = &typed;
-        eprintln!("malus: Metal runtime requires macOS");
+        eprintln!("error: Metal runtime requires macOS");
         std::process::exit(1);
     }
 }
 
 fn run_repl() {
-    eprintln!("malus: REPL not yet implemented");
+    eprintln!("error: REPL not yet implemented");
     std::process::exit(1);
 }

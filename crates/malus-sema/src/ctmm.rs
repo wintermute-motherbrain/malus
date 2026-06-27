@@ -60,6 +60,9 @@ fn annotate_body(body: &mut Vec<TypedStmt>) {
     insert_assign_drops(body, &escaping);
     let last_uses = find_last_uses(body, &locals, &escaping);
     insert_drops(body, &last_uses, &local_types);
+    // Step 8.5: inject Drop/DropStruct before early Returns inside nested scopes
+    // for bindings whose end-of-scope Drop is after the control-flow node.
+    inject_early_return_unwinds(body, &local_types);
     insert_barriers(body);
 }
 
@@ -72,7 +75,9 @@ fn recurse_into_inner_scopes(body: &mut Vec<TypedStmt>) {
                 annotate_body(then_body);
                 if let Some(eb) = else_body { annotate_body(eb); }
             }
-            TypedStmt::For { body, .. } | TypedStmt::While { body, .. } => {
+            TypedStmt::For { body, .. }
+            | TypedStmt::While { body, .. }
+            | TypedStmt::ForIn { body, .. } => {
                 annotate_body(body);
             }
             _ => {}
@@ -172,33 +177,34 @@ fn hoist_gpu_in_expr(
             }
         }
         TypedExprKind::BinOp { op, lhs, rhs } => {
+            // Recurse into operands first, then hoist any GPU-producing operand
+            // into a __malus_tmp so the existing Drop machinery can free it.
+            let lhs = hoist_gpu_in_expr(*lhs, hoisted, counter);
+            let rhs = hoist_gpu_in_expr(*rhs, hoisted, counter);
+            let lhs = hoist_if_gpu_tensor(lhs, hoisted, counter);
+            let rhs = hoist_if_gpu_tensor(rhs, hoisted, counter);
             TypedExpr {
-                kind: TypedExprKind::BinOp {
-                    op,
-                    lhs: Box::new(hoist_gpu_in_expr(*lhs, hoisted, counter)),
-                    rhs: Box::new(hoist_gpu_in_expr(*rhs, hoisted, counter)),
-                },
+                kind: TypedExprKind::BinOp { op, lhs: Box::new(lhs), rhs: Box::new(rhs) },
                 span,
                 ..expr
             }
         }
         TypedExprKind::Unary { op, operand } => {
+            let operand = hoist_gpu_in_expr(*operand, hoisted, counter);
+            let operand = hoist_if_gpu_tensor(operand, hoisted, counter);
             TypedExpr {
-                kind: TypedExprKind::Unary {
-                    op,
-                    operand: Box::new(hoist_gpu_in_expr(*operand, hoisted, counter)),
-                },
+                kind: TypedExprKind::Unary { op, operand: Box::new(operand) },
                 span,
                 ..expr
             }
         }
-        TypedExprKind::TensorLiteral { placement, dtype, elements } => {
+        TypedExprKind::TensorLiteral { placement, dtype, elements, shape } => {
             let new_elements = elements
                 .into_iter()
                 .map(|e| hoist_gpu_in_expr(e, hoisted, counter))
                 .collect();
             TypedExpr {
-                kind: TypedExprKind::TensorLiteral { placement, dtype, elements: new_elements },
+                kind: TypedExprKind::TensorLiteral { placement, dtype, elements: new_elements, shape },
                 span,
                 ..expr
             }
@@ -225,7 +231,39 @@ fn hoist_gpu_in_expr(
                 ..expr
             }
         }
+        TypedExprKind::ArrayLiteral { elements } => {
+            let new_elements = elements
+                .into_iter()
+                .map(|e| hoist_gpu_in_expr(e, hoisted, counter))
+                .collect();
+            TypedExpr {
+                kind: TypedExprKind::ArrayLiteral { elements: new_elements },
+                span,
+                ..expr
+            }
+        }
         _ => expr,
+    }
+}
+
+/// Hoist `operand` into a `__malus_tmp` Let if it is GPU-producing and
+/// tensor-typed, so the existing last-use/Drop machinery can free it.
+/// Mirrors the logic in `hoist_args` but for BinOp/Unary operands.
+fn hoist_if_gpu_tensor(
+    operand: TypedExpr,
+    hoisted: &mut Vec<TypedStmt>,
+    counter: &mut u32,
+) -> TypedExpr {
+    if is_gpu_producing(&operand) && operand.ty.is_tensor() {
+        let name = format!("__malus_tmp_{}", counter);
+        *counter += 1;
+        let ty = operand.ty.clone();
+        let placement = operand.placement;
+        let span = operand.span;
+        hoisted.push(TypedStmt::Let { name: name.clone(), expr: operand });
+        TypedExpr { kind: TypedExprKind::Ident(name), ty, placement, span }
+    } else {
+        operand
     }
 }
 
@@ -289,44 +327,98 @@ fn hoist_gpu_producing_returns(body: &mut Vec<TypedStmt>) {
 
 // ── Phase 0: Assign old-value drops ──────────────────────────────────────────
 
-/// Insert `Drop{name}` immediately before each `Assign` to a tensor binding.
-/// Frees the old tensor allocation before the Assign writes the new value.
+/// Insert a Drop/DropStruct/DropEnum before each `Assign` to an owned binding.
+/// Frees the old allocation before the Assign writes the new value.
 ///
-/// The `locals.contains(name)` guard from the original code is intentionally
-/// absent (see ADR-0014 §4): the type checker guarantees only `let mut` bindings
-/// appear as Assign targets (never parameters), so checking against the outer
-/// `locals` set is unnecessary and would incorrectly suppress drops for outer
-/// `let mut` tensors reassigned inside a loop body.
+/// Extended in M11 to cover Struct and Enum targets in addition to tensors.
+/// The `locals.contains(name)` guard is intentionally absent (see ADR-0014 §4).
 ///
-/// Must run after `hoist_gpu_subexprs` (which ensures the Assign RHS no longer
-/// references the target via the D6 guard, making the early Drop safe).
+/// Must run after `hoist_gpu_subexprs` (D6 guard ensures the RHS no longer
+/// references the target, making the early Drop safe).
 fn insert_assign_drops(body: &mut Vec<TypedStmt>, escaping: &HashSet<String>) {
     let mut i = 0;
     while i < body.len() {
         match &body[i] {
-            TypedStmt::Assign { name, expr }
-                if !escaping.contains(name) && expr.ty.is_tensor() =>
-            {
-                let name = name.clone();
-                body.insert(i, TypedStmt::Drop { name });
-                i += 1; // skip past the Drop we just inserted
+            TypedStmt::Assign { name, expr } if !escaping.contains(name) => {
+                if let Some(drop_stmt) = make_drop_stmt_for_ty(name, &expr.ty) {
+                    body.insert(i, drop_stmt);
+                    i += 1;
+                }
             }
             _ => {}
         }
-        // Recurse into inner bodies so outer-scope `let mut` tensors reassigned
+        // Recurse into inner bodies so outer-scope `let mut` bindings reassigned
         // inside a loop get a Drop before each inner Assign.
         match &mut body[i] {
             TypedStmt::If { then_body, else_body, .. } => {
                 insert_assign_drops(then_body, escaping);
                 if let Some(eb) = else_body { insert_assign_drops(eb, escaping); }
             }
-            TypedStmt::For { body: inner, .. } | TypedStmt::While { body: inner, .. } => {
+            TypedStmt::For { body: inner, .. }
+            | TypedStmt::While { body: inner, .. }
+            | TypedStmt::ForIn { body: inner, .. } => {
                 insert_assign_drops(inner, escaping);
             }
             _ => {}
         }
         i += 1;
     }
+}
+
+/// Build the appropriate drop statement for a named binding of the given type.
+/// Returns `None` for types that own no heap resources (scalar, bool, unit).
+fn make_drop_stmt_for_ty(name: &str, ty: &ResolvedTy) -> Option<TypedStmt> {
+    match ty {
+        ResolvedTy::Tensor { .. } => Some(TypedStmt::Drop { name: name.to_string() }),
+        ResolvedTy::Struct { fields, .. } => {
+            let droppable_fields = droppable_struct_fields(fields);
+            Some(TypedStmt::DropStruct { name: name.to_string(), droppable_fields })
+        }
+        ResolvedTy::Enum { variants, .. } => {
+            let drop_variants = droppable_enum_variants(variants);
+            Some(TypedStmt::DropEnum { name: name.to_string(), variants: drop_variants })
+        }
+        // All arrays own heap memory (the box itself), so always emit DropArray.
+        // Codegen handles whether to loop and release elements (only for owned types).
+        ResolvedTy::Array { elem, len } => {
+            Some(TypedStmt::DropArray { name: name.to_string(), elem_ty: *elem.clone(), len: *len })
+        }
+        _ => None,
+    }
+}
+
+fn droppable_struct_fields(fields: &[(String, ResolvedTy)]) -> Vec<(usize, ResolvedTy)> {
+    fields.iter()
+        .enumerate()
+        .filter_map(|(i, (_, ty))| {
+            if ty.is_tensor() || ty.is_struct() || ty.is_enum() {
+                Some((i, ty.clone()))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn droppable_enum_variants(
+    variants: &[(String, Vec<(String, ResolvedTy)>)],
+) -> Vec<(u32, Vec<(usize, ResolvedTy)>)> {
+    variants.iter()
+        .enumerate()
+        .map(|(tag, (_, fields))| {
+            let droppable = fields.iter()
+                .enumerate()
+                .filter_map(|(i, (_, ty))| {
+                    if ty.is_tensor() || ty.is_struct() || ty.is_enum() {
+                        Some((i, ty.clone()))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            (tag as u32, droppable)
+        })
+        .collect()
 }
 
 // ── Phase 1: Drop insertion ───────────────────────────────────────────────────
@@ -350,23 +442,134 @@ fn insert_drops(
         let insert_pos = idx + 1;
         let mut offset = 0;
         for name in &names {
-            let stmt = match local_types.get(name.as_str()) {
-                Some(ResolvedTy::Tensor { .. }) => TypedStmt::Drop { name: name.clone() },
-                Some(ResolvedTy::Struct { fields, .. }) => {
-                    let tensor_field_indices = fields.iter()
-                        .enumerate()
-                        .filter_map(|(i, (_, ty))| if ty.is_tensor() { Some(i) } else { None })
-                        .collect();
-                    TypedStmt::DropStruct { name: name.clone(), tensor_field_indices }
-                }
-                // Enum, Scalar, Bool, Unit — no drop needed in M10
-                // (enum-payload tensor RC deferred to M11).
-                _ => { continue; }
+            let ty = match local_types.get(name.as_str()) {
+                Some(t) => t,
+                None => continue,
+            };
+            let stmt = match make_drop_stmt_for_ty(name, ty) {
+                Some(s) => s,
+                None => continue,
             };
             body.insert(insert_pos + offset, stmt);
             offset += 1;
         }
     }
+}
+
+// ── Phase 1.5: Early-return unwind ───────────────────────────────────────────
+//
+// After `insert_drops` places Drop nodes in the outer body, scan for Returns
+// nested inside If/For/While bodies.  Any outer binding whose Drop is placed
+// AFTER a control-flow node containing an early Return would be leaked.  Inject
+// Drop/DropStruct before the Return so the binding is freed on every exit path.
+
+fn inject_early_return_unwinds(
+    body: &mut Vec<TypedStmt>,
+    local_types: &HashMap<String, ResolvedTy>,
+) {
+    // Map name → position of its Drop/DropStruct/DropEnum/DropArray in the outer body.
+    let mut drop_positions: HashMap<String, usize> = HashMap::new();
+    for (i, stmt) in body.iter().enumerate() {
+        match stmt {
+            TypedStmt::Drop { name }
+            | TypedStmt::DropStruct { name, .. }
+            | TypedStmt::DropEnum { name, .. }
+            | TypedStmt::DropArray { name, .. } => {
+                drop_positions.insert(name.clone(), i);
+            }
+            _ => {}
+        }
+    }
+    if drop_positions.is_empty() {
+        return;
+    }
+
+    // For each control-flow node at outer position i, any binding whose Drop
+    // is after i is "live" there and needs unwinding at any early Return inside.
+    for i in 0..body.len() {
+        let live_here: HashSet<String> = drop_positions.iter()
+            .filter(|(_, &pos)| pos > i)
+            .map(|(name, _)| name.clone())
+            .collect();
+        if live_here.is_empty() {
+            continue;
+        }
+        // We can't hold a mutable borrow to body[i] via index while also
+        // having live_here referencing drop_positions — use an index match.
+        let is_cf = matches!(&body[i],
+            TypedStmt::If { .. } | TypedStmt::For { .. }
+            | TypedStmt::While { .. } | TypedStmt::ForIn { .. });
+        if !is_cf {
+            continue;
+        }
+        match &mut body[i] {
+            TypedStmt::If { then_body, else_body, .. } => {
+                inject_unwind_in_body(then_body, &live_here, local_types);
+                if let Some(eb) = else_body {
+                    inject_unwind_in_body(eb, &live_here, local_types);
+                }
+            }
+            TypedStmt::For { body: inner, .. }
+            | TypedStmt::While { body: inner, .. }
+            | TypedStmt::ForIn { body: inner, .. } => {
+                inject_unwind_in_body(inner, &live_here, local_types);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn inject_unwind_in_body(
+    body: &mut Vec<TypedStmt>,
+    live_outer: &HashSet<String>,
+    local_types: &HashMap<String, ResolvedTy>,
+) {
+    let mut i = 0;
+    while i < body.len() {
+        match &body[i] {
+            TypedStmt::Return { expr } => {
+                let mut keep = HashSet::new();
+                collect_idents_in_expr(expr, &mut keep);
+                let mut to_drop: Vec<String> = live_outer
+                    .iter()
+                    .filter(|n| !keep.contains(*n) && local_types.contains_key(n.as_str()))
+                    .cloned()
+                    .collect();
+                to_drop.sort();
+                for name in &to_drop {
+                    if let Some(stmt) = make_unwind_drop(name, local_types) {
+                        body.insert(i, stmt);
+                        i += 1;
+                    }
+                }
+                // Skip past the Return (no inner scopes inside it).
+            }
+            TypedStmt::If { .. } | TypedStmt::For { .. }
+            | TypedStmt::While { .. } | TypedStmt::ForIn { .. } => {
+                // Recurse into nested control flow.
+                match &mut body[i] {
+                    TypedStmt::If { then_body, else_body, .. } => {
+                        inject_unwind_in_body(then_body, live_outer, local_types);
+                        if let Some(eb) = else_body {
+                            inject_unwind_in_body(eb, live_outer, local_types);
+                        }
+                    }
+                    TypedStmt::For { body: inner, .. }
+                    | TypedStmt::While { body: inner, .. }
+                    | TypedStmt::ForIn { body: inner, .. } => {
+                        inject_unwind_in_body(inner, live_outer, local_types);
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+}
+
+fn make_unwind_drop(name: &str, local_types: &HashMap<String, ResolvedTy>) -> Option<TypedStmt> {
+    local_types.get(name).and_then(|ty| make_drop_stmt_for_ty(name, ty))
 }
 
 // ── Phase 2: Barrier insertion (GPU-pending set) ──────────────────────────────
@@ -395,7 +598,8 @@ fn insert_barriers(body: &mut Vec<TypedStmt>) {
         // Control-flow nodes: if any pending tensor is referenced anywhere inside
         // the node, emit a barrier before it and clear pending.  The inner bodies
         // already received their own barrier pass in `annotate_body` step 3.
-        if matches!(&body[i], TypedStmt::If { .. } | TypedStmt::For { .. } | TypedStmt::While { .. }) {
+        if matches!(&body[i], TypedStmt::If { .. } | TypedStmt::For { .. }
+                | TypedStmt::While { .. } | TypedStmt::ForIn { .. }) {
             if !pending.is_empty() {
                 let mut referenced = HashSet::new();
                 collect_idents_in_stmt(&body[i], &mut referenced);
@@ -443,6 +647,8 @@ fn extract_gpu_producing_expr(stmt: &TypedStmt) -> Option<(Vec<String>, Option<S
         TypedStmt::Return { expr } => (expr, None),
         TypedStmt::Drop { .. }
         | TypedStmt::DropStruct { .. }
+        | TypedStmt::DropEnum { .. }
+        | TypedStmt::DropArray { .. }
         | TypedStmt::GpuBarrier
         | TypedStmt::Assign { .. }
         | TypedStmt::If { .. }
@@ -450,7 +656,8 @@ fn extract_gpu_producing_expr(stmt: &TypedStmt) -> Option<(Vec<String>, Option<S
         | TypedStmt::While { .. }
         | TypedStmt::Match { .. }
         | TypedStmt::Retain { .. }
-        | TypedStmt::Release { .. } => return None,
+        | TypedStmt::Release { .. }
+        | TypedStmt::ForIn { .. } => return None,
     };
     match &expr.kind {
         TypedExprKind::KernelCall { in_flight, .. } => {
@@ -514,7 +721,9 @@ fn collect_escaping_in(body: &[TypedStmt], out: &mut HashSet<String>) {
                 collect_escaping_in(then_body, out);
                 if let Some(eb) = else_body { collect_escaping_in(eb, out); }
             }
-            TypedStmt::For { body, .. } | TypedStmt::While { body, .. } => {
+            TypedStmt::For { body, .. }
+            | TypedStmt::While { body, .. }
+            | TypedStmt::ForIn { body, .. } => {
                 collect_escaping_in(body, out);
             }
             _ => {}
@@ -554,6 +763,8 @@ fn collect_idents_in_stmt(stmt: &TypedStmt, out: &mut HashSet<String>) {
         TypedStmt::Expr(expr) => collect_idents_in_expr(expr, out),
         TypedStmt::Drop { .. }
         | TypedStmt::DropStruct { .. }
+        | TypedStmt::DropEnum { .. }
+        | TypedStmt::DropArray { .. }
         | TypedStmt::GpuBarrier
         | TypedStmt::Retain { .. }
         | TypedStmt::Release { .. } => {}
@@ -571,6 +782,10 @@ fn collect_idents_in_stmt(stmt: &TypedStmt, out: &mut HashSet<String>) {
         }
         TypedStmt::While { condition, body } => {
             collect_idents_in_expr(condition, out);
+            for s in body { collect_idents_in_stmt(s, out); }
+        }
+        TypedStmt::ForIn { iter, body, .. } => {
+            collect_idents_in_expr(iter, out);
             for s in body { collect_idents_in_stmt(s, out); }
         }
         TypedStmt::Match { scrutinee, arms } => {
@@ -609,6 +824,9 @@ fn collect_idents_in_expr(expr: &crate::typed_ir::TypedExpr, out: &mut HashSet<S
         }
         TypedExprKind::EnumInit { payload, .. } => {
             for p in payload { collect_idents_in_expr(p, out); }
+        }
+        TypedExprKind::ArrayLiteral { elements } => {
+            for e in elements { collect_idents_in_expr(e, out); }
         }
         TypedExprKind::Lit(_) => {}
     }

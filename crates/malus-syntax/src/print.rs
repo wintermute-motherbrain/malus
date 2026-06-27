@@ -116,6 +116,10 @@ fn print_stmt(out: &mut String, stmt: &Stmt, depth: usize) {
                 for s in &arm.body { print_stmt(out, s, depth + 2); }
             }
         }
+        StmtKind::ForIn { var, iter, body } => {
+            writeln!(out, "{indent}for {var} in {}:", print_expr(iter)).unwrap();
+            for s in body { print_stmt(out, s, depth + 1); }
+        }
     }
 }
 
@@ -152,13 +156,30 @@ fn print_expr(expr: &Expr) -> String {
         ExprKind::FieldAccess { base, field } => {
             format!("{}.{}", print_expr(base), field)
         }
-        ExprKind::TensorLiteral { placement, dtype, elements } => {
+        ExprKind::TensorLiteral { placement, dtype, elements, shape } => {
             let place = match placement {
                 Placement::Cpu => "cpu",
                 Placement::Gpu => "gpu",
             };
-            let elements_str = elements.iter().map(print_expr).collect::<Vec<_>>().join(", ");
-            format!("Tensor.{}<{}>([{}])", place, print_scalar_ty(dtype), elements_str)
+            let inner = if shape.len() == 2 {
+                // 2-D: print as [[row0],[row1],...]
+                let cols = shape[1];
+                let rows: Vec<String> = elements.chunks(cols.max(1))
+                    .map(|row| {
+                        let row_str = row.iter().map(print_expr).collect::<Vec<_>>().join(", ");
+                        format!("[{}]", row_str)
+                    })
+                    .collect();
+                format!("[{}]", rows.join(", "))
+            } else {
+                let elements_str = elements.iter().map(print_expr).collect::<Vec<_>>().join(", ");
+                format!("[{}]", elements_str)
+            };
+            format!("Tensor.{}<{}>({inner})", place, print_scalar_ty(dtype))
+        }
+        ExprKind::ArrayLiteral { elements } => {
+            let elems_str = elements.iter().map(|e| print_expr(e)).collect::<Vec<_>>().join(", ");
+            format!("[{}]", elems_str)
         }
     }
 }
@@ -238,6 +259,7 @@ fn print_ty(ty: &Ty) -> String {
             let inner = types.iter().map(print_ty).collect::<Vec<_>>().join(", ");
             format!("({})", inner)
         }
+        Ty::Array { elem, len } => format!("Array<{}, {}>", print_ty(elem), len),
     }
 }
 
@@ -372,6 +394,12 @@ mod tests {
                             ..arm
                         }).collect(),
                     },
+                StmtKind::ForIn { var, iter, body } =>
+                    StmtKind::ForIn {
+                        var,
+                        iter: Box::new(erase_expr(*iter, z)),
+                        body: body.into_iter().map(|s| erase_stmt(s, z)).collect(),
+                    },
             },
         }
     }
@@ -400,9 +428,13 @@ mod tests {
                 base: Box::new(erase_expr(*base, z)),
                 field,
             },
-            ExprKind::TensorLiteral { placement, dtype, elements } => ExprKind::TensorLiteral {
+            ExprKind::TensorLiteral { placement, dtype, elements, shape } => ExprKind::TensorLiteral {
                 placement,
                 dtype,
+                elements: elements.into_iter().map(|el| erase_expr(el, z)).collect(),
+                shape,
+            },
+            ExprKind::ArrayLiteral { elements } => ExprKind::ArrayLiteral {
                 elements: elements.into_iter().map(|el| erase_expr(el, z)).collect(),
             },
         };

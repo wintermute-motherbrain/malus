@@ -92,11 +92,26 @@ pub enum TypedStmt {
     /// Decrement the tensor's reference count; frees when it reaches zero
     /// (`tensor_release`). Not emitted by M9.
     Release { name: String },
-    // ── M10: aggregate types ─────────────────────────────────────────────────
-    /// CTMM: free a struct's heap box and release its tensor fields.
-    /// `tensor_field_indices` are the slot indices (0-based) of fields whose
-    /// type is `Tensor`, so codegen knows which slots to `tensor_release`.
-    DropStruct { name: String, tensor_field_indices: Vec<usize> },
+    // ── M11: fixed arrays ─────────────────────────────────────────────────────
+    /// `for var in <array_expr>: body`  (from AST `StmtKind::ForIn`).
+    ///
+    /// `var` is bound inside `body` to each element in declaration order.
+    /// Elements are borrowed — no ownership transfer; the array binding retains
+    /// ownership and is dropped in the outer scope after the ForIn exits.
+    ForIn { var: String, iter: TypedExpr, body: Vec<TypedStmt> },
+    // ── M10/M11: aggregate types ──────────────────────────────────────────────
+    /// CTMM: free a struct's heap box and recursively drop its owned fields.
+    /// `droppable_fields` is `(slot_index, field_ty)` for every field that owns
+    /// heap resources (Tensor, Struct, Enum, Array).  Codegen recurses based on
+    /// the type so nested aggregates are fully released before the box is freed.
+    DropStruct { name: String, droppable_fields: Vec<(usize, ResolvedTy)> },
+    /// CTMM (M11): free an enum's heap box, releasing the active variant's
+    /// owned fields.  `variants` is `(tag_value, droppable_fields)` where
+    /// droppable_fields follows the same `(slot_index, field_ty)` convention as
+    /// `DropStruct`.  Codegen emits a tag-switch + per-arm release + shared free.
+    DropEnum { name: String, variants: Vec<(u32, Vec<(usize, ResolvedTy)>)> },
+    /// CTMM (M11): release each element of a fixed array (Phase 4 implementation).
+    DropArray { name: String, elem_ty: ResolvedTy, len: usize },
     /// Exhaustive `match` on an enum binding.
     Match { scrutinee: TypedExpr, arms: Vec<TypedMatchArm> },
 }
@@ -155,10 +170,18 @@ pub enum TypedExprKind {
         placement: Placement,
         dtype: ScalarTy,
         elements: Vec<TypedExpr>,
+        /// Row-major shape inferred from the literal syntax.  1-D literals have
+        /// `shape = [N]`; 2-D literals have `shape = [rows, cols]`.
+        shape: Vec<usize>,
     },
     FieldAccess {
         base: Box<TypedExpr>,
         field: String,
+    },
+    // ── M11: fixed arrays ────────────────────────────────────────────────────
+    /// `[e1, e2, e3]` — typed array literal. All elements have the same type.
+    ArrayLiteral {
+        elements: Vec<TypedExpr>,
     },
     // ── M10: aggregate constructors ──────────────────────────────────────────
     /// Struct construction: fields reordered to declaration order.

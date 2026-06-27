@@ -619,6 +619,9 @@ fn flat_stmt_kinds(stmts: &[TypedStmt]) -> Vec<&'static str> {
             TypedStmt::Retain { .. }    => "Retain",
             TypedStmt::Release { .. }   => "Release",
             TypedStmt::DropStruct { .. } => "DropStruct",
+            TypedStmt::DropEnum { .. }   => "DropEnum",
+            TypedStmt::DropArray { .. }  => "DropArray",
+            TypedStmt::ForIn { .. }      => "ForIn",
             TypedStmt::Match { .. }     => "Match",
         };
         out.push(tag);
@@ -750,4 +753,306 @@ fn main():
     for f in &typed.fns {
         assert!(!has_rc(&f.body), "M9 must emit no Retain/Release — found some in fn {}", f.name);
     }
+}
+
+// ── M11: CTMM — operand hoist + early-return unwind ──────────────────────────
+
+/// Nested BinOp: `(a + b) * c` — the inner `a+b` result must be hoisted into a
+/// `__malus_tmp_N` Let so CTMM can drop it.
+#[test]
+fn test_ctmm_binop_operand_hoisted_to_tmp() {
+    let src = r#"
+kernel add(a: Tensor<f32>, b: Tensor<f32>) -> Tensor<f32>:
+    return a + b
+
+kernel mul(a: Tensor<f32>, b: Tensor<f32>) -> Tensor<f32>:
+    return a * b
+
+fn main():
+    let a = Tensor.gpu<f32>([1.0, 2.0])
+    let b = Tensor.gpu<f32>([3.0, 4.0])
+    let c = Tensor.gpu<f32>([5.0, 6.0])
+    let result = mul(add(a, b), c)
+    print(result)
+"#;
+    let typed = check_src(src).expect("should type-check");
+    let main = typed.fns.iter().find(|f| f.name == "main").unwrap();
+
+    // After hoisting, a `__malus_tmp` Let must appear for the `add(a,b)` result.
+    let has_tmp_let = main.body.iter().any(|s| {
+        if let TypedStmt::Let { name, .. } = s {
+            name.starts_with("__malus_tmp")
+        } else {
+            false
+        }
+    });
+    assert!(has_tmp_let, "expected a __malus_tmp Let to be hoisted; body:\n{:#?}", main.body);
+
+    // Each hoisted tmp must also have a corresponding Drop.
+    let tmp_let_names: Vec<_> = main.body.iter().filter_map(|s| {
+        if let TypedStmt::Let { name, .. } = s {
+            if name.starts_with("__malus_tmp") { Some(name.as_str()) } else { None }
+        } else {
+            None
+        }
+    }).collect();
+    for tmp in &tmp_let_names {
+        let has_drop = main.body.iter().any(|s| matches!(s, TypedStmt::Drop { name } if name == *tmp));
+        assert!(has_drop, "hoisted tmp {tmp} must have a Drop; body:\n{:#?}", main.body);
+    }
+}
+
+/// Early-return inside a for loop: outer tensor `a` is used after the loop
+/// (CTMM places Drop(a) after the For node).  The unwind pass must also inject
+/// Drop(a) before the inner Return so it is not leaked on the early-exit path.
+#[test]
+fn test_ctmm_early_return_in_for_unwinds_outer_drop() {
+    let src = r#"
+fn make() -> Tensor<f32>:
+    let a = Tensor.gpu<f32>([1.0, 2.0])
+    let b = Tensor.gpu<f32>([3.0, 4.0])
+    for i in range(3):
+        return b
+    print(a)
+    return b
+
+fn main():
+    let t = make()
+    print(t)
+"#;
+    let typed = check_src(src).expect("should type-check");
+    let make_fn = typed.fns.iter().find(|f| f.name == "make").unwrap();
+
+    // CTMM places Drop(a) after the For node (last use of a is print(a) after the loop).
+    let drop_a_after_for = {
+        let for_idx = make_fn.body.iter().position(|s| matches!(s, TypedStmt::For { .. }))
+            .expect("For node not found");
+        make_fn.body[for_idx..].iter()
+            .any(|s| matches!(s, TypedStmt::Drop { name } if name == "a"))
+    };
+    assert!(drop_a_after_for, "Drop(a) must be placed after the For node in the outer body");
+
+    // The unwind pass must also inject Drop(a) before the inner Return.
+    let for_body = make_fn.body.iter().find_map(|s| {
+        if let TypedStmt::For { body, .. } = s { Some(body.as_slice()) } else { None }
+    }).expect("For node not found");
+
+    let return_idx = for_body.iter().position(|s| matches!(s, TypedStmt::Return { .. }))
+        .expect("Return not found in for body");
+    let drop_a_before_return = for_body[..return_idx].iter()
+        .any(|s| matches!(s, TypedStmt::Drop { name } if name == "a"));
+    assert!(
+        drop_a_before_return,
+        "Drop(a) must appear before the early Return inside the for body; for_body:\n{:#?}",
+        for_body
+    );
+}
+
+/// Early-return inside an if branch: outer tensor `a` is used after the if
+/// (CTMM places Drop(a) after the If node).  The unwind pass must inject
+/// Drop(a) before the early Return inside the then-branch.
+#[test]
+fn test_ctmm_early_return_in_if_unwinds_outer_drop() {
+    let src = r#"
+fn make(x: Tensor<f32>) -> Tensor<f32>:
+    let a = Tensor.gpu<f32>([1.0, 2.0])
+    let b = Tensor.gpu<f32>([3.0, 4.0])
+    if x.len > 0:
+        return b
+    print(a)
+    return b
+
+fn main():
+    let x = Tensor.gpu<f32>([1.0])
+    let t = make(x)
+    print(t)
+"#;
+    let typed = check_src(src).expect("should type-check");
+    let make_fn = typed.fns.iter().find(|f| f.name == "make").unwrap();
+
+    // CTMM places Drop(a) after the If node.
+    let drop_a_after_if = {
+        let if_idx = make_fn.body.iter().position(|s| matches!(s, TypedStmt::If { .. }))
+            .expect("If node not found");
+        make_fn.body[if_idx..].iter()
+            .any(|s| matches!(s, TypedStmt::Drop { name } if name == "a"))
+    };
+    assert!(drop_a_after_if, "Drop(a) must be placed after the If node in the outer body");
+
+    let if_stmt = make_fn.body.iter().find(|s| matches!(s, TypedStmt::If { .. }))
+        .expect("If node not found");
+    let TypedStmt::If { then_body, .. } = if_stmt else { panic!() };
+
+    let return_idx = then_body.iter().position(|s| matches!(s, TypedStmt::Return { .. }))
+        .expect("Return not found in then_body");
+    let drop_a_before_return = then_body[..return_idx].iter()
+        .any(|s| matches!(s, TypedStmt::Drop { name } if name == "a"));
+    assert!(
+        drop_a_before_return,
+        "Drop(a) must appear before the early Return inside the if branch; then_body:\n{:#?}",
+        then_body
+    );
+}
+
+// ── M11: CTMM — DropEnum + aggregate assign drops ────────────────────────────
+
+/// Enum binding with a tensor-carrying variant must emit `DropEnum` at end of
+/// scope, not just a plain `Drop`.
+#[test]
+fn test_ctmm_enum_binding_emits_drop_enum() {
+    let src = r#"
+enum Outcome:
+    Good(value: Tensor<f32>)
+    Bad
+
+fn main():
+    let r = Outcome.Good(value=Tensor.gpu<f32>([1.0, 2.0]))
+    match r:
+        Good(v):
+            print(v)
+        Bad:
+            print(Tensor.gpu<f32>([0.0]))
+"#;
+    let typed = check_src(src).expect("should type-check");
+    let main = typed.fns.iter().find(|f| f.name == "main").unwrap();
+    let has_drop_enum = main.body.iter().any(|s| matches!(s, TypedStmt::DropEnum { name, .. } if name == "r"));
+    assert!(has_drop_enum, "DropEnum(r) must be inserted for enum with tensor variant; body:\n{:#?}", main.body);
+}
+
+/// `let mut` struct reassignment in a loop must drop the OLD struct value
+/// (DropStruct) before each Assign, not just the final value.
+#[test]
+fn test_ctmm_struct_reassign_in_loop_drops_old_value() {
+    let src = r#"
+struct Pair:
+    a: Tensor<f32>
+    b: Tensor<f32>
+
+fn make_pair() -> Pair:
+    return Pair(a=Tensor.gpu<f32>([1.0]), b=Tensor.gpu<f32>([2.0]))
+
+fn main():
+    let mut p = make_pair()
+    for i in range(3):
+        p = make_pair()
+    print(p.a)
+"#;
+    let typed = check_src(src).expect("should type-check");
+    let main = typed.fns.iter().find(|f| f.name == "main").unwrap();
+    let for_body = main.body.iter().find_map(|s| {
+        if let TypedStmt::For { body, .. } = s { Some(body.as_slice()) } else { None }
+    }).expect("For node not found");
+
+    // DropStruct(p) must appear BEFORE Assign(p) inside the loop body.
+    let drop_before_assign = {
+        let mut saw_drop = false;
+        let mut found = false;
+        for stmt in for_body {
+            if matches!(stmt, TypedStmt::DropStruct { name, .. } if name == "p") { saw_drop = true; }
+            if matches!(stmt, TypedStmt::Assign { name, .. } if name == "p") && saw_drop { found = true; }
+        }
+        found
+    };
+    assert!(
+        drop_before_assign,
+        "DropStruct(p) must precede Assign(p) in loop body; body:\n{:#?}",
+        for_body
+    );
+}
+
+// ── Phase 5: 2-D nested tensor literals ──────────────────────────────────────
+
+#[test]
+fn test_2d_tensor_literal_typechecks() {
+    let src = r#"
+fn main():
+    let x = Tensor.gpu<f32>([[1.0, 2.0], [3.0, 4.0]])
+    print(x)
+"#;
+    check_src(src).expect("2-D tensor literal should typecheck");
+}
+
+#[test]
+fn test_2d_tensor_shape_mismatch_errors() {
+    let src = r#"
+fn main():
+    let x = Tensor.gpu<f32>([[1.0, 2.0], [3.0]])
+    print(x)
+"#;
+    // Parser already rejects non-rectangular rows; this tests the parse error.
+    let result = malus_syntax::parse(malus_syntax::FileId(0), src);
+    assert!(result.is_err(), "non-rectangular tensor should fail to parse");
+}
+
+// ── Phase 4: fixed arrays ─────────────────────────────────────────────────────
+
+#[test]
+fn test_array_literal_type() {
+    let src = r#"
+fn main():
+    let xs = [1, 2, 3]
+    print(xs[0])
+"#;
+    let prog = check_src(src).expect("check failed");
+    let body = &prog.fns[0].body;
+    let let_stmt = &body[0];
+    match let_stmt {
+        TypedStmt::Let { name, expr } => {
+            assert_eq!(name, "xs");
+            match &expr.ty {
+                crate::ResolvedTy::Array { len, .. } => assert_eq!(*len, 3),
+                other => panic!("expected Array type, got {:?}", other),
+            }
+        }
+        other => panic!("expected Let, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_array_index_type() {
+    let src = r#"
+fn main():
+    let xs = [1, 2, 3]
+    let v = xs[0]
+    print(v)
+"#;
+    let prog = check_src(src).expect("check failed");
+    let body = &prog.fns[0].body;
+    // body[1] is `let v = xs[0]`
+    match &body[1] {
+        TypedStmt::Let { name, expr } => {
+            assert_eq!(name, "v");
+            match &expr.ty {
+                crate::ResolvedTy::Scalar(_) => {}
+                other => panic!("expected Scalar element type, got {:?}", other),
+            }
+        }
+        other => panic!("expected Let, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_for_in_binds_elem_type() {
+    let src = r#"
+fn main():
+    let xs = [1, 2, 3]
+    for x in xs:
+        print(x)
+"#;
+    // Should typecheck without errors: x is bound to i64 (element type).
+    check_src(src).expect("for-in should typecheck");
+}
+
+#[test]
+fn test_array_drop_emitted() {
+    // An array of tensors should get a DropArray at end of scope.
+    let src = r#"
+fn main():
+    let ts = [Tensor.gpu<f32>([1.0]), Tensor.gpu<f32>([2.0])]
+    print(ts[0])
+"#;
+    let prog = check_src(src).expect("check failed");
+    let body = &prog.fns[0].body;
+    let kinds = flat_stmt_kinds(body);
+    assert!(kinds.contains(&"DropArray"), "expected DropArray in body; got {:?}", kinds);
 }

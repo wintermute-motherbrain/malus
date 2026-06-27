@@ -2,140 +2,91 @@
 
 **Crates:** All crates.
 
-Put it all together. Fixed-length arrays, rich error diagnostics, and the V1 done-when program.
+Put it all together. Fixed-length arrays, 2-D tensor literals, rich error diagnostics, recursive aggregate drops, and the V1 capstone: a 2→8→1 MLP that learns XOR.
 
 ## Done-When
 
-`examples/mlp.ml` compiles and runs on an M-series Mac, printing decreasing loss over 10 training steps:
+`examples/xor.ml` compiles and runs on an M-series Mac, printing decreasing loss over 10k training steps with final predictions that round to `0, 1, 1, 0`:
 
-```malus
-struct MLP:
-    w1: Tensor<f32>
-    w2: Tensor<f32>
-
-kernel relu_backward(grad_out: Tensor<f32>, x: Tensor<f32>) -> Tensor<f32>:
-    let mask = x > 0.0
-    return grad_out * mask
-
-fn forward(x: Tensor<f32>, model: MLP) -> Tensor<f32>:
-    let h = relu(x @ model.w1)
-    return h @ model.w2
-
-fn backward(x: Tensor<f32>, model: MLP, grad_output: Tensor<f32>) -> MLP:
-    let h_pre = x @ model.w1
-    let h = relu(h_pre)
-    let dw2 = transpose(h) @ grad_output
-    let dh = grad_output @ transpose(model.w2)
-    let dh_pre = relu_backward(dh, h_pre)
-    let dw1 = transpose(x) @ dh_pre
-    return MLP(w1=dw1, w2=dw2)
-
-fn main():
-    let mut model = MLP(w1=ones(3, 4), w2=ones(4, 2))
-    let x = ones(2, 3)
-    let target = zeros(2, 2)
-    let lr = 0.01
-
-    for step in range(10):
-        let out = forward(x, model)
-        let diff = out - target
-        let loss = sum(diff)
-        println("step {}: loss = {}", step, loss)
-        let grads = backward(x, model, diff)
-        model = MLP(
-            w1=model.w1 - lr * grads.w1,
-            w2=model.w2 - lr * grads.w2
-        )
-
-    println("final output: {}", forward(x, model))
+```
+step 0: loss = [1.0402256]
+step 500: loss = [0.006860058]
+step 1000: loss = [0.001959838]
+step 2000: loss = [0.0007679773]
+step 5000: loss = [0.00026143057]
+step 9999 (final): loss = [0.00012191984]
+predictions: [0.0056860363, 0.99518234, 0.9939387, 0.005444207]
 ```
 
 ## Scope
 
 ### 1. Fixed-Length Arrays
 
-Array literals with compile-time-known length, iteration, and indexing. The type `Array<T, N>` has `N` as a compile-time constant.
+`Array<T, N>` — heap-allocated uniform 8-byte slots, `ForIn`, single-index, recursive per-element drop.
 
-**AST** (`malus-syntax/src/ast.rs`):
-- Add `ExprKind::ArrayLiteral { elements: Vec<Expr> }` — `[expr1, expr2, ...]`
-- Add `StmtKind::ForIn { var: String, iterable: Expr, body: Vec<Stmt> }` — `for x in arr: body`
+**AST:** `ExprKind::ArrayLiteral { elements }`, `StmtKind::ForIn { var, iter, body }`, `Ty::Array { elem, len }`.
 
-**Parser:**
-- Parse `[expr, expr, ...]` as `ArrayLiteral`
-- Extend `for` parsing to handle `for <ident> in <expr>` (where expr is an array binding), distinguished from `for <ident> in range(...)` from M9
+**Parser:** `[expr, ...]` in expression position → `ArrayLiteral`. `for x in arr: body` → `ForIn` (dispatched from the existing `for` parser after the `range(...)` fast-path fails).
 
-**Type system** (`malus-sema/src/ty.rs`):
-- Add `ResolvedTy::Array { elem: Box<ResolvedTy>, len: usize }`
+**Type system:** `ResolvedTy::Array { elem, len }`. Element type unified from first element; remaining checked to match. `ForIn` binds `var: elem_ty`.
 
-**Sema:**
-- Infer element type from the first element; check all elements match
-- `ForIn` over an `Array<T, N>`: loop variable is typed as `T`, body is checked `N` is known
+**Codegen-cpu:** `ArrayLiteral` → `malloc(N*8)` + store each element. `Index` → `base + i*8` load. `ForIn` → counted loop 0..N with SSA-correct `use_var(idx)` in body block.
 
-**Typed IR:**
-- Add `TypedExpr::ArrayLiteral { elements: Vec<TypedExpr>, ty: ResolvedTy }`
-- Add `TypedStmt::ForIn { var: String, iterable: TypedExpr, body: Vec<TypedStmt> }`
+**CTMM:** `DropArray { name, elem_ty, len }` emitted for array bindings at last use. Codegen emits a counted loop releasing each element recursively before calling `heap_free`.
 
-**Codegen-cpu:**
-- `ArrayLiteral` allocates a stack slot of `N * sizeof(element_type)` bytes, stores each element
-- Array indexing `arr[i]` loads from `base_ptr + i * elem_size`
-- `ForIn` over an array: emit a counted loop from 0 to N, loading `arr[i]` each iteration
+### 2. 2-D Nested Tensor Literals
 
-**CTMM:**
-- When an `Array<Tensor<f32>, N>` goes out of scope, `tensor_release` each element (using RC from M9 — array elements are structurally ambiguous by the same logic as struct fields)
+`Tensor.gpu<f32>([[r0c0, r0c1], [r1c0, r1c1]])` — row-major, validated rectangular, produces a real 2-D shape buffer passed to `tensor_alloc_gpu(dtype, shape_ptr, ndims, data)`.
 
-### 2. Rich Error Diagnostics
+**Parser:** `parse_tensor_rows` inside `parse_tensor_literal` owns all brackets and validates rectangularity (row count × cols = total elements). Disjoint from `parse_primary`'s `[` → `ArrayLiteral` path.
 
-**Goal:** Rust/Elm-style error messages with source spans, underlines, and help suggestions.
+**Sema:** `TensorShapeMismatch` error if `product(shape) != elements.len()`.
 
-**Current state:** `SemaError` variants carry a `span: Span` (byte range in the source). The CLI prints them as plain strings with no source context.
+**Codegen-cpu:** `TensorLiteral` emits real `ndims` and N-slot shape stack buffer instead of the old hardcoded `ndims=1`.
 
-**Implementation:**
-- Add `ariadne` crate (or `codespan-reporting`) to `malus-cli/Cargo.toml`
-- In `malus-cli/src/main.rs`, format sema errors using the crate's report builder
-- Each `SemaError` variant maps to a report with: error label, underlined span, and a help message
+### 3. Rich Error Diagnostics
 
-Example output:
-```
-error: dtype mismatch in binary op
-  --> script.ml:5:13
-   |
- 5 |     let c = a + b
-   |             ^---^ left is Tensor<f32>, right is Tensor<f16>
-   |
-   = help: cast with b.to<f32>()
-```
+`ariadne` crate renders `SemaError` and `ParseError` with source context, spans, and underlines. Each error variant maps to a labeled `Report` with a `help` annotation.
 
-Runtime panics — add concrete shape and dtype info to panic messages in `malus-runtime/src/metal.rs`. For matmul shape mismatches, print the actual shapes.
+**Runtime panics:** `tensor_matmul`, `tensor_transpose`, non-f32 dtype panics now include actual shapes and dimension info.
 
-### 3. The MLP Example and Integration Bug Fixes
+### 4. Recursive Aggregate Drops + DropEnum
 
-Write `examples/mlp.ml` with the done-when program above.
+**DropEnum:** `TypedStmt::DropEnum { name, variants }` emitted by CTMM for enum bindings at last use. Codegen emits a tag-check dispatch: load tag → branch to the matching variant's payload-release block → shared `heap_free`.
 
-Run it and fix integration bugs. Likely problem areas based on the CTMM gaps:
+**Recursive DropStruct:** `DropStruct` now carries `Vec<(usize, ResolvedTy)>` field info so codegen can load child pointers and recursively drop aggregate-typed fields before freeing the parent box.
 
-- **Struct fields across training loop iterations:** `model` is reassigned each step. The old `MLP` struct's tensor fields must be released before rebinding. CTMM + RC should handle this, but verify.
-- **Barrier insertion around matmul:** `tensor_matmul` is a runtime call that schedules GPU work. CTMM's `is_gpu_producing` in `ctmm.rs` must recognize `tensor_matmul` calls as GPU-producing so barriers are inserted correctly.
-- **Nested GPU expressions in the backward pass:** `grad_output @ transpose(model.w2)` — the `transpose` result is a temporary that must be freed after the matmul. CTMM hoisting (`hoist_gpu_subexprs`) must handle `tensor_matmul` and `tensor_transpose` the same way it handles `KernelCall`.
-- **Chained BinOps still leaking temporaries:** The `ctmm-v1-gaps.md` gap about unbound temporaries in nested BinOps (`a + b * c`) applies to the training step expressions like `model.w1 - lr * grads.w1`. Fix any remaining leaks.
-- **Scalar-broadcast 1-element tensor temps leak (M7 gap):** `a * 0.5` materializes a 1-element GPU tensor for `0.5` via `tensor_alloc_gpu`, but this temp is invisible to CTMM (created inline in codegen-cpu) and is never freed. Fix alongside the chained-BinOp temp leak — both require CTMM-visible temp nodes or a post-dispatch sweep.
-- **Enum-payload tensor drops (M10 gap):** Enum locals currently receive no drop of any kind — neither a `libc_free` of the enum's own allocation nor `tensor_release` on any tensor-typed payload fields. A `Tensor<f32>` stored inside an enum variant (e.g. `enum Cache: Computed(val: Tensor<f32>)`) leaks its GPU buffer. The fix requires a `DropEnum` typed IR node that emits a runtime tag check (a mini-match) at drop time to determine which variant's tensor fields to release before calling `libc_free`. CTMM should emit `DropEnum` for enum locals at last use, just as it emits `DropStruct` for struct locals.
+**Aggregate reassign fix:** `insert_assign_drops` and D6 hoist guard now fire for Struct/Enum/Array targets (not just Tensor), so `model = MLP(...)` inside a loop correctly drops the old value on each iteration.
 
-### 4. Write examples/mlp.ml
+### 5. Temp-Leak Hoist
 
-The actual done-when file. Once the example runs correctly and loss decreases, M11 is complete.
+CTMM `hoist_gpu_subexprs` hoists GPU-producing BinOp/Unary operands into named `__malus_tmp_N` Lets so `find_last_uses`/`insert_drops` can free them. Fixes leaks from nested expressions like `x @ w1 + ones41 @ b1` where `x @ w1` and `ones41 @ b1` were previously invisible to CTMM.
 
-### 5. Early `return` Inside Control Flow Bodies
+D6 guard: `hoist_gpu_subexprs` also hoists Assign RHS to a temp when it is GPU-producing+tensor, breaking self-reference cycles (`w1 = w1 - lr*dw1`).
 
-M9 deferred `return` inside `for`/`while`/`if` bodies. M11 adds it.
+### 6. Early-Return Unwind
 
-**CTMM:** At each `return` inside a nested scope, walk the chain of enclosing scopes and emit `Drop` (or `Release` for RC-managed bindings) for all live tensor bindings that do not appear in the return expression. This is a "scope unwind" pass — similar to how Rust's drop-elaboration works before early returns.
+CTMM's `inject_early_return_unwinds` detects `TypedStmt::Return` nested inside `If`/`For`/`While`/`ForIn`/`Match` bodies and emits `Drop`/`DropStruct`/`DropEnum`/`DropArray` for all live enclosing-scope bindings not referenced by the return expression.
 
-**Sema:** `return` is already parsed and type-checked; no AST or IR changes needed. The only change is in `ctmm.rs`: detect `TypedStmt::Return` inside nested bodies and emit the unwind drops before it.
+### 7. GPU Kernel Collection Inside Control Flow
+
+`collect_binops_in_stmt` and `collect_unary_builtins_in_stmt` in `malus-codegen-gpu` now recurse into `If`/`For`/`While`/`ForIn` bodies. Previously they skipped control-flow nodes, so any BinOp or unary builtin used inside a loop body was not compiled as a Metal kernel — the runtime would panic with "unknown kernel".
+
+### 8. XOR MLP (Capstone)
+
+`examples/xor.ml`: 2→8→1 sigmoid-sigmoid MLP, MSE loss, `sigmoid_backward` user kernel, manual weight updates, 10k steps, lr=1.5, asymmetric init.
+
+Architecture:
+- **Hidden:** sigmoid with 8 units
+- **Output:** sigmoid with 1 unit
+- **Bias:** `ones41 @ b1` trick (4×1 column of ones matmul'd with 1×H bias row)
+- **Backward:** `sigmoid_backward(grad, sig_z) = grad * sig_z * (1 - sig_z)` kernel reused for both output and hidden layers
 
 ## Out of Scope
 
-- SafeTensors loading (deferred — the MLP uses `ones`/`zeros` for initialization)
-- GPU RNG (deferred)
+- SafeTensors loading
+- GPU RNG
 - nanoGPT or any model larger than a 2-layer MLP
 - Autograd / gradient tape
-- Optimizer objects (learning rate is a plain scalar, update is manual)
+- Optimizer objects
+- ScalarBroadcast typed IR node (inline scalar-broadcast BinOps continue to work; dedicated IR node deferred)

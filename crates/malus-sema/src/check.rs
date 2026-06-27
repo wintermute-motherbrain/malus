@@ -428,6 +428,32 @@ fn check_body(
                 ctx.env.pop_scope();
                 typed.push(TypedStmt::For { var: var.clone(), start: tstart, end: tend, body: tbody });
             }
+            StmtKind::ForIn { var, iter, body } => {
+                // `iter` must resolve to Array<T, N>; `var` is bound to T inside body.
+                let titer = match check_expr(iter, None, ctx) {
+                    Some(e) => e,
+                    None => return typed,
+                };
+                let (elem_ty, _len) = match &titer.ty {
+                    ResolvedTy::Array { elem, len } => (*elem.clone(), *len),
+                    other => {
+                        ctx.errors.push(SemaError::TypeMismatch {
+                            expected: ResolvedTy::Array {
+                                elem: Box::new(ResolvedTy::Unit),
+                                len: 0,
+                            },
+                            found: other.clone(),
+                            span: iter.span,
+                        });
+                        return typed;
+                    }
+                };
+                ctx.env.push_scope();
+                ctx.env.bind(var.clone(), elem_ty, None);
+                let tbody = check_body(body, ctx);
+                ctx.env.pop_scope();
+                typed.push(TypedStmt::ForIn { var: var.clone(), iter: titer, body: tbody });
+            }
             StmtKind::While { condition, body } => {
                 // Condition must be Bool.
                 let tcond = match check_expr(condition, Some(&ResolvedTy::Bool), ctx) {
@@ -548,8 +574,10 @@ fn check_expr(
         ExprKind::BinOp { op, lhs, rhs } => check_binop(op, lhs, rhs, expr.span, ctx),
         ExprKind::Unary { op, operand } => check_unary(op, operand, expr.span, ctx),
         ExprKind::Call { callee, args } => check_call(callee, args, expr.span, ctx),
-        ExprKind::TensorLiteral { placement, dtype, elements } =>
-            check_tensor_literal(placement, dtype, elements, expr.span, ctx),
+        ExprKind::TensorLiteral { placement, dtype, elements, shape } =>
+            check_tensor_literal(placement, dtype, elements, shape, expr.span, ctx),
+        ExprKind::ArrayLiteral { elements } =>
+            check_array_literal(elements, expr.span, ctx),
         ExprKind::Index { base, indices } => check_index(base, indices, expr.span, ctx),
         ExprKind::FieldAccess { base, field } => check_field_access(base, field, expr.span, ctx),
     }
@@ -1011,9 +1039,21 @@ fn check_tensor_literal(
     placement: &Placement,
     dtype: &ScalarTy,
     elements: &[malus_syntax::ast::Expr],
+    shape: &[usize],
     span: Span,
     ctx: &mut BodyCtx<'_>,
 ) -> Option<TypedExpr> {
+    // Validate product(shape) == elements.len().
+    let expected_count: usize = shape.iter().product();
+    if expected_count != elements.len() {
+        ctx.errors.push(SemaError::TensorShapeMismatch {
+            expected: expected_count,
+            found: elements.len(),
+            span,
+        });
+        return None;
+    }
+
     let elem_ty = ResolvedTy::Scalar(dtype.clone());
     let mut typed_elements: Vec<TypedExpr> = Vec::new();
 
@@ -1039,9 +1079,48 @@ fn check_tensor_literal(
             placement: placement.clone(),
             dtype: dtype.clone(),
             elements: typed_elements,
+            shape: shape.to_vec(),
         },
         ResolvedTy::Tensor { dtype: dtype.clone() },
         Some(placement.clone()),
+        span,
+    ))
+}
+
+fn check_array_literal(
+    elements: &[malus_syntax::ast::Expr],
+    span: Span,
+    ctx: &mut BodyCtx<'_>,
+) -> Option<TypedExpr> {
+    if elements.is_empty() {
+        ctx.errors.push(SemaError::TypeMismatch {
+            expected: ResolvedTy::Array { elem: Box::new(ResolvedTy::Unit), len: 0 },
+            found: ResolvedTy::Unit,
+            span,
+        });
+        return None;
+    }
+    let first = check_expr(&elements[0], None, ctx)?;
+    let elem_ty = first.ty.clone();
+    let placement = first.placement;
+    let mut typed: Vec<TypedExpr> = vec![first];
+    for elem in &elements[1..] {
+        let te = check_expr(elem, Some(&elem_ty), ctx)?;
+        if te.ty != elem_ty {
+            ctx.errors.push(SemaError::TypeMismatch {
+                expected: elem_ty.clone(),
+                found: te.ty.clone(),
+                span: elem.span,
+            });
+            return None;
+        }
+        typed.push(te);
+    }
+    let len = typed.len();
+    Some(typed_expr(
+        TypedExprKind::ArrayLiteral { elements: typed },
+        ResolvedTy::Array { elem: Box::new(elem_ty), len },
+        placement,
         span,
     ))
 }
@@ -1053,6 +1132,21 @@ fn check_index(
     ctx: &mut BodyCtx<'_>,
 ) -> Option<TypedExpr> {
     let tbase = check_expr(base, None, ctx)?;
+    // Array<T, N>[i] → T
+    if let ResolvedTy::Array { elem, .. } = &tbase.ty.clone() {
+        let elem_ty = *elem.clone();
+        let placement = tbase.placement;
+        let mut typed_indices: Vec<TypedExpr> = Vec::new();
+        for idx in indices {
+            typed_indices.push(check_expr(idx, Some(&ResolvedTy::Scalar(ScalarTy::I64)), ctx)?);
+        }
+        return Some(typed_expr(
+            TypedExprKind::Index { base: Box::new(tbase), indices: typed_indices },
+            elem_ty,
+            placement,
+            span,
+        ));
+    }
     let ty = tbase.ty.clone();
     let placement = tbase.placement;
     let mut typed_indices: Vec<TypedExpr> = Vec::new();
@@ -1237,6 +1331,10 @@ pub fn resolve_ty(
                 resolved.push(resolve_ty(t, span, nominals, errors)?);
             }
             Some(ResolvedTy::Tuple(resolved))
+        }
+        Ty::Array { elem, len } => {
+            let resolved_elem = resolve_ty(elem, span, nominals, errors)?;
+            Some(ResolvedTy::Array { elem: Box::new(resolved_elem), len: *len })
         }
         Ty::Named(name) if name == "None" => Some(ResolvedTy::Unit),
         Ty::Named(name) => {

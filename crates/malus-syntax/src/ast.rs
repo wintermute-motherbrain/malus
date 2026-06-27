@@ -26,6 +26,8 @@ pub enum Ty {
     Bool,
     Tuple(Vec<Ty>),
     Named(String),
+    /// `Array<T, N>` — fixed-length homogeneous array.
+    Array { elem: Box<Ty>, len: usize },
 }
 
 // ── Operators ─────────────────────────────────────────────────────────────────
@@ -131,7 +133,9 @@ pub enum ExprKind {
     /// positional (regular fn call).
     Call { callee: Box<Expr>, args: Vec<CallArg> },
     Index { base: Box<Expr>, indices: Vec<Expr> },
-    TensorLiteral { placement: Placement, dtype: ScalarTy, elements: Vec<Expr> },
+    TensorLiteral { placement: Placement, dtype: ScalarTy, elements: Vec<Expr>, shape: Vec<usize> },
+    /// `[e1, e2, e3]` — fixed-length array literal.
+    ArrayLiteral { elements: Vec<Expr> },
     FieldAccess { base: Box<Expr>, field: String },
 }
 
@@ -169,6 +173,11 @@ pub enum StmtKind {
         end: Expr,
         body: Vec<Stmt>,
     },
+    /// `for var in <array_expr>: body`
+    ///
+    /// Only reached when the iterator is NOT `range(...)`. The `iter` must
+    /// resolve to an `Array<T, N>` binding; `var` is bound to `T` inside body.
+    ForIn { var: String, iter: Box<Expr>, body: Vec<Stmt> },
     /// `while condition: body`
     While { condition: Expr, body: Vec<Stmt> },
     /// `match scrutinee: arms`

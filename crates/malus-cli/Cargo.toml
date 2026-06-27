@@ -8,6 +8,7 @@ name = "malus"
 path = "src/main.rs"
 
 [dependencies]
+ariadne = "0.4"
 malus-syntax = { path = "../malus-syntax" }
 malus-loader = { path = "../malus-loader" }
 malus-sema = { path = "../malus-sema" }

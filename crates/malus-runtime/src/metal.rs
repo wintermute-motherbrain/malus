@@ -118,7 +118,7 @@ pub extern "C" fn tensor_alloc_gpu(
 ) -> i64 {
     let dt = Dtype::from_tag(dtype);
     if dt != Dtype::F32 {
-        panic!("malus: non-f32 dtypes not yet implemented (got dtype tag {dtype})");
+        panic!("malus: non-f32 dtypes not yet implemented (got dtype {:?}, tag {})", dt, dtype);
     }
     let shape = unsafe { std::slice::from_raw_parts(shape_ptr, ndims).to_vec() };
     let n: usize = shape.iter().product();
@@ -259,7 +259,10 @@ pub extern "C" fn tensor_matmul(handle_a: i64, handle_b: i64) -> i64 {
     let (m, k) = (a.shape[0], a.shape[1]);
     let (k2, n) = (b.shape[0], b.shape[1]);
     if k != k2 {
-        panic!("malus: tensor_matmul dim mismatch: {:?} @ {:?}", a.shape, b.shape);
+        panic!(
+            "malus: matmul shape mismatch: [{m}x{k}] @ [{k2}x{n}] — inner dims {k} != {k2}\n  left shape:  {:?}\n  right shape: {:?}",
+            a.shape, b.shape
+        );
     }
 
     let a_data = unsafe { std::slice::from_raw_parts(a.buffer.contents() as *const f32, a.len) };

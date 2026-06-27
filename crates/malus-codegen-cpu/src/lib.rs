@@ -150,8 +150,8 @@ fn cranelift_type(ty: &ResolvedTy) -> Result<Option<cranelift_codegen::ir::Type>
         ResolvedTy::Bool => Ok(Some(I8)),
         ResolvedTy::Unit => Ok(None),
         ResolvedTy::Tuple(_) => Err(CodegenError::UnsupportedType("tuple".into())),
-        // Structs and enums are heap-allocated; represented as opaque i64 pointer.
-        ResolvedTy::Struct { .. } | ResolvedTy::Enum { .. } => Ok(Some(I64)),
+        // Structs, enums, and arrays are heap-allocated; represented as opaque i64 pointer.
+        ResolvedTy::Struct { .. } | ResolvedTy::Enum { .. } | ResolvedTy::Array { .. } => Ok(Some(I64)),
     }
 }
 
@@ -437,6 +437,70 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                 Ok(false)
             }
 
+            // ── M11: for-in loop over fixed arrays ────────────────────────────────
+            TypedStmt::ForIn { var, iter, body } => {
+                // Load the array pointer and determine the element type + length.
+                let arr_ptr = self.lower_expr(iter)?;
+                let (elem_ty, len) = match &iter.ty {
+                    malus_sema::ResolvedTy::Array { elem, len } => (*elem.clone(), *len),
+                    _ => return Err(CodegenError::UnsupportedExpr("ForIn requires Array type".into())),
+                };
+                let cl_ty = match cranelift_type(&elem_ty)? {
+                    Some(t) => t,
+                    None => return Err(CodegenError::UnsupportedExpr("ForIn: unit-typed array element".into())),
+                };
+
+                // Declare the loop variable (the element binding).
+                let elem_var = Variable::from_u32(self.next_var as u32);
+                self.next_var += 1;
+                self.builder.declare_var(elem_var, cl_ty);
+                self.var_map.insert(var.clone(), elem_var);
+
+                // Declare the index variable (i64, not visible to the body).
+                let idx_var = Variable::from_u32(self.next_var as u32);
+                self.next_var += 1;
+                self.builder.declare_var(idx_var, I64);
+                let zero = self.builder.ins().iconst(I64, 0);
+                self.builder.def_var(idx_var, zero);
+
+                let header_blk = self.builder.create_block();
+                let body_blk   = self.builder.create_block();
+                let exit_blk   = self.builder.create_block();
+
+                self.builder.ins().jump(header_blk, &[]);
+
+                // Header: test i < len.
+                self.builder.switch_to_block(header_blk);
+                let cur_idx = self.builder.use_var(idx_var);
+                let len_val = self.builder.ins().iconst(I64, len as i64);
+                let cmp = self.builder.ins().icmp(
+                    cranelift_codegen::ir::condcodes::IntCC::SignedLessThan, cur_idx, len_val,
+                );
+                self.builder.ins().brif(cmp, body_blk, &[], exit_blk, &[]);
+
+                // Body: load element at arr_ptr + idx * 8.
+                self.builder.switch_to_block(body_blk);
+                let body_idx = self.builder.use_var(idx_var);
+                let eight = self.builder.ins().iconst(I64, 8);
+                let byte_offset_val = self.builder.ins().imul(body_idx, eight);
+                let elem_ptr = self.builder.ins().iadd(arr_ptr, byte_offset_val);
+                let elem_val = self.builder.ins().load(cl_ty, cranelift_codegen::ir::MemFlags::trusted(), elem_ptr, 0);
+                self.builder.def_var(elem_var, elem_val);
+
+                let body = body.clone();
+                for s in &body { self.lower_stmt(s)?; }
+
+                // Increment index.
+                let cur_idx2 = self.builder.use_var(idx_var);
+                let one = self.builder.ins().iconst(I64, 1);
+                let next_idx = self.builder.ins().iadd(cur_idx2, one);
+                self.builder.def_var(idx_var, next_idx);
+                self.builder.ins().jump(header_blk, &[]);
+
+                self.builder.switch_to_block(exit_blk);
+                Ok(false)
+            }
+
             // ── M10 RC nodes (wired, not emitted by M9 CTMM) ─────────────────────
             TypedStmt::Retain { name } => {
                 let handle = self.use_var(name)?;
@@ -450,16 +514,34 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                 Ok(false)
             }
 
-            // ── M10: aggregate types ──────────────────────────────────────────────
-            TypedStmt::DropStruct { name, tensor_field_indices } => {
+            // ── M10/M11: aggregate types ──────────────────────────────────────────
+            TypedStmt::DropStruct { name, droppable_fields } => {
                 let ptr = self.use_var(name)?;
-                // Release each tensor field (tensor_release = tensor_free when refcount hits 0).
-                for &slot_idx in tensor_field_indices {
-                    let offset = (slot_idx as i32) * 8;
-                    let field_handle = self.builder.ins().load(I64, cranelift_codegen::ir::MemFlags::trusted(), ptr, offset);
-                    self.call_runtime_release(field_handle);
+                // Recursively release droppable fields, then free the struct box.
+                let droppable_fields = droppable_fields.clone();
+                for (slot_idx, field_ty) in &droppable_fields {
+                    let offset = (*slot_idx as i32) * 8;
+                    self.emit_drop_field(ptr, offset, field_ty)?;
                 }
-                // Free the struct's heap allocation.
+                self.call_heap_free(ptr);
+                Ok(false)
+            }
+
+            TypedStmt::DropEnum { name, variants } => {
+                let ptr = self.use_var(name)?;
+                let variants = variants.clone();
+                self.emit_drop_enum_box(ptr, &variants)?;
+                Ok(false)
+            }
+
+            TypedStmt::DropArray { name, elem_ty, len } => {
+                let ptr = self.use_var(name)?;
+                let elem_ty = elem_ty.clone();
+                let len = *len;
+                // If the element type owns heap resources, release each element.
+                if elem_ty.is_tensor() || elem_ty.is_struct() || elem_ty.is_enum() || elem_ty.is_array() {
+                    self.emit_counted_drop_loop(ptr, &elem_ty, len)?;
+                }
                 self.call_heap_free(ptr);
                 Ok(false)
             }
@@ -563,6 +645,239 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
         Ok(self.builder.use_var(var))
     }
 
+    // ── Recursive aggregate drop helpers (M11) ────────────────────────────────
+
+    /// Emit code to release one field at `byte_offset` within `base_ptr`.
+    /// - Tensor  → `tensor_release(field_value)`
+    /// - Struct  → recursively release struct fields, then `heap_free`
+    /// - Enum    → tag-switch, per-arm release, then `heap_free`
+    /// All other types carry no heap resources and are skipped.
+    fn emit_drop_field(
+        &mut self,
+        base_ptr: cranelift_codegen::ir::Value,
+        byte_offset: i32,
+        ty: &malus_sema::ResolvedTy,
+    ) -> Result<(), CodegenError> {
+        use malus_sema::ResolvedTy;
+        match ty {
+            ResolvedTy::Tensor { .. } => {
+                let handle = self.builder.ins().load(
+                    I64, cranelift_codegen::ir::MemFlags::trusted(), base_ptr, byte_offset,
+                );
+                self.call_runtime_release(handle);
+            }
+            ResolvedTy::Struct { fields, .. } => {
+                let nested_ptr = self.builder.ins().load(
+                    I64, cranelift_codegen::ir::MemFlags::trusted(), base_ptr, byte_offset,
+                );
+                let droppable: Vec<(usize, ResolvedTy)> = fields.iter()
+                    .enumerate()
+                    .filter_map(|(i, (_, fty))| {
+                        if fty.is_tensor() || fty.is_struct() || fty.is_enum() {
+                            Some((i, fty.clone()))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                for (fidx, fty) in &droppable {
+                    self.emit_drop_field(nested_ptr, (*fidx as i32) * 8, fty)?;
+                }
+                self.call_heap_free(nested_ptr);
+            }
+            ResolvedTy::Enum { variants, .. } => {
+                let nested_ptr = self.builder.ins().load(
+                    I64, cranelift_codegen::ir::MemFlags::trusted(), base_ptr, byte_offset,
+                );
+                let drop_variants: Vec<(u32, Vec<(usize, ResolvedTy)>)> = variants.iter()
+                    .enumerate()
+                    .map(|(tag, (_, vfields))| {
+                        let droppable = vfields.iter()
+                            .enumerate()
+                            .filter_map(|(i, (_, vty))| {
+                                if vty.is_tensor() || vty.is_struct() || vty.is_enum() {
+                                    Some((i, vty.clone()))
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+                        (tag as u32, droppable)
+                    })
+                    .collect();
+                self.emit_drop_enum_box(nested_ptr, &drop_variants)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Emit a tag-switch drop for an enum box pointer.
+    /// Each variant arm releases its droppable fields; all arms jump to a merge
+    /// block that calls `heap_free` exactly once.
+    fn emit_drop_enum_box(
+        &mut self,
+        ptr: cranelift_codegen::ir::Value,
+        variants: &[(u32, Vec<(usize, malus_sema::ResolvedTy)>)],
+    ) -> Result<(), CodegenError> {
+        let tag = self.builder.ins().load(
+            I32, cranelift_codegen::ir::MemFlags::trusted(), ptr, 0,
+        );
+
+        let merge_blk = self.builder.create_block();
+        let arm_test_blks: Vec<_> = variants.iter().map(|_| self.builder.create_block()).collect();
+        let unreachable_blk = self.builder.create_block();
+
+        if let Some(&first) = arm_test_blks.first() {
+            self.builder.ins().jump(first, &[]);
+        } else {
+            // No variants — just free the box and return.
+            self.call_heap_free(ptr);
+            return Ok(());
+        }
+
+        let variants_clone: Vec<(u32, Vec<(usize, malus_sema::ResolvedTy)>)> = variants.to_vec();
+        for (i, (variant_tag, droppable_fields)) in variants_clone.iter().enumerate() {
+            let test_blk = arm_test_blks[i];
+            let next_blk = arm_test_blks.get(i + 1).copied().unwrap_or(unreachable_blk);
+            let body_blk = self.builder.create_block();
+
+            self.builder.switch_to_block(test_blk);
+            self.builder.seal_block(test_blk);
+
+            let expected = self.builder.ins().iconst(I32, *variant_tag as i64);
+            let cmp = self.builder.ins().icmp(
+                cranelift_codegen::ir::condcodes::IntCC::Equal, tag, expected,
+            );
+            self.builder.ins().brif(cmp, body_blk, &[], next_blk, &[]);
+
+            self.builder.switch_to_block(body_blk);
+            self.builder.seal_block(body_blk);
+
+            // Release droppable fields (payload starts at offset 8).
+            let droppable = droppable_fields.clone();
+            for (slot_idx, field_ty) in &droppable {
+                let offset = 8 + (*slot_idx as i32) * 8;
+                self.emit_drop_field(ptr, offset, field_ty)?;
+            }
+            self.builder.ins().jump(merge_blk, &[]);
+        }
+
+        self.builder.switch_to_block(unreachable_blk);
+        self.builder.seal_block(unreachable_blk);
+        self.builder.ins().trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
+
+        self.builder.switch_to_block(merge_blk);
+        self.builder.seal_block(merge_blk);
+        self.call_heap_free(ptr);
+
+        Ok(())
+    }
+
+    /// Emit a counted loop that calls `emit_drop_field` for each element of a
+    /// fixed array at `arr_ptr`.  Elements are at `arr_ptr + i * 8`.
+    /// Only called when `elem_ty` owns heap resources.
+    fn emit_counted_drop_loop(
+        &mut self,
+        arr_ptr: cranelift_codegen::ir::Value,
+        elem_ty: &malus_sema::ResolvedTy,
+        len: usize,
+    ) -> Result<(), CodegenError> {
+        let idx_var = Variable::from_u32(self.next_var as u32);
+        self.next_var += 1;
+        self.builder.declare_var(idx_var, I64);
+        let zero = self.builder.ins().iconst(I64, 0);
+        self.builder.def_var(idx_var, zero);
+
+        let header_blk = self.builder.create_block();
+        let body_blk   = self.builder.create_block();
+        let exit_blk   = self.builder.create_block();
+
+        self.builder.ins().jump(header_blk, &[]);
+
+        self.builder.switch_to_block(header_blk);
+        let cur = self.builder.use_var(idx_var);
+        let len_val = self.builder.ins().iconst(I64, len as i64);
+        let cmp = self.builder.ins().icmp(
+            cranelift_codegen::ir::condcodes::IntCC::SignedLessThan, cur, len_val,
+        );
+        self.builder.ins().brif(cmp, body_blk, &[], exit_blk, &[]);
+
+        self.builder.switch_to_block(body_blk);
+        self.builder.seal_block(body_blk);
+        // Compute byte offset: arr_ptr + i * 8
+        let body_cur = self.builder.use_var(idx_var);
+        let eight = self.builder.ins().iconst(I64, 8);
+        let byte_off = self.builder.ins().imul(body_cur, eight);
+        let elem_ptr = self.builder.ins().iadd(arr_ptr, byte_off);
+        // Elements are values stored by value — load the handle from the slot.
+        let handle = self.builder.ins().load(
+            I64, cranelift_codegen::ir::MemFlags::trusted(), elem_ptr, 0,
+        );
+        // Drop the element at ptr=handle (the slot IS the pointer for agg types).
+        let elem_ty_clone = elem_ty.clone();
+        match &elem_ty_clone {
+            malus_sema::ResolvedTy::Tensor { .. } => {
+                self.call_runtime_release(handle);
+            }
+            malus_sema::ResolvedTy::Struct { fields, .. } => {
+                let droppable: Vec<(usize, malus_sema::ResolvedTy)> = fields.iter().enumerate()
+                    .filter_map(|(i, (_, ty))| {
+                        if ty.is_tensor() || ty.is_struct() || ty.is_enum() || ty.is_array() {
+                            Some((i, ty.clone()))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                for (slot_idx, field_ty) in &droppable {
+                    let offset = (*slot_idx as i32) * 8;
+                    self.emit_drop_field(handle, offset, field_ty)?;
+                }
+                self.call_heap_free(handle);
+            }
+            malus_sema::ResolvedTy::Enum { variants, .. } => {
+                let drop_variants: Vec<(u32, Vec<(usize, malus_sema::ResolvedTy)>)> = variants.iter()
+                    .enumerate()
+                    .map(|(vi, (_, vfields))| {
+                        let droppable: Vec<(usize, malus_sema::ResolvedTy)> = vfields.iter().enumerate()
+                            .filter_map(|(fi, (_, fty))| {
+                                if fty.is_tensor() || fty.is_struct() || fty.is_enum() || fty.is_array() {
+                                    Some((fi, fty.clone()))
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+                        (vi as u32, droppable)
+                    })
+                    .collect();
+                self.emit_drop_enum_box(handle, &drop_variants)?;
+            }
+            malus_sema::ResolvedTy::Array { elem, len } => {
+                let inner_elem = *elem.clone();
+                let inner_len = *len;
+                if inner_elem.is_tensor() || inner_elem.is_struct() || inner_elem.is_enum() || inner_elem.is_array() {
+                    self.emit_counted_drop_loop(handle, &inner_elem, inner_len)?;
+                }
+                self.call_heap_free(handle);
+            }
+            _ => {}
+        }
+        // Advance index.
+        let cur2 = self.builder.use_var(idx_var);
+        let one = self.builder.ins().iconst(I64, 1);
+        let next = self.builder.ins().iadd(cur2, one);
+        self.builder.def_var(idx_var, next);
+        self.builder.ins().jump(header_blk, &[]);
+        self.builder.seal_block(header_blk);
+
+        self.builder.switch_to_block(exit_blk);
+        self.builder.seal_block(exit_blk);
+
+        Ok(())
+    }
+
     fn import_func(&mut self, func_id: FuncId) -> cranelift_codegen::ir::FuncRef {
         self.codegen.module.declare_func_in_func(func_id, self.builder.func)
     }
@@ -624,12 +939,15 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                     (ResolvedTy::Tensor { .. }, ResolvedTy::Tensor { .. }) => {
                         Err(CodegenError::UnsupportedExpr("non-f32 tensor BinOp not yet supported".into()))
                     }
-                    // tensor ⊕ scalar — materialize scalar as 1-elem tensor, dispatch scalar builtin
+                    // tensor ⊕ scalar — materialize scalar as 1-elem tensor, dispatch scalar builtin,
+                    // then immediately free the temp (Metal retains the buffer until GPU finishes).
                     (ResolvedTy::Tensor { dtype }, ResolvedTy::Scalar(sd)) if dtype == sd && *dtype == ScalarTy::F32 => {
                         if let Some(name) = scalar_broadcast_builtin_name(op, true) {
                             let tensor_handle = self.lower_expr(lhs)?;
                             let scalar_handle = self.materialize_scalar_tensor(rhs)?;
-                            self.lower_kernel_dispatch_with_handles(name, &[tensor_handle, scalar_handle])
+                            let result = self.lower_kernel_dispatch_with_handles(name, &[tensor_handle, scalar_handle])?;
+                            self.call_runtime_free(scalar_handle);
+                            Ok(result)
                         } else {
                             Err(CodegenError::UnsupportedExpr(format!("scalar broadcast {:?} not supported", op)))
                         }
@@ -639,7 +957,9 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                         if let Some(name) = scalar_broadcast_builtin_name(op, false) {
                             let tensor_handle = self.lower_expr(rhs)?;
                             let scalar_handle = self.materialize_scalar_tensor(lhs)?;
-                            self.lower_kernel_dispatch_with_handles(name, &[tensor_handle, scalar_handle])
+                            let result = self.lower_kernel_dispatch_with_handles(name, &[tensor_handle, scalar_handle])?;
+                            self.call_runtime_free(scalar_handle);
+                            Ok(result)
                         } else {
                             Err(CodegenError::UnsupportedExpr(format!("scalar broadcast {:?} (reversed) not supported", op)))
                         }
@@ -750,13 +1070,13 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                 self.lower_kernel_dispatch(callee, &arg_refs)
             }
 
-            TypedExprKind::TensorLiteral { dtype, elements, .. } => {
+            TypedExprKind::TensorLiteral { dtype, elements, shape, .. } => {
                 let len = elements.len() as u32;
                 // Stack slot for f32 elements (len * 4 bytes, 4-byte aligned).
                 let data_slot = self.builder.create_sized_stack_slot(
                     cranelift_codegen::ir::StackSlotData::new(
                         cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
-                        len * 4,
+                        (len * 4).max(4),
                         2,
                     )
                 );
@@ -772,21 +1092,25 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                     self.builder.ins().stack_store(f32_val, data_slot, (i as i32) * 4);
                 }
 
-                // Shape slot: one usize (8 bytes, 8-byte aligned) holding the element count.
+                // Shape slot: ndims usizes (each 8 bytes, 8-byte aligned).
+                // For 1-D: [N].  For 2-D: [rows, cols].
+                let ndims = shape.len();
                 let shape_slot = self.builder.create_sized_stack_slot(
                     cranelift_codegen::ir::StackSlotData::new(
                         cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
-                        8,
+                        (ndims as u32 * 8).max(8),
                         3,
                     )
                 );
-                let len_as_usize = self.builder.ins().iconst(I64, len as i64);
-                self.builder.ins().stack_store(len_as_usize, shape_slot, 0);
+                for (i, &dim) in shape.iter().enumerate() {
+                    let dim_val = self.builder.ins().iconst(I64, dim as i64);
+                    self.builder.ins().stack_store(dim_val, shape_slot, (i as i32) * 8);
+                }
 
                 let data_ptr  = self.builder.ins().stack_addr(self.codegen.ptr_type(), data_slot, 0);
                 let shape_ptr = self.builder.ins().stack_addr(self.codegen.ptr_type(), shape_slot, 0);
                 let dtype_val = self.builder.ins().iconst(I32, dtype_tag(dtype) as i64);
-                let ndims_val = self.builder.ins().iconst(self.codegen.ptr_type(), 1);
+                let ndims_val = self.builder.ins().iconst(self.codegen.ptr_type(), ndims as i64);
 
                 let alloc_ref = self.import_func(self.codegen.rt_tensor_alloc_gpu);
                 let call = self.builder.ins().call(alloc_ref, &[dtype_val, shape_ptr, ndims_val, data_ptr]);
@@ -794,8 +1118,41 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                 Ok(results[0])
             }
 
-            TypedExprKind::Index { .. } => {
-                Err(CodegenError::UnsupportedExpr("Index not yet supported".into()))
+            TypedExprKind::Index { base, indices } => {
+                match &base.ty {
+                    ResolvedTy::Array { .. } => {
+                        let arr_ptr = self.lower_expr(base)?;
+                        let idx_val = self.lower_expr(&indices[0])?;
+                        let eight = self.builder.ins().iconst(I64, 8);
+                        let byte_off = self.builder.ins().imul(idx_val, eight);
+                        let elem_ptr = self.builder.ins().iadd(arr_ptr, byte_off);
+                        let cl_ty = match cranelift_type(&expr.ty)? {
+                            Some(t) => t,
+                            None => return Err(CodegenError::UnsupportedExpr("Index: unit element type".into())),
+                        };
+                        let val = self.builder.ins().load(cl_ty, cranelift_codegen::ir::MemFlags::trusted(), elem_ptr, 0);
+                        Ok(val)
+                    }
+                    _ => Err(CodegenError::UnsupportedExpr("Index: only Array indexing is supported".into())),
+                }
+            }
+
+            TypedExprKind::ArrayLiteral { elements } => {
+                let n = elements.len();
+                // Heap-allocate N * 8 bytes (uniform 8-byte slots like structs).
+                let size = (n * 8) as i64;
+                let size_val = self.builder.ins().iconst(self.codegen.ptr_type(), size);
+                let arr_ptr = self.call_malloc(size_val);
+                for (i, elem_expr) in elements.iter().enumerate() {
+                    let val = self.lower_expr(elem_expr)?;
+                    self.builder.ins().store(
+                        cranelift_codegen::ir::MemFlags::trusted(),
+                        val,
+                        arr_ptr,
+                        (i as i32) * 8,
+                    );
+                }
+                Ok(arr_ptr)
             }
 
             TypedExprKind::FieldAccess { base, field } => {
@@ -1000,8 +1357,8 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
 
     /// Allocate a single-element GPU tensor holding a scalar value.
     /// Used for scalar-broadcast dispatch. The caller is responsible for
-    /// ensuring the scalar is f32 (V1 only supports f32 broadcasting).
-    /// The returned handle leaks — it will be freed as part of the M11 temp cleanup.
+    /// ensuring the scalar is f32 (V1 only supports f32 broadcasting)
+    /// and for freeing the returned handle after dispatch.
     fn materialize_scalar_tensor(
         &mut self,
         scalar_expr: &malus_sema::TypedExpr,

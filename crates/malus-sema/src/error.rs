@@ -30,6 +30,98 @@ pub enum SemaError {
     UnknownConstructorField { struct_name: String, field: String, span: Span },
     DuplicateTypeDefinition { name: String, first: Span, second: Span },
     MatchScrutineeNotEnum { found: String, span: Span },
+    // ── M11: diagnostics ─────────────────────────────────────────────────────
+    TensorShapeMismatch { expected: usize, found: usize, span: Span },
+}
+
+impl SemaError {
+    pub fn primary_span(&self) -> Option<Span> {
+        use SemaError::*;
+        match self {
+            TypeMismatch { span, .. }
+            | DtypeMismatch { span, .. }
+            | PlacementMismatch { span, .. }
+            | UnknownIdent { span, .. }
+            | ArgCountMismatch { span, .. }
+            | ReturnTypeMismatch { span, .. }
+            | NotAFunction { span, .. }
+            | LossyCoercion { span, .. }
+            | KernelCalledFromKernel { span, .. }
+            | UnknownType { span, .. }
+            | FormatArgCountMismatch { span, .. }
+            | StringLiteralOutsidePrint { span }
+            | AssignToImmutable { span, .. }
+            | UnknownField { span, .. }
+            | UnknownVariant { span, .. }
+            | NonExhaustiveMatch { span, .. }
+            | DuplicateMatchArm { span, .. }
+            | MatchWildcard { span }
+            | MatchArmArityMismatch { span, .. }
+            | MissingField { span, .. }
+            | UnknownConstructorField { span, .. }
+            | MatchScrutineeNotEnum { span, .. }
+            | TensorShapeMismatch { span, .. } => Some(*span),
+            DuplicateDefinition { second, .. } | DuplicateTypeDefinition { second, .. } => Some(*second),
+            MainNotFound => None,
+        }
+    }
+
+    pub fn secondary_span(&self) -> Option<Span> {
+        use SemaError::*;
+        match self {
+            DuplicateDefinition { first, .. } | DuplicateTypeDefinition { first, .. } => Some(*first),
+            _ => None,
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        use SemaError::*;
+        match self {
+            TypeMismatch { .. } => "type mismatch here",
+            DtypeMismatch { .. } => "dtype mismatch in this expression",
+            PlacementMismatch { .. } => "placement mismatch here",
+            UnknownIdent { .. } => "not found in scope",
+            ArgCountMismatch { .. } => "wrong number of arguments",
+            ReturnTypeMismatch { .. } => "this expression has the wrong type",
+            NotAFunction { .. } => "not a function or kernel",
+            LossyCoercion { .. } => "lossy conversion not allowed",
+            KernelCalledFromKernel { .. } => "kernel called from kernel",
+            UnknownType { .. } => "unknown type",
+            FormatArgCountMismatch { .. } => "wrong number of {} placeholders",
+            StringLiteralOutsidePrint { .. } => "string literal here",
+            AssignToImmutable { .. } => "cannot assign to immutable binding",
+            UnknownField { .. } => "no such field",
+            UnknownVariant { .. } => "no such variant",
+            NonExhaustiveMatch { .. } => "match is not exhaustive",
+            DuplicateMatchArm { .. } => "duplicate arm",
+            MatchWildcard { .. } => "wildcard not allowed",
+            MatchArmArityMismatch { .. } => "wrong number of bindings in this arm",
+            MissingField { .. } => "this field is required",
+            UnknownConstructorField { .. } => "no such field in this struct",
+            DuplicateDefinition { .. } => "defined again here",
+            DuplicateTypeDefinition { .. } => "defined again here",
+            MatchScrutineeNotEnum { .. } => "not an enum type",
+            TensorShapeMismatch { .. } => "tensor shape mismatch",
+            MainNotFound => "",
+        }
+    }
+
+    pub fn note(&self) -> Option<&'static str> {
+        use SemaError::*;
+        match self {
+            AssignToImmutable { .. } => Some("change `let` to `let mut` to allow reassignment"),
+            LossyCoercion { .. } => Some("widen the narrower type explicitly — implicit narrowing is not allowed"),
+            DtypeMismatch { .. } => Some("ensure both sides of the operation use the same dtype"),
+            PlacementMismatch { .. } => Some("ensure both tensors are on the same device"),
+            KernelCalledFromKernel { .. } => Some("kernels can only be called from fn bodies"),
+            FormatArgCountMismatch { .. } => Some("add or remove {} placeholders to match the number of value arguments"),
+            StringLiteralOutsidePrint { .. } => Some("use println(\"{}\", value) to print a non-string value"),
+            NonExhaustiveMatch { .. } => Some("list all variants explicitly — wildcard _ arms are not supported in V1"),
+            MatchWildcard { .. } => Some("list each variant explicitly instead of using _"),
+            MissingField { .. } => Some("all fields must be provided in struct literals"),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for SemaError {
@@ -85,6 +177,8 @@ impl fmt::Display for SemaError {
                 write!(f, "duplicate type definition '{}'", name),
             SemaError::MatchScrutineeNotEnum { found, .. } =>
                 write!(f, "match scrutinee must be an enum type, got {}", found),
+            SemaError::TensorShapeMismatch { expected, found, .. } =>
+                write!(f, "tensor literal declares shape with {} element(s) but {} value(s) provided", expected, found),
         }
     }
 }

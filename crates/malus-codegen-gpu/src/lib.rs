@@ -165,11 +165,24 @@ fn collect_binops_in_stmt(
         TypedStmt::Assign { expr, .. } => collect_binops_in_expr(expr, tensor_ops, scalar_ops),
         TypedStmt::Return { expr } => collect_binops_in_expr(expr, tensor_ops, scalar_ops),
         TypedStmt::Expr(expr) => collect_binops_in_expr(expr, tensor_ops, scalar_ops),
-        TypedStmt::Drop { .. } | TypedStmt::DropStruct { .. } | TypedStmt::GpuBarrier
+        TypedStmt::Drop { .. } | TypedStmt::DropStruct { .. } | TypedStmt::DropEnum { .. }
+        | TypedStmt::DropArray { .. } | TypedStmt::GpuBarrier
         | TypedStmt::Retain { .. } | TypedStmt::Release { .. } => {}
-        // Kernel bodies cannot contain control flow (V1 constraint).
-        TypedStmt::If { .. } | TypedStmt::For { .. } | TypedStmt::While { .. } => {}
-        // Match recurse — relu/sigmoid inside arms must be collected.
+        TypedStmt::If { condition, then_body, else_body } => {
+            collect_binops_in_expr(condition, tensor_ops, scalar_ops);
+            for s in then_body { collect_binops_in_stmt(s, tensor_ops, scalar_ops); }
+            if let Some(eb) = else_body { for s in eb { collect_binops_in_stmt(s, tensor_ops, scalar_ops); } }
+        }
+        TypedStmt::For { body, .. } => {
+            for s in body { collect_binops_in_stmt(s, tensor_ops, scalar_ops); }
+        }
+        TypedStmt::While { condition, body } => {
+            collect_binops_in_expr(condition, tensor_ops, scalar_ops);
+            for s in body { collect_binops_in_stmt(s, tensor_ops, scalar_ops); }
+        }
+        TypedStmt::ForIn { body, .. } => {
+            for s in body { collect_binops_in_stmt(s, tensor_ops, scalar_ops); }
+        }
         TypedStmt::Match { scrutinee, arms } => {
             collect_binops_in_expr(scrutinee, tensor_ops, scalar_ops);
             for arm in arms {
@@ -229,6 +242,9 @@ fn collect_binops_in_expr(
         TypedExprKind::EnumInit { payload, .. } => {
             for p in payload { collect_binops_in_expr(p, tensor_ops, scalar_ops); }
         }
+        TypedExprKind::ArrayLiteral { elements } => {
+            for e in elements { collect_binops_in_expr(e, tensor_ops, scalar_ops); }
+        }
         TypedExprKind::Lit(_) | TypedExprKind::Ident(_) => {}
     }
 }
@@ -239,9 +255,24 @@ fn collect_unary_builtins_in_stmt(stmt: &TypedStmt, out: &mut BTreeSet<String>) 
             collect_unary_builtins_in_expr(expr, out);
         }
         TypedStmt::Expr(expr) => collect_unary_builtins_in_expr(expr, out),
-        TypedStmt::Drop { .. } | TypedStmt::DropStruct { .. } | TypedStmt::GpuBarrier
+        TypedStmt::Drop { .. } | TypedStmt::DropStruct { .. } | TypedStmt::DropEnum { .. }
+        | TypedStmt::DropArray { .. } | TypedStmt::GpuBarrier
         | TypedStmt::Retain { .. } | TypedStmt::Release { .. } => {}
-        TypedStmt::If { .. } | TypedStmt::For { .. } | TypedStmt::While { .. } => {}
+        TypedStmt::If { condition, then_body, else_body } => {
+            collect_unary_builtins_in_expr(condition, out);
+            for s in then_body { collect_unary_builtins_in_stmt(s, out); }
+            if let Some(eb) = else_body { for s in eb { collect_unary_builtins_in_stmt(s, out); } }
+        }
+        TypedStmt::For { body, .. } => {
+            for s in body { collect_unary_builtins_in_stmt(s, out); }
+        }
+        TypedStmt::While { condition, body } => {
+            collect_unary_builtins_in_expr(condition, out);
+            for s in body { collect_unary_builtins_in_stmt(s, out); }
+        }
+        TypedStmt::ForIn { body, .. } => {
+            for s in body { collect_unary_builtins_in_stmt(s, out); }
+        }
         TypedStmt::Match { scrutinee, arms } => {
             collect_unary_builtins_in_expr(scrutinee, out);
             for arm in arms {
@@ -290,6 +321,9 @@ fn collect_unary_builtins_in_expr(expr: &TypedExpr, out: &mut BTreeSet<String>) 
         }
         TypedExprKind::EnumInit { payload, .. } => {
             for p in payload { collect_unary_builtins_in_expr(p, out); }
+        }
+        TypedExprKind::ArrayLiteral { elements } => {
+            for e in elements { collect_unary_builtins_in_expr(e, out); }
         }
         TypedExprKind::Lit(_) | TypedExprKind::Ident(_) => {}
     }

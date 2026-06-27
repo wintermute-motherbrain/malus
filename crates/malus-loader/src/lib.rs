@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug)]
 pub enum LoadError {
-    Parse(ParseError),
+    Parse { error: ParseError, path: PathBuf, source: String },
     FileNotFound { path: PathBuf, import_span: Span },
     CircularImport { cycle: Vec<PathBuf>, import_span: Span },
     UnresolvedName { name: String, module: String, span: Span },
@@ -17,7 +17,8 @@ pub enum LoadError {
 impl std::fmt::Display for LoadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            LoadError::Parse(e) => write!(f, "parse error: {}", e),
+            LoadError::Parse { error: e, path, .. } =>
+                write!(f, "{}: parse error: {}", path.display(), e),
             LoadError::FileNotFound { path, .. } =>
                 write!(f, "module not found: {}", path.display()),
             LoadError::CircularImport { cycle, .. } => {
@@ -136,7 +137,11 @@ impl ModuleLoader {
         })?;
         self.sources.insert(file_id, (canonical.clone(), source.clone()));
 
-        let program = parse(file_id, &source).map_err(LoadError::Parse)?;
+        let program = parse(file_id, &source).map_err(|e| LoadError::Parse {
+            error: e,
+            path: canonical.clone(),
+            source: source.clone(),
+        })?;
 
         let base_dir = canonical.parent().unwrap().to_path_buf();
         let mut definition_items: Vec<Item> = Vec::new();

@@ -126,7 +126,7 @@ impl Parser {
     fn parse_type(&mut self) -> Result<Ty, ParseError> {
         let span = self.current_span();
 
-        // Tensor<dtype>
+        // Tensor<dtype> | Array<T, N>
         if let TokenKind::Ident(name) = self.current_kind().clone() {
             if name == "Tensor" {
                 self.advance();
@@ -137,6 +137,28 @@ impl Parser {
                 })?;
                 self.expect(&TokenKind::Gt)?;
                 return Ok(Ty::Tensor { dtype });
+            }
+
+            if name == "Array" {
+                self.advance();
+                self.expect(&TokenKind::Lt)?;
+                let elem = self.parse_type()?;
+                self.expect(&TokenKind::Comma)?;
+                let len_span = self.current_span();
+                let len = match self.current_kind().clone() {
+                    TokenKind::Int(v) if v >= 0 => {
+                        self.advance();
+                        v as usize
+                    }
+                    other => {
+                        return Err(ParseError::new(
+                            format!("Array length must be a non-negative integer literal, got {:?}", other),
+                            len_span,
+                        ));
+                    }
+                };
+                self.expect(&TokenKind::Gt)?;
+                return Ok(Ty::Array { elem: Box::new(elem), len });
             }
 
             // Scalar type
@@ -398,45 +420,41 @@ impl Parser {
                 let (var, _) = self.expect_ident()?; // loop variable
                 self.expect(&TokenKind::In)?;
 
-                // `range` is syntactic sugar, not a runtime function.
-                // Accepted forms: `range(end)` → start=0  and `range(start, end)`.
-                let range_span = self.current_span();
-                match self.current_kind().clone() {
-                    TokenKind::Ident(ref name) if name == "range" => {
-                        self.advance(); // consume 'range'
-                    }
-                    _ => {
-                        return Err(ParseError::new(
-                            format!(
-                                "'for' loops must iterate over 'range(...)'; got {:?}",
-                                self.current_kind()
-                            ),
-                            range_span,
-                        ));
-                    }
-                }
-                self.expect(&TokenKind::LParen)?;
-                let first_arg = self.parse_expr()?;
-                let (start_expr, end_expr) = if matches!(self.current_kind(), TokenKind::Comma) {
-                    self.advance(); // consume ','
-                    let second = self.parse_expr()?;
-                    (first_arg, second)
-                } else {
-                    // range(n) → start = 0, end = n
-                    let zero = Expr {
-                        kind: ExprKind::Lit(Lit::Int(0)),
-                        span: start, // synthetic span at the 'for' keyword
+                // `range(...)` is syntactic sugar → `For { start, end }`.
+                // Any other expression → `ForIn { iter }` for array iteration.
+                if matches!(self.current_kind(), TokenKind::Ident(ref n) if n == "range") {
+                    self.advance(); // consume 'range'
+                    self.expect(&TokenKind::LParen)?;
+                    let first_arg = self.parse_expr()?;
+                    let (start_expr, end_expr) = if matches!(self.current_kind(), TokenKind::Comma) {
+                        self.advance(); // consume ','
+                        let second = self.parse_expr()?;
+                        (first_arg, second)
+                    } else {
+                        let zero = Expr {
+                            kind: ExprKind::Lit(Lit::Int(0)),
+                            span: start,
+                        };
+                        (zero, first_arg)
                     };
-                    (zero, first_arg)
-                };
-                self.expect(&TokenKind::RParen)?;
-                self.expect(&TokenKind::Colon)?;
-                let body = self.parse_body()?;
-                let end = self.current_span();
-                Ok(Stmt {
-                    kind: StmtKind::For { var, start: start_expr, end: end_expr, body },
-                    span: Span::new(start.file, start.start as usize, end.start as usize),
-                })
+                    self.expect(&TokenKind::RParen)?;
+                    self.expect(&TokenKind::Colon)?;
+                    let body = self.parse_body()?;
+                    let end = self.current_span();
+                    Ok(Stmt {
+                        kind: StmtKind::For { var, start: start_expr, end: end_expr, body },
+                        span: Span::new(start.file, start.start as usize, end.start as usize),
+                    })
+                } else {
+                    let iter = self.parse_expr()?;
+                    self.expect(&TokenKind::Colon)?;
+                    let body = self.parse_body()?;
+                    let end = self.current_span();
+                    Ok(Stmt {
+                        kind: StmtKind::ForIn { var, iter: Box::new(iter), body },
+                        span: Span::new(start.file, start.start as usize, end.start as usize),
+                    })
+                }
             }
             _ => {
                 let expr = self.parse_expr()?;
@@ -650,21 +668,61 @@ impl Parser {
         })?;
         self.expect(&TokenKind::Gt)?;
         self.expect(&TokenKind::LParen)?;
-        self.expect(&TokenKind::LBracket)?;
-        let mut elements = Vec::new();
-        while !matches!(self.current_kind(), TokenKind::RBracket | TokenKind::Eof) {
-            elements.push(self.parse_expr()?);
-            if matches!(self.current_kind(), TokenKind::Comma) {
-                self.advance();
-            } else {
-                break;
-            }
-        }
+        // Peek: if next token is `[` followed by `[`, it's a 2-D (nested) literal.
+        // If just `[`, it's 1-D. parse_tensor_rows handles both.
+        let (elements, shape) = self.parse_tensor_rows()?;
         let end = self.current_span();
-        self.expect(&TokenKind::RBracket)?;
         self.expect(&TokenKind::RParen)?;
         let span = Span::new(start.file, start.start as usize, end.end as usize);
-        Ok(Expr { kind: ExprKind::TensorLiteral { placement, dtype, elements }, span })
+        Ok(Expr { kind: ExprKind::TensorLiteral { placement, dtype, elements, shape }, span })
+    }
+
+    /// Parse `[scalar, ...]` (1-D) or `[[scalar,...],[scalar,...]]` (2-D).
+    /// Returns `(flat_elements, shape)`.
+    fn parse_tensor_rows(&mut self) -> Result<(Vec<Expr>, Vec<usize>), ParseError> {
+        self.expect(&TokenKind::LBracket)?;
+        if matches!(self.current_kind(), TokenKind::LBracket) {
+            // 2-D: rows of scalars.
+            let mut all_elems: Vec<Expr> = Vec::new();
+            let mut row_count = 0usize;
+            let mut col_count: Option<usize> = None;
+            loop {
+                self.expect(&TokenKind::LBracket)?;
+                let mut row: Vec<Expr> = Vec::new();
+                while !matches!(self.current_kind(), TokenKind::RBracket | TokenKind::Eof) {
+                    row.push(self.parse_expr()?);
+                    if matches!(self.current_kind(), TokenKind::Comma) { self.advance(); } else { break; }
+                }
+                self.expect(&TokenKind::RBracket)?;
+                let n = row.len();
+                if let Some(c) = col_count {
+                    if n != c {
+                        return Err(ParseError::new(
+                            format!("tensor row has {} elements but expected {}", n, c),
+                            self.current_span(),
+                        ));
+                    }
+                } else {
+                    col_count = Some(n);
+                }
+                all_elems.extend(row);
+                row_count += 1;
+                if matches!(self.current_kind(), TokenKind::Comma) { self.advance(); } else { break; }
+            }
+            self.expect(&TokenKind::RBracket)?;
+            let cols = col_count.unwrap_or(0);
+            Ok((all_elems, vec![row_count, cols]))
+        } else {
+            // 1-D flat list.
+            let mut elements = Vec::new();
+            while !matches!(self.current_kind(), TokenKind::RBracket | TokenKind::Eof) {
+                elements.push(self.parse_expr()?);
+                if matches!(self.current_kind(), TokenKind::Comma) { self.advance(); } else { break; }
+            }
+            let len = elements.len();
+            self.expect(&TokenKind::RBracket)?;
+            Ok((elements, vec![len]))
+        }
     }
 
     fn parse_primary(&mut self) -> Result<Expr, ParseError> {
@@ -680,6 +738,26 @@ impl Parser {
                 let inner = self.parse_expr()?;
                 self.expect(&TokenKind::RParen)?;
                 Ok(inner)
+            }
+            // `[e1, e2, e3]` — array literal (NOT tensor literal rows; those are
+            // parsed by `parse_tensor_literal` which owns the bracket structure).
+            TokenKind::LBracket => {
+                self.advance();
+                let mut elements = Vec::new();
+                while !matches!(self.current_kind(), TokenKind::RBracket | TokenKind::Eof) {
+                    elements.push(self.parse_expr()?);
+                    if matches!(self.current_kind(), TokenKind::Comma) {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
+                let end = self.current_span();
+                self.expect(&TokenKind::RBracket)?;
+                Ok(Expr {
+                    kind: ExprKind::ArrayLiteral { elements },
+                    span: Span::new(span.file, span.start as usize, end.end as usize),
+                })
             }
             _ => Err(ParseError::new(
                 format!("expected expression, got {:?}", self.current_kind()),
@@ -972,7 +1050,7 @@ mod tests {
         let StmtKind::Return { expr } = &body[0].kind else { panic!() };
         assert!(matches!(
             &expr.kind,
-            ExprKind::TensorLiteral { placement: Placement::Gpu, dtype: ScalarTy::F32, elements }
+            ExprKind::TensorLiteral { placement: Placement::Gpu, dtype: ScalarTy::F32, elements, .. }
             if elements.len() == 1
         ));
     }
@@ -1086,7 +1164,7 @@ mod tests {
         let StmtKind::Return { expr } = &body[0].kind else { panic!() };
         assert!(matches!(
             &expr.kind,
-            ExprKind::TensorLiteral { placement: Placement::Cpu, dtype: ScalarTy::I32, elements }
+            ExprKind::TensorLiteral { placement: Placement::Cpu, dtype: ScalarTy::I32, elements, .. }
             if elements.len() == 3
         ));
     }
@@ -1317,9 +1395,29 @@ mod tests {
     }
 
     #[test]
-    fn parse_for_non_range_is_error() {
+    fn parse_for_in_array_ident() {
+        // `for x in expr:` is now valid ForIn syntax (M11).
         let src = "fn f():\n    for i in mylist:\n        print(i)\n";
-        let err = parse(FileId(0), src).unwrap_err();
-        assert!(err.message.contains("range"), "error was: {}", err.message);
+        let prog = parse_ok(src);
+        let ItemKind::Fn { body, .. } = &prog.items[0].kind else { panic!() };
+        assert!(matches!(body[0].kind, StmtKind::ForIn { .. }), "expected ForIn, got {:?}", body[0].kind);
+    }
+
+    #[test]
+    fn parse_array_literal() {
+        let src = "fn f():\n    let xs = [1, 2, 3]\n";
+        let prog = parse_ok(src);
+        let ItemKind::Fn { body, .. } = &prog.items[0].kind else { panic!() };
+        let StmtKind::Let { name, expr } = &body[0].kind else { panic!() };
+        assert_eq!(name, "xs");
+        assert!(matches!(expr.kind, ExprKind::ArrayLiteral { .. }));
+    }
+
+    #[test]
+    fn parse_array_type() {
+        let src = "fn f(xs: Array<i64, 3>):\n    return xs[0]\n";
+        let prog = parse_ok(src);
+        let ItemKind::Fn { params, .. } = &prog.items[0].kind else { panic!() };
+        assert!(matches!(params[0].ty, Ty::Array { len: 3, .. }));
     }
 }

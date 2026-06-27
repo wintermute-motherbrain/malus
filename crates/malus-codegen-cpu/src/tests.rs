@@ -159,7 +159,10 @@ extern "C" fn mock_tensor_len(handle: i64) -> i64 {
 
 // M9 RC ABI — no-ops in tests (M9 CTMM emits no Retain/Release nodes).
 extern "C" fn mock_tensor_retain(_handle: i64) {}
-extern "C" fn mock_tensor_release(_handle: i64) {}
+extern "C" fn mock_tensor_release(handle: i64) {
+    // In a single-owner world (CTMM), release == free.
+    with_store(|s| { s.tensors.remove(&handle); });
+}
 
 fn mock_symbols() -> RuntimeSymbols {
     RuntimeSymbols {
@@ -701,6 +704,82 @@ fn main():
 "#;
     run_src(src).expect("let mut accumulator in loop should compile and run");
     assert_eq!(live_tensor_count(), 0, "acc and delta must be freed after loop");
+}
+
+// ── Phase 5: 2-D nested tensor literals ──────────────────────────────────────
+
+#[test]
+fn test_2d_tensor_literal_compiles() {
+    let src = r#"
+fn main():
+    let x = Tensor.gpu<f32>([[1.0, 2.0], [3.0, 4.0]])
+    print(x)
+"#;
+    run_src(src).expect("2-D tensor literal should compile and run");
+    assert_eq!(live_tensor_count(), 0, "2-D tensor should be freed");
+}
+
+#[test]
+fn test_2d_tensor_shape_in_alloc() {
+    let src = r#"
+fn main():
+    let x = Tensor.gpu<f32>([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+    print(x)
+"#;
+    // Should pass 2 dimensions [2, 3] to tensor_alloc_gpu, which the mock records.
+    run_src(src).expect("2-D tensor literal [2,3] should compile and run");
+    assert_eq!(live_tensor_count(), 0);
+}
+
+// ── Phase 4: fixed arrays ─────────────────────────────────────────────────────
+
+#[test]
+fn test_array_literal_and_index() {
+    let src = r#"
+fn main():
+    let xs = [10, 20, 30]
+    let v0 = xs[0]
+    let v1 = xs[1]
+    let v2 = xs[2]
+    println("vals: {} {} {}", v0, v1, v2)
+"#;
+    run_src(src).expect("array literal + index should compile and run");
+}
+
+#[test]
+fn test_for_in_array() {
+    let src = r#"
+fn main():
+    let xs = [1, 2, 3]
+    let mut sum = 0
+    for x in xs:
+        sum = sum + x
+    println("sum={}", sum)
+"#;
+    run_src(src).expect("for-in over integer array should compile and run");
+}
+
+#[test]
+fn test_array_of_tensors_no_leak() {
+    let src = r#"
+fn main():
+    let ts = [Tensor.gpu<f32>([1.0]), Tensor.gpu<f32>([2.0]), Tensor.gpu<f32>([3.0])]
+    print(ts[0])
+"#;
+    run_src(src).expect("array of tensors should compile and run");
+    assert_eq!(live_tensor_count(), 0, "tensors in array must be freed by DropArray");
+}
+
+#[test]
+fn test_for_in_tensor_array_no_leak() {
+    let src = r#"
+fn main():
+    let ts = [Tensor.gpu<f32>([1.0]), Tensor.gpu<f32>([2.0])]
+    for t in ts:
+        print(t)
+"#;
+    run_src(src).expect("for-in over tensor array should compile and run");
+    assert_eq!(live_tensor_count(), 0, "no tensors should leak after for-in over tensor array");
 }
 
 /// M9 done-when: the example from the milestone spec.
