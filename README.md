@@ -69,7 +69,9 @@ predictions: [0.0056860363, 0.99518234, 0.9939387, 0.005444207]
 
 ## Status
 
-**V1 complete.** All M1–M11 milestones shipped.
+**V1 complete. V2 in progress (M13 done).**
+
+### V1 — complete
 
 - Dual-pipeline compilation — `fn` bodies JIT via Cranelift, `kernel` bodies compiled to MSL and dispatched on Metal
 - CTMM memory model — static tensor `free` and GPU barrier insertion at compile time, no GC overhead
@@ -85,6 +87,11 @@ predictions: [0.0056860363, 0.99518234, 0.9939387, 0.005444207]
 - Ariadne diagnostics — source spans, underlines, and help text on all parse/type errors
 - Multi-file imports — `import ops` / `from ops import add`
 - Format-string printing — `println("loss: {}", tensor)`
+
+### V2 — autograd (in progress)
+
+- **M12** — Hardening: `break`/`continue`, zero-length tensor guard, enum-payload retain-on-bind
+- **M13** — `Variable<f32>` type: type-directed ARC distinguishes differentiable tensors from plain tensors at compile time; CTMM emits `tensor_retain`/`tensor_release` only for `Variable` bindings; static `Drop` on `Tensor` is untouched. Aggregate boxes (structs, enums) gain an 8-byte ARC header; match-arm struct/enum payload escape is now safe via targeted `RetainAgg`/`ReleaseAgg` emission
 
 ## Project structure
 
@@ -110,6 +117,9 @@ examples/
   nested_tensor.ml    # 2-D tensor literal fed to matmul
   xor.ml              # V1 capstone: 2→8→1 sigmoid MLP that learns XOR
   import_demo/        # multi-file import
+  hardening.ml        # M12: break/continue, zeros(0), enum-payload escape
+  variable_rc.ml      # M13: Variable<f32> wrap/identity/data, zero-leak ARC
+  payload_escape.ml   # M13: struct payload escaping a match arm via aggregate ARC
 CONTEXT.md            # domain glossary
 ```
 
@@ -124,4 +134,4 @@ Requires: Rust 1.78+, macOS 14+ with Xcode command line tools (Metal runtime is 
 
 ## Architecture decisions
 
-See [`docs/adr/`](./docs/adr/) for the key decisions behind malus's design, including dual-pipeline compilation (ADR-0001), CTMM memory model (ADR-0002), panic-only error model (ADR-0006), and built-in kernel id allocation (ADR-0010).
+See [`docs/adr/`](./docs/adr/) for the key decisions behind malus's design, including dual-pipeline compilation (ADR-0001), CTMM memory model (ADR-0002), panic-only error model (ADR-0006), built-in kernel id allocation (ADR-0010), define-by-run autograd tape (ADR-0015), and type-directed RC for `Variable` vs `Tensor` (ADR-0016).
