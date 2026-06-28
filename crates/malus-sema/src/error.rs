@@ -52,6 +52,10 @@ pub enum SemaError {
     TupleIndexNotTuple { found: String, span: Span },
     /// Tuples with fewer than 2 elements are not allowed.
     TupleTooShort { span: Span },
+    // ── M14: tape control ────────────────────────────────────────────────────
+    /// `return`/`break`/`continue` inside a `with no_grad:` body would skip
+    /// `tape_resume()`. Rejected in M14 (D6).
+    EarlyExitInNoGrad { span: Span },
 }
 
 impl SemaError {
@@ -90,7 +94,8 @@ impl SemaError {
             | TupleDestructureNotTuple { span, .. }
             | TupleIndexOutOfRange { span, .. }
             | TupleIndexNotTuple { span, .. }
-            | TupleTooShort { span } => Some(*span),
+            | TupleTooShort { span }
+            | EarlyExitInNoGrad { span } => Some(*span),
             DuplicateDefinition { second, .. } | DuplicateTypeDefinition { second, .. } => Some(*second),
             MainNotFound => None,
         }
@@ -142,6 +147,7 @@ impl SemaError {
             TupleIndexOutOfRange { .. } => "tuple index out of range",
             TupleIndexNotTuple { .. } => "not a tuple type",
             TupleTooShort { .. } => "tuple must have at least 2 elements",
+            EarlyExitInNoGrad { .. } => "early exit inside no_grad block",
             MainNotFound => "",
         }
     }
@@ -157,6 +163,7 @@ impl SemaError {
             FormatArgCountMismatch { .. } => Some("add or remove {} placeholders to match the number of value arguments"),
             StringLiteralOutsidePrint { .. } => Some("use println(\"{}\", value) to print a non-string value"),
             NonExhaustiveMatch { .. } => Some("list all variants explicitly — wildcard _ arms are not supported in V1"),
+            EarlyExitInNoGrad { .. } => Some("move the early exit outside the `with no_grad:` block"),
             MatchWildcard { .. } => Some("list each variant explicitly instead of using _"),
             MissingField { .. } => Some("all fields must be provided in struct literals"),
             _ => None,
@@ -239,6 +246,8 @@ impl fmt::Display for SemaError {
                 write!(f, "cannot index with `.N`: expected a tuple, got {}", found),
             SemaError::TupleTooShort { .. } =>
                 write!(f, "tuples must have at least 2 elements"),
+            SemaError::EarlyExitInNoGrad { .. } =>
+                write!(f, "`return`/`break`/`continue` may not cross a `with no_grad:` boundary"),
         }
     }
 }

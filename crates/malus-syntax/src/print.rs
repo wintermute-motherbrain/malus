@@ -122,6 +122,10 @@ fn print_stmt(out: &mut String, stmt: &Stmt, depth: usize) {
         }
         StmtKind::Break => { writeln!(out, "{indent}break").unwrap(); }
         StmtKind::Continue => { writeln!(out, "{indent}continue").unwrap(); }
+        StmtKind::NoGrad { body } => {
+            writeln!(out, "{indent}with no_grad:").unwrap();
+            for s in body { print_stmt(out, s, depth + 1); }
+        }
         StmtKind::LetTuple { names, mutable, expr } => {
             let mut_kw = if *mutable { "mut " } else { "" };
             let binding = format!("({})", names.join(", "));
@@ -417,6 +421,9 @@ mod tests {
                     },
                 StmtKind::Break => StmtKind::Break,
                 StmtKind::Continue => StmtKind::Continue,
+                StmtKind::NoGrad { body } => StmtKind::NoGrad {
+                    body: body.into_iter().map(|s| erase_stmt(s, z)).collect(),
+                },
                 StmtKind::LetTuple { names, mutable, expr } => StmtKind::LetTuple {
                     names,
                     mutable,

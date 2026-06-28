@@ -106,7 +106,8 @@ fn recurse_into_inner_scopes(body: &mut Vec<TypedStmt>) {
             }
             TypedStmt::For { body, .. }
             | TypedStmt::While { body, .. }
-            | TypedStmt::ForIn { body, .. } => {
+            | TypedStmt::ForIn { body, .. }
+            | TypedStmt::NoGrad { body } => {
                 annotate_body(body);
             }
             _ => {}
@@ -450,7 +451,8 @@ fn insert_assign_drops(body: &mut Vec<TypedStmt>, escaping: &HashSet<String>) {
             }
             TypedStmt::For { body: inner, .. }
             | TypedStmt::While { body: inner, .. }
-            | TypedStmt::ForIn { body: inner, .. } => {
+            | TypedStmt::ForIn { body: inner, .. }
+            | TypedStmt::NoGrad { body: inner } => {
                 insert_assign_drops(inner, escaping);
             }
             _ => {}
@@ -609,7 +611,7 @@ fn inject_early_return_unwinds(
         let is_cf = matches!(&body[i],
             TypedStmt::If { .. } | TypedStmt::For { .. }
             | TypedStmt::While { .. } | TypedStmt::ForIn { .. }
-            | TypedStmt::Match { .. });
+            | TypedStmt::Match { .. } | TypedStmt::NoGrad { .. });
         if !is_cf {
             continue;
         }
@@ -622,7 +624,8 @@ fn inject_early_return_unwinds(
             }
             TypedStmt::For { body: inner, .. }
             | TypedStmt::While { body: inner, .. }
-            | TypedStmt::ForIn { body: inner, .. } => {
+            | TypedStmt::ForIn { body: inner, .. }
+            | TypedStmt::NoGrad { body: inner } => {
                 inject_unwind_in_body(inner, &live_here, local_types);
             }
             TypedStmt::Match { arms, .. } => {
@@ -662,7 +665,7 @@ fn inject_unwind_in_body(
             }
             TypedStmt::If { .. } | TypedStmt::For { .. }
             | TypedStmt::While { .. } | TypedStmt::ForIn { .. }
-            | TypedStmt::Match { .. } => {
+            | TypedStmt::Match { .. } | TypedStmt::NoGrad { .. } => {
                 // Recurse into nested control flow.
                 match &mut body[i] {
                     TypedStmt::If { then_body, else_body, .. } => {
@@ -673,7 +676,8 @@ fn inject_unwind_in_body(
                     }
                     TypedStmt::For { body: inner, .. }
                     | TypedStmt::While { body: inner, .. }
-                    | TypedStmt::ForIn { body: inner, .. } => {
+                    | TypedStmt::ForIn { body: inner, .. }
+                    | TypedStmt::NoGrad { body: inner } => {
                         inject_unwind_in_body(inner, live_outer, local_types);
                     }
                     TypedStmt::Match { arms, .. } => {
@@ -760,7 +764,7 @@ fn inject_break_continue_unwinds(body: &mut Vec<TypedStmt>, local_types: &HashMa
                 i += inserted + 1; // skip past the inserted drops + the jump itself
                 continue;
             }
-            TypedStmt::If { .. } | TypedStmt::Match { .. } => {
+            TypedStmt::If { .. } | TypedStmt::Match { .. } | TypedStmt::NoGrad { .. } => {
                 // Descend; do NOT descend into nested loops.
                 inject_bc_unwind_in_body_mut(body, i, &live_here, local_types);
             }
@@ -796,7 +800,7 @@ fn inject_bc_unwind_in_body(
                 i += inserted + 1;
                 continue;
             }
-            TypedStmt::If { .. } | TypedStmt::Match { .. } => {
+            TypedStmt::If { .. } | TypedStmt::Match { .. } | TypedStmt::NoGrad { .. } => {
                 match &mut inner[i] {
                     TypedStmt::If { then_body, else_body, .. } => {
                         inject_bc_unwind_in_body(then_body, live_outer, local_types);
@@ -808,6 +812,9 @@ fn inject_bc_unwind_in_body(
                         for arm in arms.iter_mut() {
                             inject_bc_unwind_in_body(&mut arm.body, live_outer, local_types);
                         }
+                    }
+                    TypedStmt::NoGrad { body: inner_body } => {
+                        inject_bc_unwind_in_body(inner_body, live_outer, local_types);
                     }
                     _ => {}
                 }
@@ -838,6 +845,9 @@ fn inject_bc_unwind_in_body_mut(
             for arm in arms.iter_mut() {
                 inject_bc_unwind_in_body(&mut arm.body, live_here, local_types);
             }
+        }
+        TypedStmt::NoGrad { body: inner } => {
+            inject_bc_unwind_in_body(inner, live_here, local_types);
         }
         _ => {}
     }
@@ -881,7 +891,8 @@ fn insert_barriers(body: &mut Vec<TypedStmt>) {
         // the node, emit a barrier before it and clear pending.  The inner bodies
         // already received their own barrier pass in `annotate_body` step 3.
         if matches!(&body[i], TypedStmt::If { .. } | TypedStmt::For { .. }
-                | TypedStmt::While { .. } | TypedStmt::ForIn { .. }) {
+                | TypedStmt::While { .. } | TypedStmt::ForIn { .. }
+                | TypedStmt::NoGrad { .. }) {
             if !pending.is_empty() {
                 let mut referenced = HashSet::new();
                 collect_idents_in_stmt(&body[i], &mut referenced);
@@ -945,7 +956,8 @@ fn extract_gpu_producing_expr(stmt: &TypedStmt) -> Option<(Vec<String>, Option<S
         | TypedStmt::ForIn { .. }
         | TypedStmt::LetTuple { .. }
         | TypedStmt::Break
-        | TypedStmt::Continue => return None,
+        | TypedStmt::Continue
+        | TypedStmt::NoGrad { .. } => return None,
     };
     match &expr.kind {
         TypedExprKind::KernelCall { in_flight, .. } => {
@@ -1027,7 +1039,8 @@ fn collect_escaping_in(body: &[TypedStmt], out: &mut HashSet<String>) {
             }
             TypedStmt::For { body, .. }
             | TypedStmt::While { body, .. }
-            | TypedStmt::ForIn { body, .. } => {
+            | TypedStmt::ForIn { body, .. }
+            | TypedStmt::NoGrad { body } => {
                 collect_escaping_in(body, out);
             }
             _ => {}
@@ -1103,6 +1116,9 @@ fn collect_idents_in_stmt(stmt: &TypedStmt, out: &mut HashSet<String>) {
             for arm in arms {
                 for s in &arm.body { collect_idents_in_stmt(s, out); }
             }
+        }
+        TypedStmt::NoGrad { body } => {
+            for s in body { collect_idents_in_stmt(s, out); }
         }
     }
 }

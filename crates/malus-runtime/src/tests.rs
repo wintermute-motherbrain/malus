@@ -6,6 +6,9 @@ use crate::{
     tensor_retain, tensor_release, tensor_free, tensor_print, tensor_len,
     tensor_matmul, tensor_transpose, tensor_sum,
     kernel_dispatch, gpu_barrier,
+    tape_record_binop, tape_record_unary, tape_register_leaf,
+    tape_pause, tape_resume, tape_get_grad, tape_clear,
+    backward, OpTag, tape_reset,
 };
 
 #[test]
@@ -370,4 +373,403 @@ fn test_tensor_retain_null_no_crash() {
 #[test]
 fn test_tensor_release_null_no_crash() {
     tensor_release(0); // guard: handle == 0 → no-op
+}
+
+// ── M14: tape + backward ──────────────────────────────────────────────────────
+
+#[test]
+fn test_optag_from_tag_drift() {
+    assert_eq!(OpTag::from_tag(0),  OpTag::Matmul);
+    assert_eq!(OpTag::from_tag(1),  OpTag::Add);
+    assert_eq!(OpTag::from_tag(2),  OpTag::Sub);
+    assert_eq!(OpTag::from_tag(3),  OpTag::Mul);
+    assert_eq!(OpTag::from_tag(4),  OpTag::Div);
+    assert_eq!(OpTag::from_tag(5),  OpTag::Sigmoid);
+    assert_eq!(OpTag::from_tag(6),  OpTag::Relu);
+    assert_eq!(OpTag::from_tag(7),  OpTag::Tanh);
+    assert_eq!(OpTag::from_tag(8),  OpTag::Exp);
+    assert_eq!(OpTag::from_tag(9),  OpTag::Log);
+    assert_eq!(OpTag::from_tag(10), OpTag::Sqrt);
+    assert_eq!(OpTag::from_tag(11), OpTag::Abs);
+    assert_eq!(OpTag::from_tag(12), OpTag::Sum);
+    assert_eq!(OpTag::from_tag(13), OpTag::Transpose);
+    assert_eq!(OpTag::from_tag(14), OpTag::Neg);
+}
+
+#[test]
+fn test_tape_clear_empty_no_crash() {
+    tape_reset();
+    tape_clear();
+}
+
+#[test]
+fn test_no_grad_records_nothing() {
+    tape_reset();
+    let a = alloc_f32(&[1.0, 2.0]);
+    let b = alloc_f32(&[3.0, 4.0]);
+    tape_register_leaf(a);
+    tape_register_leaf(b);
+    tape_pause();
+    let out = alloc_f32(&[4.0, 6.0]);
+    tape_record_binop(OpTag::Add as i32, a, b, out);
+    tape_resume();
+    // Tape should still be empty because we were paused.
+    backward(out);
+    let ga = tape_get_grad(a);
+    let gb = tape_get_grad(b);
+    // No nodes recorded → grads were never accumulated → zeros returned.
+    assert!(read_f32(ga).iter().all(|&v| v == 0.0), "paused record should produce zero grad");
+    assert!(read_f32(gb).iter().all(|&v| v == 0.0));
+    tensor_free(ga);
+    tensor_free(gb);
+    tensor_free(a);
+    tensor_free(b);
+    tensor_free(out);
+}
+
+#[test]
+fn test_backward_add() {
+    tape_reset();
+    let a = alloc_f32(&[1.0, 2.0]);
+    let b = alloc_f32(&[3.0, 4.0]);
+    tape_register_leaf(a);
+    tape_register_leaf(b);
+    // Forward: out = a + b  (simulated manually)
+    let out = alloc_f32(&[4.0, 6.0]);
+    tape_record_binop(OpTag::Add as i32, a, b, out);
+    backward(out);
+    let ga = tape_get_grad(a);
+    let gb = tape_get_grad(b);
+    // dA = dC = ones_like(out) = [1,1]; dB = dC = [1,1]
+    assert_eq!(read_f32(ga), vec![1.0, 1.0]);
+    assert_eq!(read_f32(gb), vec![1.0, 1.0]);
+    tensor_free(ga);
+    tensor_free(gb);
+    tensor_free(a);
+    tensor_free(b);
+    tensor_free(out);
+}
+
+#[test]
+fn test_backward_sub() {
+    tape_reset();
+    let a = alloc_f32(&[5.0, 6.0]);
+    let b = alloc_f32(&[2.0, 1.0]);
+    tape_register_leaf(a);
+    tape_register_leaf(b);
+    let out = alloc_f32(&[3.0, 5.0]);
+    tape_record_binop(OpTag::Sub as i32, a, b, out);
+    backward(out);
+    let ga = tape_get_grad(a);
+    let gb = tape_get_grad(b);
+    // dA = [1,1]; dB = -[1,1] = [-1,-1]
+    assert_eq!(read_f32(ga), vec![1.0, 1.0]);
+    assert_eq!(read_f32(gb), vec![-1.0, -1.0]);
+    tensor_free(ga); tensor_free(gb);
+    tensor_free(a); tensor_free(b); tensor_free(out);
+}
+
+#[test]
+fn test_backward_mul() {
+    tape_reset();
+    let a = alloc_f32(&[2.0, 3.0]);
+    let b = alloc_f32(&[4.0, 5.0]);
+    tape_register_leaf(a);
+    tape_register_leaf(b);
+    let out = alloc_f32(&[8.0, 15.0]);
+    tape_record_binop(OpTag::Mul as i32, a, b, out);
+    backward(out);
+    let ga = tape_get_grad(a);
+    let gb = tape_get_grad(b);
+    // dA = dC * B = [1,1]*[4,5] = [4,5]; dB = A * dC = [2,3]*[1,1] = [2,3]
+    assert_eq!(read_f32(ga), vec![4.0, 5.0]);
+    assert_eq!(read_f32(gb), vec![2.0, 3.0]);
+    tensor_free(ga); tensor_free(gb);
+    tensor_free(a); tensor_free(b); tensor_free(out);
+}
+
+#[test]
+fn test_backward_neg() {
+    tape_reset();
+    let a = alloc_f32(&[1.0, -2.0, 3.0]);
+    tape_register_leaf(a);
+    let out = alloc_f32(&[-1.0, 2.0, -3.0]);
+    tape_record_unary(OpTag::Neg as i32, a, out);
+    backward(out);
+    let ga = tape_get_grad(a);
+    // dx = -dC = -[1,1,1] = [-1,-1,-1]
+    assert_eq!(read_f32(ga), vec![-1.0, -1.0, -1.0]);
+    tensor_free(ga); tensor_free(a); tensor_free(out);
+}
+
+#[test]
+fn test_backward_relu() {
+    tape_reset();
+    // relu(x): mask = x>0
+    let x = alloc_f32(&[-1.0, 0.0, 2.0, 3.0]);
+    tape_register_leaf(x);
+    let out = alloc_f32(&[0.0, 0.0, 2.0, 3.0]);
+    tape_record_unary(OpTag::Relu as i32, x, out);
+    backward(out);
+    let gx = tape_get_grad(x);
+    // dC = ones; mask = [0,0,1,1]; dx = [0,0,1,1]
+    assert_eq!(read_f32(gx), vec![0.0, 0.0, 1.0, 1.0]);
+    tensor_free(gx); tensor_free(x); tensor_free(out);
+}
+
+#[test]
+fn test_backward_sigmoid() {
+    tape_reset();
+    // s = sigmoid(0) = 0.5; ds/dx = s*(1-s) = 0.25
+    let x = alloc_f32(&[0.0]);
+    tape_register_leaf(x);
+    let s_val = 1.0_f32 / (1.0 + (-0.0_f32).exp());
+    let out = alloc_f32(&[s_val]);
+    tape_record_unary(OpTag::Sigmoid as i32, x, out);
+    backward(out);
+    let gx = tape_get_grad(x);
+    let gx_data = read_f32(gx);
+    let expected = s_val * (1.0 - s_val);
+    assert!((gx_data[0] - expected).abs() < 1e-6, "sigmoid grad: got {}, want {}", gx_data[0], expected);
+    tensor_free(gx); tensor_free(x); tensor_free(out);
+}
+
+#[test]
+fn test_backward_tanh() {
+    tape_reset();
+    let x = alloc_f32(&[0.0]);
+    tape_register_leaf(x);
+    let t_val = 0.0_f32.tanh(); // = 0
+    let out = alloc_f32(&[t_val]);
+    tape_record_unary(OpTag::Tanh as i32, x, out);
+    backward(out);
+    let gx = tape_get_grad(x);
+    let expected = 1.0 - t_val * t_val; // = 1.0
+    assert!((read_f32(gx)[0] - expected).abs() < 1e-6);
+    tensor_free(gx); tensor_free(x); tensor_free(out);
+}
+
+#[test]
+fn test_backward_exp() {
+    tape_reset();
+    let x = alloc_f32(&[1.0]);
+    tape_register_leaf(x);
+    let e_val = 1.0_f32.exp();
+    let out = alloc_f32(&[e_val]);
+    tape_record_unary(OpTag::Exp as i32, x, out);
+    backward(out);
+    let gx = tape_get_grad(x);
+    // dx = dC * e = 1 * e = e
+    assert!((read_f32(gx)[0] - e_val).abs() < 1e-6);
+    tensor_free(gx); tensor_free(x); tensor_free(out);
+}
+
+#[test]
+fn test_backward_log() {
+    tape_reset();
+    let x = alloc_f32(&[2.0]);
+    tape_register_leaf(x);
+    let out = alloc_f32(&[2.0_f32.ln()]);
+    tape_record_unary(OpTag::Log as i32, x, out);
+    backward(out);
+    let gx = tape_get_grad(x);
+    // dx = dC / x = 1 / 2 = 0.5
+    assert!((read_f32(gx)[0] - 0.5).abs() < 1e-6);
+    tensor_free(gx); tensor_free(x); tensor_free(out);
+}
+
+#[test]
+fn test_backward_sqrt() {
+    tape_reset();
+    let x = alloc_f32(&[4.0]);
+    tape_register_leaf(x);
+    let s = 4.0_f32.sqrt(); // = 2.0
+    let out = alloc_f32(&[s]);
+    tape_record_unary(OpTag::Sqrt as i32, x, out);
+    backward(out);
+    let gx = tape_get_grad(x);
+    // dx = dC / (2*s) = 1 / 4 = 0.25
+    assert!((read_f32(gx)[0] - 0.25).abs() < 1e-6);
+    tensor_free(gx); tensor_free(x); tensor_free(out);
+}
+
+#[test]
+fn test_backward_abs() {
+    tape_reset();
+    let x = alloc_f32(&[-3.0, 0.0, 2.0]);
+    tape_register_leaf(x);
+    let out = alloc_f32(&[3.0, 0.0, 2.0]);
+    tape_record_unary(OpTag::Abs as i32, x, out);
+    backward(out);
+    let gx = tape_get_grad(x);
+    // sign: -1, 0, 1
+    assert_eq!(read_f32(gx), vec![-1.0, 0.0, 1.0]);
+    tensor_free(gx); tensor_free(x); tensor_free(out);
+}
+
+#[test]
+fn test_backward_div() {
+    tape_reset();
+    // C = A / B; A=[6,8], B=[2,4]
+    let a = alloc_f32(&[6.0, 8.0]);
+    let b = alloc_f32(&[2.0, 4.0]);
+    tape_register_leaf(a);
+    tape_register_leaf(b);
+    let out = alloc_f32(&[3.0, 2.0]);
+    tape_record_binop(OpTag::Div as i32, a, b, out);
+    backward(out);
+    let ga = tape_get_grad(a);
+    let gb = tape_get_grad(b);
+    // dA = dC / B = [1,1] / [2,4] = [0.5, 0.25]
+    let ga_data = read_f32(ga);
+    assert!((ga_data[0] - 0.5).abs() < 1e-6, "dA[0]: {}", ga_data[0]);
+    assert!((ga_data[1] - 0.25).abs() < 1e-6, "dA[1]: {}", ga_data[1]);
+    // dB = -dC * A / B² = -[1,1] * [6,8] / [4,16] = [-1.5, -0.5]
+    let gb_data = read_f32(gb);
+    assert!((gb_data[0] - (-1.5)).abs() < 1e-6, "dB[0]: {}", gb_data[0]);
+    assert!((gb_data[1] - (-0.5)).abs() < 1e-6, "dB[1]: {}", gb_data[1]);
+    tensor_free(ga); tensor_free(gb);
+    tensor_free(a); tensor_free(b); tensor_free(out);
+}
+
+#[test]
+fn test_backward_sum() {
+    tape_reset();
+    let x = alloc_f32(&[1.0, 2.0, 3.0]);
+    tape_register_leaf(x);
+    let out = alloc_f32(&[6.0]); // sum = 6
+    tape_record_unary(OpTag::Sum as i32, x, out);
+    backward(out);
+    let gx = tape_get_grad(x);
+    // dx = ones_like(x) * dC[0] = [1,1,1]*1 = [1,1,1]
+    assert_eq!(read_f32(gx), vec![1.0, 1.0, 1.0]);
+    tensor_free(gx); tensor_free(x); tensor_free(out);
+}
+
+#[test]
+fn test_backward_transpose() {
+    tape_reset();
+    // [[1,2],[3,4]] transposed = [[1,3],[2,4]]
+    let x = alloc_2d(&[1.0, 2.0, 3.0, 4.0], 2, 2);
+    tape_register_leaf(x);
+    let out = alloc_2d(&[1.0, 3.0, 2.0, 4.0], 2, 2);
+    tape_record_unary(OpTag::Transpose as i32, x, out);
+    backward(out);
+    let gx = tape_get_grad(x);
+    let gx_tb = unsafe { &*(gx as *const TensorBuffer) };
+    // dA = dBᵀ.  dB = ones[2,2].  dBᵀ = ones[2,2] transposed = ones[2,2].
+    assert_eq!(gx_tb.shape, &[2, 2]);
+    assert!(read_f32(gx).iter().all(|&v| v == 1.0));
+    tensor_free(gx); tensor_free(x); tensor_free(out);
+}
+
+#[test]
+fn test_backward_matmul() {
+    tape_reset();
+    // A=[2,3] @ B=[3,2] -> C=[2,2]; finite-diff check
+    let a_data = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0]; // 2x3
+    let b_data = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]; // 3x2
+    let a = alloc_2d(&a_data, 2, 3);
+    let b = alloc_2d(&b_data, 3, 2);
+    tape_register_leaf(a);
+    tape_register_leaf(b);
+    let out = tensor_matmul(a, b);
+    tape_record_binop(OpTag::Matmul as i32, a, b, out);
+    backward(out); // seeds with ones[2,2]
+
+    let ga = tape_get_grad(a);
+    let gb = tape_get_grad(b);
+    let ga_tb = unsafe { &*(ga as *const TensorBuffer) };
+    let gb_tb = unsafe { &*(gb as *const TensorBuffer) };
+
+    // dA = dC @ Bᵀ; dB = Aᵀ @ dC (dC = ones[2,2])
+    assert_eq!(ga_tb.shape, &[2, 3]);
+    assert_eq!(gb_tb.shape, &[3, 2]);
+    // dA = ones[2,2] @ B^T; B^T = [[1,3,5],[2,4,6]]; row sums = [1+2,3+4,5+6] = [3,7,11]
+    let ga_data = read_f32(ga);
+    assert!((ga_data[0] - 3.0).abs() < 1e-5, "ga[0]: {}", ga_data[0]);
+    assert!((ga_data[1] - 7.0).abs() < 1e-5, "ga[1]: {}", ga_data[1]);
+    assert!((ga_data[2] - 11.0).abs() < 1e-5, "ga[2]: {}", ga_data[2]);
+
+    tensor_free(ga); tensor_free(gb);
+    tensor_free(a); tensor_free(b); tensor_free(out);
+}
+
+#[test]
+fn test_tape_clears_after_backward() {
+    tape_reset();
+    let a = alloc_f32(&[1.0]);
+    let b = alloc_f32(&[2.0]);
+    tape_register_leaf(a);
+    let out = alloc_f32(&[3.0]);
+    tape_record_binop(OpTag::Add as i32, a, b, out);
+    backward(out);
+    // backward calls tape_clear; push another node and clear manually
+    let g = tape_get_grad(a);
+    tensor_free(g);
+    // Another backward with empty tape should be a no-op
+    let loss2 = alloc_f32(&[0.0]);
+    backward(loss2);
+    tensor_free(loss2);
+    tensor_free(a); tensor_free(b); tensor_free(out);
+}
+
+#[test]
+fn test_leaf_grad_accumulates_across_two_backward_calls() {
+    tape_reset();
+    let a = alloc_f32(&[2.0]);
+    tape_register_leaf(a);
+
+    // First backward: a + b1
+    let b1 = alloc_f32(&[3.0]);
+    let out1 = alloc_f32(&[5.0]);
+    tape_record_binop(OpTag::Add as i32, a, b1, out1);
+    backward(out1);
+    // Second backward: a + b2
+    let b2 = alloc_f32(&[7.0]);
+    let out2 = alloc_f32(&[9.0]);
+    tape_record_binop(OpTag::Add as i32, a, b2, out2);
+    backward(out2);
+
+    // Each backward seeds ones[1] → da=1 per call → accumulated = 2
+    let ga = tape_get_grad(a);
+    assert_eq!(read_f32(ga), vec![2.0], "should accumulate across two backward calls");
+    tensor_free(ga);
+    tensor_free(a); tensor_free(b1); tensor_free(b2); tensor_free(out1); tensor_free(out2);
+}
+
+#[test]
+fn test_chain_sum_sigmoid_matmul() {
+    // Smoke test: loss = sum(sigmoid(x @ w)); backward works without panic.
+    tape_reset();
+    let x_data = [1.0f32, 2.0, 3.0, 4.0];
+    let w_data = [0.1f32, 0.2, 0.3, 0.4];
+    let x = alloc_2d(&x_data, 2, 2);
+    let w = alloc_2d(&w_data, 2, 2);
+    tape_register_leaf(w);
+
+    let mm = tensor_matmul(x, w);
+    tape_record_binop(OpTag::Matmul as i32, x, w, mm);
+
+    let sig_data: Vec<f32> = read_f32(mm).iter().map(|&v| 1.0 / (1.0 + (-v).exp())).collect();
+    let sig = alloc_like_vec(mm, &sig_data);
+    tape_record_unary(OpTag::Sigmoid as i32, mm, sig);
+
+    let s: f32 = sig_data.iter().sum();
+    let loss = alloc_f32(&[s]);
+    tape_record_unary(OpTag::Sum as i32, sig, loss);
+
+    backward(loss);
+
+    let gw = tape_get_grad(w);
+    let gw_tb = unsafe { &*(gw as *const TensorBuffer) };
+    assert_eq!(gw_tb.shape, &[2, 2], "grad w should be [2,2]");
+
+    tensor_free(gw);
+    tensor_free(x); tensor_free(w); tensor_free(mm); tensor_free(sig); tensor_free(loss);
+}
+
+fn alloc_like_vec(template: i64, data: &[f32]) -> i64 {
+    let tb = unsafe { &*(template as *const TensorBuffer) };
+    tensor_alloc_gpu(0, tb.shape.as_ptr(), tb.shape.len(), data.as_ptr())
 }

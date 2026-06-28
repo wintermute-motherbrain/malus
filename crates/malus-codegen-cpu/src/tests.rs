@@ -164,6 +164,16 @@ extern "C" fn mock_tensor_release(handle: i64) {
     with_store(|s| { s.tensors.remove(&handle); });
 }
 
+// M14 tape ABI — no-ops in tests (existing tests use Tensor, not Variable ops).
+extern "C" fn mock_tape_record_binop(_op: i32, _a: i64, _b: i64, _out: i64) {}
+extern "C" fn mock_tape_record_unary(_op: i32, _x: i64, _out: i64) {}
+extern "C" fn mock_tape_register_leaf(_handle: i64) {}
+extern "C" fn mock_tape_pause() {}
+extern "C" fn mock_tape_resume() {}
+extern "C" fn mock_tape_clear() {}
+extern "C" fn mock_tape_get_grad(_handle: i64) -> i64 { 0 }
+extern "C" fn mock_backward(_loss: i64) {}
+
 fn mock_symbols() -> RuntimeSymbols {
     RuntimeSymbols {
         tensor_alloc_gpu:       mock_tensor_alloc_gpu,
@@ -179,6 +189,14 @@ fn mock_symbols() -> RuntimeSymbols {
         tensor_len:             mock_tensor_len,
         tensor_retain:          mock_tensor_retain,
         tensor_release:         mock_tensor_release,
+        tape_record_binop:      mock_tape_record_binop,
+        tape_record_unary:      mock_tape_record_unary,
+        tape_register_leaf:     mock_tape_register_leaf,
+        tape_pause:             mock_tape_pause,
+        tape_resume:            mock_tape_resume,
+        tape_clear:             mock_tape_clear,
+        tape_get_grad:          mock_tape_get_grad,
+        backward:               mock_backward,
     }
 }
 

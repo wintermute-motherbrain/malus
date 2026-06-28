@@ -104,6 +104,15 @@ pub struct RuntimeSymbols {
     // M9 RC ABI — wired now, unused by M9 CTMM, consumed by M10.
     pub tensor_retain:          extern "C" fn(i64),
     pub tensor_release:         extern "C" fn(i64),
+    // M14 tape ABI.
+    pub tape_record_binop:      extern "C" fn(i32, i64, i64, i64),
+    pub tape_record_unary:      extern "C" fn(i32, i64, i64),
+    pub tape_register_leaf:     extern "C" fn(i64),
+    pub tape_pause:             extern "C" fn(),
+    pub tape_resume:            extern "C" fn(),
+    pub tape_clear:             extern "C" fn(),
+    pub tape_get_grad:          extern "C" fn(i64) -> i64,
+    pub backward:               extern "C" fn(i64),
 }
 
 // ── Error ─────────────────────────────────────────────────────────────────────
@@ -141,6 +150,50 @@ extern "C" fn print_i64(v: i64)  { print!("{v}"); }
 extern "C" fn print_bool(v: i8)  { print!("{}", if v != 0 { "true" } else { "false" }); }
 
 // ── dtype_tag — ScalarTy enum discriminant order ──────────────────────────────
+
+// M14: OpTag discriminants — must stay in sync with malus_runtime::tape::OpTag.
+// Drift is caught by the test_optag_from_tag_drift test in malus-runtime.
+const OPTAG_MATMUL:    i32 = 0;
+const OPTAG_ADD:       i32 = 1;
+const OPTAG_SUB:       i32 = 2;
+const OPTAG_MUL:       i32 = 3;
+const OPTAG_DIV:       i32 = 4;
+const OPTAG_SIGMOID:   i32 = 5;
+const OPTAG_RELU:      i32 = 6;
+const OPTAG_TANH:      i32 = 7;
+const OPTAG_EXP:       i32 = 8;
+const OPTAG_LOG:       i32 = 9;
+const OPTAG_SQRT:      i32 = 10;
+const OPTAG_ABS:       i32 = 11;
+const OPTAG_SUM:       i32 = 12;
+const OPTAG_TRANSPOSE: i32 = 13;
+const OPTAG_NEG:       i32 = 14;
+
+fn binop_to_optag(op: &BinOp) -> Option<i32> {
+    match op {
+        BinOp::Matmul => Some(OPTAG_MATMUL),
+        BinOp::Add    => Some(OPTAG_ADD),
+        BinOp::Sub    => Some(OPTAG_SUB),
+        BinOp::Mul    => Some(OPTAG_MUL),
+        BinOp::Div    => Some(OPTAG_DIV),
+        _ => None,
+    }
+}
+
+fn unary_builtin_to_optag(name: &str) -> Option<i32> {
+    match name {
+        "sigmoid"   => Some(OPTAG_SIGMOID),
+        "relu"      => Some(OPTAG_RELU),
+        "tanh"      => Some(OPTAG_TANH),
+        "exp"       => Some(OPTAG_EXP),
+        "log"       => Some(OPTAG_LOG),
+        "sqrt"      => Some(OPTAG_SQRT),
+        "abs"       => Some(OPTAG_ABS),
+        "sum"       => Some(OPTAG_SUM),
+        "transpose" => Some(OPTAG_TRANSPOSE),
+        _ => None,
+    }
+}
 
 fn dtype_tag(s: &ScalarTy) -> i32 {
     match s {
@@ -241,6 +294,15 @@ struct Codegen<'m> {
     rt_aggregate_alloc: FuncId,
     rt_aggregate_retain: FuncId,
     rt_aggregate_release: FuncId,
+    // M14: tape ABI.
+    rt_tape_record_binop:  FuncId,
+    rt_tape_record_unary:  FuncId,
+    rt_tape_register_leaf: FuncId,
+    rt_tape_pause:         FuncId,
+    rt_tape_resume:        FuncId,
+    rt_tape_clear:         FuncId,
+    rt_tape_get_grad:      FuncId,
+    rt_backward:           FuncId,
 }
 
 impl<'m> Codegen<'m> {
@@ -722,6 +784,16 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
             TypedStmt::Match { scrutinee, arms } => {
                 self.lower_match(scrutinee, arms)
             }
+
+            // ── M14: no_grad scope ───────────────────────────────────────────────
+            TypedStmt::NoGrad { body } => {
+                self.call_tape_pause();
+                for s in body {
+                    self.lower_stmt(s)?;
+                }
+                self.call_tape_resume();
+                Ok(false)
+            }
         }
     }
 
@@ -1103,6 +1175,27 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
 
             TypedExprKind::BinOp { op, lhs, rhs } => {
                 match (&lhs.ty, &rhs.ty) {
+                    // Variable ⊕ Variable — same forward as Tensor, plus tape_record_binop.
+                    (ResolvedTy::Variable { dtype: ld }, ResolvedTy::Variable { dtype: rd })
+                        if ld == rd && *ld == ScalarTy::F32 =>
+                    {
+                        let op_tag = binop_to_optag(op).ok_or_else(|| {
+                            CodegenError::UnsupportedExpr(format!("Variable BinOp {:?} not supported on tape", op))
+                        })?;
+                        let a = self.lower_expr(lhs)?;
+                        let b = self.lower_expr(rhs)?;
+                        let out = if *op == BinOp::Matmul {
+                            let matmul_ref = self.import_func(self.codegen.rt_tensor_matmul);
+                            let call = self.builder.ins().call(matmul_ref, &[a, b]);
+                            self.builder.inst_results(call).to_vec()[0]
+                        } else if let Some(kernel_name) = elementwise_builtin_name(op) {
+                            self.lower_kernel_dispatch_with_handles(kernel_name, &[a, b])?
+                        } else {
+                            return Err(CodegenError::UnsupportedExpr(format!("Variable BinOp {:?} not supported", op)));
+                        };
+                        self.call_tape_record_binop(op_tag, a, b, out);
+                        Ok(out)
+                    }
                     // tensor ⊕ tensor — matmul or element-wise builtin kernel
                     (ResolvedTy::Tensor { dtype: ld }, ResolvedTy::Tensor { dtype: rd })
                         if ld == rd && *ld == ScalarTy::F32 =>
@@ -1163,14 +1256,28 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
             }
 
             TypedExprKind::Unary { op, operand } => {
-                let val = self.lower_expr(operand)?;
                 match op {
-                    UnaryOp::Neg => match &operand.ty {
-                        ResolvedTy::Scalar(s) if is_float_scalar(s) => Ok(self.builder.ins().fneg(val)),
-                        ResolvedTy::Scalar(_) => Ok(self.builder.ins().ineg(val)),
-                        _ => Err(CodegenError::UnsupportedExpr("Neg on non-scalar".into())),
-                    },
+                    UnaryOp::Neg if operand.ty.is_variable() => {
+                        // Variable neg — forward: malus_mul_scalar(x, -1.0).
+                        // No Neg GPU kernel; reuse scalar-broadcast Mul with a -1 scalar tensor.
+                        let x = self.lower_expr(operand)?;
+                        let neg_one = self.builder.ins().f32const(-1.0_f32);
+                        let scalar_handle = self.emit_scalar_tensor(neg_one);
+                        let out = self.lower_kernel_dispatch_with_handles("malus_mul_scalar", &[x, scalar_handle])?;
+                        self.call_runtime_free(scalar_handle);
+                        self.call_tape_record_unary(OPTAG_NEG, x, out);
+                        Ok(out)
+                    }
+                    UnaryOp::Neg => {
+                        let val = self.lower_expr(operand)?;
+                        match &operand.ty {
+                            ResolvedTy::Scalar(s) if is_float_scalar(s) => Ok(self.builder.ins().fneg(val)),
+                            ResolvedTy::Scalar(_) => Ok(self.builder.ins().ineg(val)),
+                            _ => Err(CodegenError::UnsupportedExpr("Neg on non-scalar".into())),
+                        }
+                    }
                     UnaryOp::Not => {
+                        let val = self.lower_expr(operand)?;
                         let one = self.builder.ins().iconst(I8, 1);
                         Ok(self.builder.ins().bxor(val, one))
                     }
@@ -1223,17 +1330,44 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                 } else if self.codegen.kernel_ids.contains_key(callee.as_str()) {
                     // Unary math builtins (relu, sigmoid, tanh, exp, log, sqrt, abs)
                     // dispatched as built-in GPU kernels via kernel_dispatch.
-                    let arg_refs: Vec<&TypedExpr> = args.iter().collect();
-                    self.lower_kernel_dispatch(callee, &arg_refs)
+                    if expr.ty.is_variable() {
+                        // Variable input: lower arg first so we have x for tape_record_unary.
+                        let op_tag = unary_builtin_to_optag(callee).ok_or_else(|| {
+                            CodegenError::UnsupportedExpr(format!("no OpTag for Variable builtin '{callee}'"))
+                        })?;
+                        let x = self.lower_expr(&args[0])?;
+                        let out = self.lower_kernel_dispatch_with_handles(callee, &[x])?;
+                        self.call_tape_record_unary(op_tag, x, out);
+                        Ok(out)
+                    } else {
+                        let arg_refs: Vec<&TypedExpr> = args.iter().collect();
+                        self.lower_kernel_dispatch(callee, &arg_refs)
+                    }
                 } else if callee == "zeros" || callee == "ones" {
                     self.lower_zeros_ones(callee, args)
                 } else if callee == "transpose" || callee == "sum" {
-                    self.lower_eager_cpu_op(callee, args)
+                    if expr.ty.is_variable() {
+                        let op_tag = unary_builtin_to_optag(callee).ok_or_else(|| {
+                            CodegenError::UnsupportedExpr(format!("no OpTag for Variable builtin '{callee}'"))
+                        })?;
+                        let x = self.lower_expr(&args[0])?;
+                        let out = self.lower_eager_cpu_op_with_handle(callee, x)?;
+                        self.call_tape_record_unary(op_tag, x, out);
+                        Ok(out)
+                    } else {
+                        self.lower_eager_cpu_op(callee, args)
+                    }
                 } else if callee == "variable" {
-                    // variable(t) — wrap Tensor in Variable: retain to bump refcount, return same handle.
+                    // variable(t) — wrap Tensor in Variable: retain + tape_register_leaf.
                     let handle = self.lower_expr(&args[0])?;
                     self.call_runtime_retain(handle);
+                    self.call_tape_register_leaf(handle);
                     Ok(handle)
+                } else if callee == "backward" {
+                    // backward(loss) — walk the tape in reverse, accumulate grads.
+                    let handle = self.lower_expr(&args[0])?;
+                    self.call_backward(handle);
+                    Ok(self.builder.ins().iconst(I64, 0))
                 } else if callee == "tensor_print" {
                     let handle = self.lower_expr(&args[0])?;
                     self.call_runtime_print(handle);
@@ -1356,6 +1490,10 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                 } else if field == "data" && base.ty.is_variable() {
                     // Variable IS the tensor handle — .data just returns the same i64.
                     self.lower_expr(base)
+                } else if field == "grad" && base.ty.is_variable() {
+                    // .grad — call tape_get_grad; returns an owned Tensor handle (D5).
+                    let handle = self.lower_expr(base)?;
+                    Ok(self.call_tape_get_grad(handle))
                 } else if let ResolvedTy::Struct { fields, .. } = &base.ty {
                     let slot_idx = fields.iter().position(|(n, _)| n == field)
                         .ok_or_else(|| CodegenError::UnsupportedExpr(format!("struct has no field '{field}'")))?;
@@ -1627,6 +1765,36 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
         Ok(self.builder.inst_results(call).to_vec()[0])
     }
 
+    fn emit_scalar_tensor(
+        &mut self,
+        f32_val: cranelift_codegen::ir::Value,
+    ) -> cranelift_codegen::ir::Value {
+        let data_slot = self.builder.create_sized_stack_slot(
+            cranelift_codegen::ir::StackSlotData::new(
+                cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                4,
+                2,
+            )
+        );
+        self.builder.ins().stack_store(f32_val, data_slot, 0);
+        let shape_slot = self.builder.create_sized_stack_slot(
+            cranelift_codegen::ir::StackSlotData::new(
+                cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                8,
+                3,
+            )
+        );
+        let one = self.builder.ins().iconst(I64, 1);
+        self.builder.ins().stack_store(one, shape_slot, 0);
+        let data_ptr  = self.builder.ins().stack_addr(self.codegen.ptr_type(), data_slot, 0);
+        let shape_ptr = self.builder.ins().stack_addr(self.codegen.ptr_type(), shape_slot, 0);
+        let dtype_val = self.builder.ins().iconst(I32, 0); // F32 = tag 0
+        let ndims_val = self.builder.ins().iconst(self.codegen.ptr_type(), 1);
+        let alloc_ref = self.import_func(self.codegen.rt_tensor_alloc_gpu);
+        let call = self.builder.ins().call(alloc_ref, &[dtype_val, shape_ptr, ndims_val, data_ptr]);
+        self.builder.inst_results(call).to_vec()[0]
+    }
+
     fn lower_zeros_ones(
         &mut self,
         name: &str,
@@ -1667,6 +1835,14 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
             ));
         }
         let handle = self.lower_expr(&args[0])?;
+        self.lower_eager_cpu_op_with_handle(name, handle)
+    }
+
+    fn lower_eager_cpu_op_with_handle(
+        &mut self,
+        name: &str,
+        handle: cranelift_codegen::ir::Value,
+    ) -> Result<cranelift_codegen::ir::Value, CodegenError> {
         let func_ref = if name == "transpose" {
             self.import_func(self.codegen.rt_tensor_transpose)
         } else {
@@ -1756,6 +1932,57 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
         let func_ref = self.import_func(self.codegen.rt_aggregate_release);
         self.builder.ins().call(func_ref, &[ptr]);
     }
+
+    // M14 tape helpers.
+
+    fn call_tape_record_binop(
+        &mut self,
+        op_tag: i32,
+        a: cranelift_codegen::ir::Value,
+        b: cranelift_codegen::ir::Value,
+        out: cranelift_codegen::ir::Value,
+    ) {
+        let tag_val = self.builder.ins().iconst(I32, op_tag as i64);
+        let func_ref = self.import_func(self.codegen.rt_tape_record_binop);
+        self.builder.ins().call(func_ref, &[tag_val, a, b, out]);
+    }
+
+    fn call_tape_record_unary(
+        &mut self,
+        op_tag: i32,
+        x: cranelift_codegen::ir::Value,
+        out: cranelift_codegen::ir::Value,
+    ) {
+        let tag_val = self.builder.ins().iconst(I32, op_tag as i64);
+        let func_ref = self.import_func(self.codegen.rt_tape_record_unary);
+        self.builder.ins().call(func_ref, &[tag_val, x, out]);
+    }
+
+    fn call_tape_register_leaf(&mut self, handle: cranelift_codegen::ir::Value) {
+        let func_ref = self.import_func(self.codegen.rt_tape_register_leaf);
+        self.builder.ins().call(func_ref, &[handle]);
+    }
+
+    fn call_tape_pause(&mut self) {
+        let func_ref = self.import_func(self.codegen.rt_tape_pause);
+        self.builder.ins().call(func_ref, &[]);
+    }
+
+    fn call_tape_resume(&mut self) {
+        let func_ref = self.import_func(self.codegen.rt_tape_resume);
+        self.builder.ins().call(func_ref, &[]);
+    }
+
+    fn call_tape_get_grad(&mut self, handle: cranelift_codegen::ir::Value) -> cranelift_codegen::ir::Value {
+        let func_ref = self.import_func(self.codegen.rt_tape_get_grad);
+        let call = self.builder.ins().call(func_ref, &[handle]);
+        self.builder.inst_results(call).to_vec()[0]
+    }
+
+    fn call_backward(&mut self, loss: cranelift_codegen::ir::Value) {
+        let func_ref = self.import_func(self.codegen.rt_backward);
+        self.builder.ins().call(func_ref, &[loss]);
+    }
 }
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -1804,6 +2031,15 @@ pub fn compile_and_run(
     jit_builder.symbol("aggregate_alloc",        aggregate_alloc                as *const u8);
     jit_builder.symbol("aggregate_retain",       aggregate_retain               as *const u8);
     jit_builder.symbol("aggregate_release",      aggregate_release              as *const u8);
+    // M14 tape ABI — from RuntimeSymbols (live in malus-runtime).
+    jit_builder.symbol("tape_record_binop",      symbols.tape_record_binop      as *const u8);
+    jit_builder.symbol("tape_record_unary",      symbols.tape_record_unary      as *const u8);
+    jit_builder.symbol("tape_register_leaf",     symbols.tape_register_leaf     as *const u8);
+    jit_builder.symbol("tape_pause",             symbols.tape_pause             as *const u8);
+    jit_builder.symbol("tape_resume",            symbols.tape_resume            as *const u8);
+    jit_builder.symbol("tape_clear",             symbols.tape_clear             as *const u8);
+    jit_builder.symbol("tape_get_grad",          symbols.tape_get_grad          as *const u8);
+    jit_builder.symbol("backward",               symbols.backward               as *const u8);
 
     let mut module = JITModule::new(jit_builder);
     let ptr = module.target_config().pointer_type();
@@ -1955,6 +2191,44 @@ pub fn compile_and_run(
     let rt_aggregate_release = module.declare_function("aggregate_release", Linkage::Import, &sig_agg_rc)
         .map_err(|e| CodegenError::JitError(e.to_string()))?;
 
+    // M14 tape ABI signatures.
+    // tape_record_binop(op_tag: i32, a: i64, b: i64, out: i64)
+    let sig_tape_binop = {
+        let mut s = Signature::new(call_conv);
+        s.params.push(AbiParam::new(I32));
+        s.params.push(AbiParam::new(I64));
+        s.params.push(AbiParam::new(I64));
+        s.params.push(AbiParam::new(I64));
+        s
+    };
+    // tape_record_unary(op_tag: i32, x: i64, out: i64)
+    let sig_tape_unary = {
+        let mut s = Signature::new(call_conv);
+        s.params.push(AbiParam::new(I32));
+        s.params.push(AbiParam::new(I64));
+        s.params.push(AbiParam::new(I64));
+        s
+    };
+    let rt_tape_record_binop = module.declare_function("tape_record_binop", Linkage::Import, &sig_tape_binop)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
+    let rt_tape_record_unary = module.declare_function("tape_record_unary", Linkage::Import, &sig_tape_unary)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
+    // tape_register_leaf / backward / tape_clear use sig_free: (i64) -> ()
+    let rt_tape_register_leaf = module.declare_function("tape_register_leaf", Linkage::Import, &sig_free)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
+    let rt_backward = module.declare_function("backward", Linkage::Import, &sig_free)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
+    let rt_tape_clear = module.declare_function("tape_clear", Linkage::Import, &sig_barrier)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
+    // tape_pause / tape_resume: () -> ()
+    let rt_tape_pause = module.declare_function("tape_pause", Linkage::Import, &sig_barrier)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
+    let rt_tape_resume = module.declare_function("tape_resume", Linkage::Import, &sig_barrier)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
+    // tape_get_grad(handle: i64) -> i64  (same as sig_unary_tensor_ret)
+    let rt_tape_get_grad = module.declare_function("tape_get_grad", Linkage::Import, &sig_unary_tensor_ret)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
+
     // First pass: declare all user fn signatures.
     let mut func_ids: HashMap<String, FuncId> = HashMap::new();
     for typed_fn in &program.fns {
@@ -1998,6 +2272,14 @@ pub fn compile_and_run(
         rt_aggregate_alloc,
         rt_aggregate_retain,
         rt_aggregate_release,
+        rt_tape_record_binop,
+        rt_tape_record_unary,
+        rt_tape_register_leaf,
+        rt_tape_pause,
+        rt_tape_resume,
+        rt_tape_clear,
+        rt_tape_get_grad,
+        rt_backward,
     };
 
     // Second pass: compile each fn body.

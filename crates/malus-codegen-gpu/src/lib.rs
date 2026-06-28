@@ -194,6 +194,9 @@ fn collect_binops_in_stmt(
             }
         }
         TypedStmt::Break | TypedStmt::Continue => {}
+        TypedStmt::NoGrad { body } => {
+            for s in body { collect_binops_in_stmt(s, tensor_ops, scalar_ops); }
+        }
     }
 }
 
@@ -204,7 +207,9 @@ fn collect_binops_in_expr(
 ) {
     match &expr.kind {
         TypedExprKind::BinOp { op, lhs, rhs } => {
-            if lhs.ty.is_tensor() && rhs.ty.is_tensor() {
+            let lhs_agg = lhs.ty.is_tensor() || lhs.ty.is_variable();
+            let rhs_agg = rhs.ty.is_tensor() || rhs.ty.is_variable();
+            if lhs_agg && rhs_agg {
                 if elementwise_builtin_name(op).is_some() {
                     tensor_ops.insert(*op);
                 }
@@ -291,6 +296,9 @@ fn collect_unary_builtins_in_stmt(stmt: &TypedStmt, out: &mut BTreeSet<String>) 
             }
         }
         TypedStmt::Break | TypedStmt::Continue => {}
+        TypedStmt::NoGrad { body } => {
+            for s in body { collect_unary_builtins_in_stmt(s, out); }
+        }
     }
 }
 

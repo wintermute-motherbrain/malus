@@ -13,6 +13,16 @@ pub use metal::{
     kernel_dispatch, gpu_barrier, Dtype, TensorBuffer,
 };
 
+#[cfg(target_os = "macos")]
+mod tape;
+
+#[cfg(target_os = "macos")]
+pub use tape::{
+    tape_record_binop, tape_record_unary, tape_register_leaf,
+    tape_pause, tape_resume, tape_get_grad, tape_clear,
+    backward, OpTag, tape_reset,
+};
+
 #[cfg(test)]
 #[cfg(target_os = "macos")]
 mod tests;

@@ -629,6 +629,7 @@ fn flat_stmt_kinds(stmts: &[TypedStmt]) -> Vec<&'static str> {
             TypedStmt::Continue          => "Continue",
             TypedStmt::LetTuple { .. }   => "LetTuple",
             TypedStmt::DropTuple { .. }  => "DropTuple",
+            TypedStmt::NoGrad { .. }     => "NoGrad",
         };
         out.push(tag);
     }

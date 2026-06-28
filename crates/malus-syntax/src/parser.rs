@@ -414,6 +414,21 @@ impl Parser {
                     span: Span::new(start.file, start.start as usize, end.start as usize),
                 })
             }
+            TokenKind::With => {
+                self.advance(); // consume 'with'
+                // Expect contextual identifier 'no_grad'.
+                let (ident, ident_span) = self.expect_ident()?;
+                if ident != "no_grad" {
+                    return Err(ParseError::new("expected 'no_grad' after 'with'", ident_span));
+                }
+                self.expect(&TokenKind::Colon)?;
+                let body = self.parse_body()?;
+                let end = self.current_span();
+                Ok(Stmt {
+                    kind: StmtKind::NoGrad { body },
+                    span: Span::new(start.file, start.start as usize, end.start as usize),
+                })
+            }
             TokenKind::Match => {
                 self.advance(); // consume 'match'
                 let scrutinee = self.parse_expr()?;

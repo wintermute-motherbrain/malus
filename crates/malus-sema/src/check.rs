@@ -29,6 +29,7 @@ struct BodyCtx<'a> {
     return_ty: ResolvedTy,
     in_kernel: bool,
     loop_depth: usize,
+    no_grad_depth: usize,
 }
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -233,6 +234,7 @@ pub fn check(
                     return_ty: sig.return_ty.clone(),
                     in_kernel: false,
                     loop_depth: 0,
+                    no_grad_depth: 0,
                 };
                 let typed_body = check_body(body, &mut ctx);
                 env.pop_scope();
@@ -282,6 +284,7 @@ pub fn check(
                     return_ty: kernel_return_ty,
                     in_kernel: true,
                     loop_depth: 0,
+                    no_grad_depth: 0,
                 };
                 let typed_body = check_body(body, &mut ctx);
                 env.pop_scope();
@@ -332,6 +335,10 @@ fn check_body(
                 }
             }
             malus_syntax::ast::StmtKind::Return { expr } => {
+                if ctx.no_grad_depth > 0 {
+                    ctx.errors.push(SemaError::EarlyExitInNoGrad { span: stmt.span });
+                    return typed;
+                }
                 match check_expr(expr, Some(&ctx.return_ty.clone()), ctx) {
                     Some(texpr) => {
                         if texpr.ty != ctx.return_ty {
@@ -473,6 +480,14 @@ fn check_body(
                     return typed;
                 }
                 typed.push(TypedStmt::Continue);
+            }
+            StmtKind::NoGrad { body } => {
+                ctx.env.push_scope();
+                ctx.no_grad_depth += 1;
+                let tbody = check_body(body, ctx);
+                ctx.no_grad_depth -= 1;
+                ctx.env.pop_scope();
+                typed.push(TypedStmt::NoGrad { body: tbody });
             }
             StmtKind::For { var, start, end, body } => {
                 // Loop bounds must be I64 (range() desugars to int literals or exprs).
@@ -699,6 +714,34 @@ fn check_binop(
 ) -> Option<TypedExpr> {
     let tlhs = check_expr(lhs, None, ctx)?;
     let trhs = check_expr(rhs, None, ctx)?;
+
+    // Variable⊗Variable → Variable for arithmetic and matmul ops.
+    if tlhs.ty.is_variable() && trhs.ty.is_variable() {
+        if !matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Matmul) {
+            ctx.errors.push(SemaError::TypeMismatch {
+                expected: tlhs.ty.clone(),
+                found: trhs.ty.clone(),
+                span,
+            });
+            return None;
+        }
+        let ldtype = match &tlhs.ty { ResolvedTy::Variable { dtype } => dtype.clone(), _ => unreachable!() };
+        let rdtype = match &trhs.ty { ResolvedTy::Variable { dtype } => dtype.clone(), _ => unreachable!() };
+        if ldtype != rdtype {
+            ctx.errors.push(SemaError::DtypeMismatch {
+                lhs: scalar_ty_name(&ldtype).to_string(),
+                rhs: scalar_ty_name(&rdtype).to_string(),
+                span,
+            });
+            return None;
+        }
+        return Some(typed_expr(
+            TypedExprKind::BinOp { op: op.clone(), lhs: Box::new(tlhs), rhs: Box::new(trhs) },
+            ResolvedTy::Variable { dtype: ldtype },
+            Some(Placement::Gpu),
+            span,
+        ));
+    }
 
     // Placement check for tensor operands.
     if tlhs.ty.is_tensor() && trhs.ty.is_tensor() {
@@ -1096,7 +1139,27 @@ fn check_call(
                 }
             }
             let placement = sig.return_placement;
-            let return_ty = sig.return_ty.clone();
+            // Unary-tensor builtins accept Variable<f32> and return Variable<f32>:
+            // relu/sigmoid/tanh/exp/log/sqrt/abs/transpose/sum take Tensor<f32> in the
+            // builtin table, but when the caller passes a Variable the VJP path needs
+            // the return type to be Variable so codegen emits tape_record_unary.
+            let return_ty = if let BuiltinKind::Fixed(params) = &sig.kind {
+                if params.len() == 1
+                    && sig.return_ty.is_tensor()
+                    && typed_args.len() == 1
+                    && typed_args[0].ty.is_variable()
+                {
+                    if let ResolvedTy::Variable { dtype } = &typed_args[0].ty {
+                        ResolvedTy::Variable { dtype: dtype.clone() }
+                    } else {
+                        sig.return_ty.clone()
+                    }
+                } else {
+                    sig.return_ty.clone()
+                }
+            } else {
+                sig.return_ty.clone()
+            };
             Some(typed_expr(
                 TypedExprKind::Call { callee: callee_name, args: typed_args },
                 return_ty,
@@ -1301,6 +1364,18 @@ fn check_field_access(
 
     // .data on a Variable returns the underlying Tensor.
     if field == "data" {
+        if let ResolvedTy::Variable { dtype } = &tbase.ty.clone() {
+            return Some(typed_expr(
+                TypedExprKind::FieldAccess { base: Box::new(tbase), field: field.to_string() },
+                ResolvedTy::Tensor { dtype: dtype.clone() },
+                Some(malus_syntax::ast::Placement::Gpu),
+                span,
+            ));
+        }
+    }
+
+    // .grad on a Variable returns an owned Tensor (retained by tape_get_grad, see D5).
+    if field == "grad" {
         if let ResolvedTy::Variable { dtype } = &tbase.ty.clone() {
             return Some(typed_expr(
                 TypedExprKind::FieldAccess { base: Box::new(tbase), field: field.to_string() },

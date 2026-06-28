@@ -385,6 +385,7 @@ impl<'src> Lexer<'src> {
             "for"    => TokenKind::For,
             "in"     => TokenKind::In,
             "while"  => TokenKind::While,
+            "with"   => TokenKind::With,
             "struct" => TokenKind::Struct,
             "enum"   => TokenKind::Enum,
             "inout"  => TokenKind::Inout,

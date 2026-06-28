@@ -91,5 +91,12 @@ pub fn register_builtins() -> HashMap<String, BuiltinSig> {
         return_placement: None,
     });
 
+    // backward(loss: Variable<f32>) — walk the tape in reverse, accumulate grads, clear tape.
+    m.insert("backward".to_string(), BuiltinSig {
+        kind: BuiltinKind::Fixed(vec![ResolvedTy::Variable { dtype: ScalarTy::F32 }]),
+        return_ty: ResolvedTy::Unit,
+        return_placement: None,
+    });
+
     m
 }

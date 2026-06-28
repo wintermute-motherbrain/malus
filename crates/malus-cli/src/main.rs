@@ -122,6 +122,14 @@ fn run_script(path: &str) {
             tensor_len:             malus_runtime::tensor_len,
             tensor_retain:          malus_runtime::tensor_retain,
             tensor_release:         malus_runtime::tensor_release,
+            tape_record_binop:      malus_runtime::tape_record_binop,
+            tape_record_unary:      malus_runtime::tape_record_unary,
+            tape_register_leaf:     malus_runtime::tape_register_leaf,
+            tape_pause:             malus_runtime::tape_pause,
+            tape_resume:            malus_runtime::tape_resume,
+            tape_clear:             malus_runtime::tape_clear,
+            tape_get_grad:          malus_runtime::tape_get_grad,
+            backward:               malus_runtime::backward,
         };
         if let Err(e) = malus_codegen_cpu::compile_and_run(&typed, &symbols, &kernel_ids) {
             eprintln!("error: {e}");

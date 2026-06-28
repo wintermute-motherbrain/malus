@@ -139,6 +139,11 @@ pub enum TypedStmt {
     /// CTMM: free a tuple's heap box and release owned fields.
     /// `droppable_fields` is `(slot_index, field_ty)` for Tensor/Variable fields.
     DropTuple { name: String, droppable_fields: Vec<(usize, ResolvedTy)> },
+    // ── M14: tape control ─────────────────────────────────────────────────────
+    /// `with no_grad: body` — emit tape_pause() before body, tape_resume() after.
+    /// Variable RC (retain/release) is unchanged; only tape recording is gated.
+    /// Early-exit (return/break/continue) across this boundary is rejected by sema.
+    NoGrad { body: Vec<TypedStmt> },
 }
 
 /// One arm of a `match` statement.

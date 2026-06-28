@@ -27,6 +27,7 @@ pub enum TokenKind {
     Struct,
     Enum,
     Inout,
+    With,
 
     // Boolean keyword-operators
     And,

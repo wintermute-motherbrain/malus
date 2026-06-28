@@ -196,6 +196,9 @@ pub enum StmtKind {
     Break,
     /// `continue` — jump to the next iteration of the innermost loop.
     Continue,
+    /// `with no_grad: body` — suspend tape recording for `body`.
+    /// Variable RC semantics are unchanged; only tape pushes are suppressed.
+    NoGrad { body: Vec<Stmt> },
 }
 
 // ── Parameters ────────────────────────────────────────────────────────────────
