@@ -89,6 +89,17 @@ impl ResolvedTy {
         }
     }
 
+    pub fn is_tuple(&self) -> bool {
+        matches!(self, ResolvedTy::Tuple(_))
+    }
+
+    pub fn tuple_elements(&self) -> Option<&[ResolvedTy]> {
+        match self {
+            ResolvedTy::Tuple(ts) => Some(ts),
+            _ => None,
+        }
+    }
+
     pub fn is_array(&self) -> bool {
         matches!(self, ResolvedTy::Array { .. })
     }

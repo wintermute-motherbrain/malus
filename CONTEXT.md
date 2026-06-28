@@ -143,6 +143,10 @@ _Avoid_: clear gradients, reset gradients
 
 ### Types (V1)
 
+**Tuple**:
+An anonymous product type with positional fields. Constructed with `(expr, expr, ...)` (minimum 2 elements). Fields accessed via positional dot notation (`x.0`, `x.1`) or destructured in a `let` binding (`let (a, b) = x`). `let mut (a, b) = x` makes all bindings mutable. Heap-allocated like `Struct`; `DropTuple` releases tensor/variable fields via `tensor_release` then frees the box. Valid as local bindings and `fn` return types. Flat-only: element types may not themselves be tuples. Tuple elements may not appear as struct fields or array elements. `match` on tuples is deferred.
+_Avoid_: anonymous struct (informal description, not the canonical term)
+
 **Struct**:
 A user-defined product type with named, typed fields. Constructed with keyword arguments: `Layer(weights=w, bias=b)`. Fields accessed with dot notation: `layer.weights`. Tensor fields are moved into the struct at construction (ownership transfers; no retain is emitted). `DropStruct` releases each tensor field via `tensor_release`, freeing the tensor when the refcount hits zero.
 _Avoid_: Record, dataclass

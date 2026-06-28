@@ -4,7 +4,7 @@
 
 malus is a compiled ML DSL for Apple Silicon. Python-like syntax, dual compilation pipeline: `fn` bodies → Cranelift JIT (CPU), `kernel` bodies → Metal Shading Language (GPU). The CTMM memory model inserts static `free`/barrier calls at compile time, falling back to reference counting only when lifetimes are structurally ambiguous.
 
-## Current state: **M13 done — `Variable` type + aggregate ARC complete; M14 (Tape + backward) next**
+## Current state: **M13.5 done — Tuples (anonymous product types, positional access, destructuring); M14 (Tape + backward) next**
 
 | Milestone | Status | Crate |
 |---|---|---|
@@ -23,6 +23,7 @@ malus is a compiled ML DSL for Apple Silicon. Python-like syntax, dual compilati
 | **V2 — Autograd** | | |
 | M12 — Hardening (enum-payload retain-on-bind, zero-length guard, break/continue) | ✅ done | `malus-syntax`, `malus-sema`, `malus-codegen-cpu`, `malus-runtime` |
 | M13 — The `Variable` Type (type-directed RC, dormant retain/release ABI activated) | ✅ done | `malus-syntax`, `malus-sema`, `malus-codegen-cpu`, `malus-runtime` |
+| M13.5 — Tuples (anonymous product types, positional access, `let` destructuring, fn return types) | ✅ done | `malus-syntax`, `malus-sema`, `malus-codegen-cpu` |
 | M14 — The Tape + `backward()` (global tape, VJPs for all V1 ops, `no_grad`) | 🔲 planned | `malus-runtime`, `malus-sema`, `malus-codegen-cpu` |
 | M15 — Differentiable Stdlib + Capstone (`zero_grad`, V2 XOR capstone) | 🔲 planned | all crates |
 | **V3 — nanoGPT** | | |
@@ -101,6 +102,7 @@ examples/
   nested_tensor.ml     # M11: 2-D tensor literal [[r0],[r1]]
   xor.ml               # M11 done-when: 2→8→1 sigmoid MLP that learns XOR (V1 capstone)
   hardening.ml         # M12 done-when: break/continue, zeros(0), enum-payload escape
+  tuples.ml            # M13.5 done-when: tuple construction, positional access, let destructuring, fn return
   import_demo/         # multi-file import demo (main.ml, ops.ml)
 docs/milestones/       # m1–m12 specs, v1-plan.md, v2-plan.md
 docs/spec/             # language spec (01-overview … 09-modules)
@@ -168,6 +170,9 @@ The `i64` handle is a raw pointer to a heap-allocated `TensorBuffer { buffer: me
 | Limitation | Status | Notes |
 |---|---|---|
 | Escaping struct/enum match-arm payload (non-tensor) | M13 | Compile error today (ADR-0019); aggregate boxes have no refcount until M13 adds one |
+| Tuple elements as struct fields or array elements | Post-M13.5 | Sema rejects these positions; requires recursive drop in DropStruct/RC path (ADR-0020) |
+| `match` on tuples | Post-M13.5 | Destructure with `let (a, b) = x` instead; match arm patterns deferred |
+| Nested tuples (`((a, b), c)`) | Post-M13.5 | Flat-only in M13.5; element types may not themselves be tuples (ADR-0020) |
 | NumPy-style broadcasting | M16 | Element-count must match today; right-aligned broadcast deferred |
 | Axis reductions (`mean`, `var`, `max` with keepdim) | M16 | Only whole-tensor `sum` exists |
 | `reshape`/`view`, batched/3-D matmul | M17 | matmul is 2-D only |

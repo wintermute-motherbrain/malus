@@ -312,6 +312,29 @@ impl Parser {
                 } else {
                     false
                 };
+                // Tuple destructuring: let [mut] (a, b, ...) = expr
+                if matches!(self.current_kind(), TokenKind::LParen) {
+                    self.advance(); // consume '('
+                    let mut names = Vec::new();
+                    while !matches!(self.current_kind(), TokenKind::RParen | TokenKind::Eof) {
+                        let (name, _) = self.expect_ident()?;
+                        names.push(name);
+                        if matches!(self.current_kind(), TokenKind::Comma) {
+                            self.advance();
+                        } else {
+                            break;
+                        }
+                    }
+                    self.expect(&TokenKind::RParen)?;
+                    self.expect(&TokenKind::Eq)?;
+                    let expr = self.parse_expr()?;
+                    let end = expr.span;
+                    self.expect_newline_or_eof()?;
+                    return Ok(Stmt {
+                        kind: StmtKind::LetTuple { names, mutable, expr },
+                        span: Span::new(start.file, start.start as usize, end.end as usize),
+                    });
+                }
                 let (name, _) = self.expect_ident()?;
                 self.expect(&TokenKind::Eq)?;
                 let expr = self.parse_expr()?;
@@ -656,9 +679,22 @@ impl Parser {
                     let span = Span::new(base.span.file, base.span.start as usize, end.end as usize);
                     base = Expr { kind: ExprKind::Index { base: Box::new(base), indices }, span };
                 }
-                // Field / method access: base.name  or  Tensor.gpu<dtype>([...])
+                // Field / method access: base.name, base.0, or Tensor.gpu<dtype>([...])
                 TokenKind::Dot => {
                     self.advance();
+                    // Positional tuple access: .0, .1, ...
+                    if let TokenKind::Int(n) = self.current_kind().clone() {
+                        if n >= 0 {
+                            let idx_span = self.current_span();
+                            self.advance();
+                            let span = Span::new(base.span.file, base.span.start as usize, idx_span.end as usize);
+                            base = Expr {
+                                kind: ExprKind::TupleIndex { base: Box::new(base), index: n as usize },
+                                span,
+                            };
+                            continue;
+                        }
+                    }
                     let (name, name_span) = self.expect_ident()?;
                     let span = Span::new(base.span.file, base.span.start as usize, name_span.end as usize);
 
@@ -764,9 +800,27 @@ impl Parser {
             TokenKind::Ident(name) => { self.advance(); Ok(Expr { kind: ExprKind::Ident(name), span }) }
             TokenKind::LParen => {
                 self.advance();
-                let inner = self.parse_expr()?;
-                self.expect(&TokenKind::RParen)?;
-                Ok(inner)
+                let first = self.parse_expr()?;
+                if matches!(self.current_kind(), TokenKind::Comma) {
+                    // Tuple construction: (first, second, ...)
+                    self.advance();
+                    let mut elements = vec![first];
+                    elements.push(self.parse_expr()?);
+                    while matches!(self.current_kind(), TokenKind::Comma) {
+                        self.advance();
+                        elements.push(self.parse_expr()?);
+                    }
+                    let end = self.current_span();
+                    self.expect(&TokenKind::RParen)?;
+                    Ok(Expr {
+                        kind: ExprKind::Tuple(elements),
+                        span: Span::new(span.file, span.start as usize, end.end as usize),
+                    })
+                } else {
+                    // Grouping: (expr)
+                    self.expect(&TokenKind::RParen)?;
+                    Ok(first)
+                }
             }
             // `[e1, e2, e3]` — array literal (NOT tensor literal rows; those are
             // parsed by `parse_tensor_literal` which owns the bracket structure).

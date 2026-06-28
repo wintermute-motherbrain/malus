@@ -89,7 +89,18 @@ pub fn check(
                 let mut ok = true;
                 for f in fields {
                     match resolve_ty(&f.ty, f.span, &nominals, &mut errors) {
-                        Some(ty) => resolved_fields.push((f.name.clone(), ty)),
+                        Some(ty) => {
+                            if ty.is_tuple() {
+                                errors.push(SemaError::TupleInStructField {
+                                    struct_name: name.clone(),
+                                    field: f.name.clone(),
+                                    span: f.span,
+                                });
+                                ok = false;
+                            } else {
+                                resolved_fields.push((f.name.clone(), ty));
+                            }
+                        }
                         None => { ok = false; }
                     }
                 }
@@ -344,6 +355,42 @@ fn check_body(
                         ctx.env.bind_mutable(name.clone(), ty, placement);
                     }
                     None => return typed,
+                }
+            }
+            malus_syntax::ast::StmtKind::LetTuple { names, mutable, expr } => {
+                let texpr = match check_expr(expr, None, ctx) {
+                    Some(e) => e,
+                    None => return typed,
+                };
+                let elem_tys = match &texpr.ty {
+                    ResolvedTy::Tuple(ts) => ts.clone(),
+                    other => {
+                        ctx.errors.push(SemaError::TupleDestructureNotTuple {
+                            found: other.to_string(),
+                            span: stmt.span,
+                        });
+                        return typed;
+                    }
+                };
+                if names.len() != elem_tys.len() {
+                    ctx.errors.push(SemaError::TupleDestructureArity {
+                        expected: elem_tys.len(),
+                        found: names.len(),
+                        span: stmt.span,
+                    });
+                    return typed;
+                }
+                let name_tys: Vec<(String, ResolvedTy)> = names.iter()
+                    .zip(elem_tys.iter())
+                    .map(|(n, t)| (n.clone(), t.clone()))
+                    .collect();
+                typed.push(TypedStmt::LetTuple { names: name_tys.clone(), expr: texpr });
+                for (name, ty) in name_tys {
+                    if *mutable {
+                        ctx.env.bind_mutable(name, ty, None);
+                    } else {
+                        ctx.env.bind(name, ty, None);
+                    }
                 }
             }
             malus_syntax::ast::StmtKind::Assign { target, expr } => {
@@ -603,6 +650,8 @@ fn check_expr(
             check_array_literal(elements, expr.span, ctx),
         ExprKind::Index { base, indices } => check_index(base, indices, expr.span, ctx),
         ExprKind::FieldAccess { base, field } => check_field_access(base, field, expr.span, ctx),
+        ExprKind::Tuple(elements) => check_tuple(elements, expr.span, ctx),
+        ExprKind::TupleIndex { base, index } => check_tuple_index(base, *index, expr.span, ctx),
     }
 }
 
@@ -1296,6 +1345,68 @@ fn check_field_access(
     ))
 }
 
+// ── Tuple expressions (M13.5) ────────────────────────────────────────────────
+
+fn check_tuple(
+    elements: &[malus_syntax::ast::Expr],
+    span: Span,
+    ctx: &mut BodyCtx<'_>,
+) -> Option<TypedExpr> {
+    if elements.len() < 2 {
+        ctx.errors.push(SemaError::TupleTooShort { span });
+        return None;
+    }
+    let mut typed_elements = Vec::new();
+    let mut elem_tys = Vec::new();
+    for e in elements {
+        let te = check_expr(e, None, ctx)?;
+        if te.ty.is_tuple() {
+            ctx.errors.push(SemaError::NestedTuple { span: e.span });
+            return None;
+        }
+        elem_tys.push(te.ty.clone());
+        typed_elements.push(te);
+    }
+    Some(typed_expr(
+        TypedExprKind::TupleInit { elements: typed_elements },
+        ResolvedTy::Tuple(elem_tys),
+        None,
+        span,
+    ))
+}
+
+fn check_tuple_index(
+    base: &malus_syntax::ast::Expr,
+    index: usize,
+    span: Span,
+    ctx: &mut BodyCtx<'_>,
+) -> Option<TypedExpr> {
+    let tbase = check_expr(base, None, ctx)?;
+    match tbase.ty.clone() {
+        ResolvedTy::Tuple(ref elems) => {
+            if index >= elems.len() {
+                ctx.errors.push(SemaError::TupleIndexOutOfRange {
+                    len: elems.len(),
+                    index,
+                    span,
+                });
+                return None;
+            }
+            let elem_ty = elems[index].clone();
+            Some(typed_expr(
+                TypedExprKind::TupleIndex { base: Box::new(tbase), index },
+                elem_ty,
+                None,
+                span,
+            ))
+        }
+        other => {
+            ctx.errors.push(SemaError::TupleIndexNotTuple { found: other.to_string(), span });
+            None
+        }
+    }
+}
+
 // ── Callee resolution from expression ────────────────────────────────────────
 
 /// Owned callee — cloned eagerly so we release the borrow on env before
@@ -1370,6 +1481,10 @@ pub fn resolve_ty(
         }
         Ty::Array { elem, len } => {
             let resolved_elem = resolve_ty(elem, span, nominals, errors)?;
+            if resolved_elem.is_tuple() {
+                errors.push(SemaError::TupleInArrayElement { span });
+                return None;
+            }
             Some(ResolvedTy::Array { elem: Box::new(resolved_elem), len: *len })
         }
         Ty::Named(name) if name == "None" => Some(ResolvedTy::Unit),

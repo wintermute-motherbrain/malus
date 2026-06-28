@@ -189,7 +189,8 @@ fn cranelift_type(ty: &ResolvedTy) -> Result<Option<cranelift_codegen::ir::Type>
         ResolvedTy::Scalar(s) => Ok(Some(scalar_cranelift_type(s))),
         ResolvedTy::Bool => Ok(Some(I8)),
         ResolvedTy::Unit => Ok(None),
-        ResolvedTy::Tuple(_) => Err(CodegenError::UnsupportedType("tuple".into())),
+        // Tuples are heap-allocated; represented as opaque i64 pointer (same as Struct).
+        ResolvedTy::Tuple(_) => Ok(Some(I64)),
         // Structs, enums, and arrays are heap-allocated; represented as opaque i64 pointer.
         ResolvedTy::Struct { .. } | ResolvedTy::Enum { .. } | ResolvedTy::Array { .. } => Ok(Some(I64)),
     }
@@ -667,6 +668,54 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                     self.emit_counted_drop_loop(ptr, &elem_ty, len)?;
                 }
                 self.call_heap_free(ptr);
+                Ok(false)
+            }
+
+            // ── M13.5: tuples ─────────────────────────────────────────────────────
+            TypedStmt::DropTuple { name, droppable_fields } => {
+                let ptr = self.use_var(name)?;
+                let droppable_fields = droppable_fields.clone();
+                for (slot_idx, field_ty) in &droppable_fields {
+                    let offset = 8 + (*slot_idx as i32) * 8;
+                    self.emit_drop_field(ptr, offset, field_ty)?;
+                }
+                self.call_aggregate_release(ptr);
+                Ok(false)
+            }
+
+            TypedStmt::LetTuple { names, expr } => {
+                // Detect whether the source is a named local binding (Ident).
+                // If so, CTMM will insert DropTuple for it — don't double-free the box.
+                // For temporaries (TupleInit, Call, etc.) we must free the box here.
+                let expr_is_ident = matches!(&expr.kind, TypedExprKind::Ident(_));
+                let ptr = self.lower_expr(expr)?;
+                // Extract each field into a new Cranelift variable.
+                // Fields are at ptr + 8 + i*8 (8-byte ARC header + field slots).
+                let names = names.clone();
+                for (i, (name, ty)) in names.iter().enumerate() {
+                    let cl_ty = match cranelift_type(ty)? {
+                        Some(t) => t,
+                        None => continue,
+                    };
+                    let offset = 8 + (i as i32) * 8;
+                    let val = self.builder.ins().load(
+                        cl_ty, cranelift_codegen::ir::MemFlags::trusted(), ptr, offset,
+                    );
+                    // Tensor/Variable fields: retain so DropTuple's tensor_release balances
+                    // with the Drop for the extracted binding. Only needed when DropTuple fires.
+                    if expr_is_ident && (ty.is_tensor() || ty.is_variable()) {
+                        self.call_runtime_retain(val);
+                    }
+                    let var = Variable::from_u32(self.next_var as u32);
+                    self.next_var += 1;
+                    self.builder.declare_var(var, cl_ty);
+                    self.builder.def_var(var, val);
+                    self.var_map.insert(name.clone(), var);
+                }
+                // Free the box only for temporaries — named bindings get DropTuple from CTMM.
+                if !expr_is_ident {
+                    self.call_aggregate_release(ptr);
+                }
                 Ok(false)
             }
 
@@ -1366,6 +1415,37 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                     );
                 }
                 Ok(ptr)
+            }
+
+            // ── M13.5: tuples ────────────────────────────────────────────────────
+            TypedExprKind::TupleInit { elements } => {
+                // Layout: 8-byte ARC header + N * 8 bytes (one slot per element).
+                let n = elements.len();
+                let size = (8 + n * 8) as i64;
+                let ptr = self.call_aggregate_alloc(size);
+                for (i, elem_expr) in elements.iter().enumerate() {
+                    let val = self.lower_expr(elem_expr)?;
+                    self.builder.ins().store(
+                        cranelift_codegen::ir::MemFlags::trusted(),
+                        val,
+                        ptr,
+                        8 + (i as i32) * 8,
+                    );
+                }
+                Ok(ptr)
+            }
+
+            TypedExprKind::TupleIndex { base, index } => {
+                let ptr = self.lower_expr(base)?;
+                let offset = 8 + (*index as i32) * 8;
+                let cl_ty = match cranelift_type(&expr.ty)? {
+                    Some(t) => t,
+                    None => return Err(CodegenError::UnsupportedExpr("tuple index has unit type".into())),
+                };
+                let val = self.builder.ins().load(
+                    cl_ty, cranelift_codegen::ir::MemFlags::trusted(), ptr, offset,
+                );
+                Ok(val)
             }
         }
     }

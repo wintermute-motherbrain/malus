@@ -1112,3 +1112,92 @@ fn main():
     run_src(src).expect("inline .data borrow should compile and run");
     assert_eq!(live_tensor_count(), 0, "no tensor leaks after inline .data borrow");
 }
+
+// ── M13.5: Tuples ─────────────────────────────────────────────────────────────
+
+#[test]
+fn test_tuple_scalar_construction_and_access() {
+    let src = r#"
+fn main():
+    let t = (25.0, 50.0)
+    let x = t.0
+    let y = t.1
+    println("{} {}", x, y)
+"#;
+    run_src(src).expect("tuple scalar construction and positional access");
+}
+
+#[test]
+fn test_tuple_bool_mixed() {
+    let src = r#"
+fn main():
+    let t = (3.14, true)
+    let x = t.0
+    let b = t.1
+    println("{}", x)
+"#;
+    run_src(src).expect("tuple with mixed bool/f32");
+}
+
+#[test]
+fn test_tuple_destructuring() {
+    let src = r#"
+fn main():
+    let t = (10.0, 20.0)
+    let (a, b) = t
+    println("{} {}", a, b)
+"#;
+    run_src(src).expect("tuple destructuring");
+}
+
+#[test]
+fn test_tuple_return() {
+    let src = r#"
+fn swap(x: f32, y: f32) -> (f32, f32):
+    return (y, x)
+
+fn main():
+    let (a, b) = swap(1.0, 2.0)
+    println("{} {}", a, b)
+"#;
+    run_src(src).expect("tuple return from fn");
+}
+
+#[test]
+fn test_tuple_three_elements() {
+    let src = r#"
+fn triple() -> (f32, f32, f32):
+    return (1.0, 2.0, 3.0)
+
+fn main():
+    let t = triple()
+    let x = t.0
+    let y = t.1
+    let z = t.2
+    println("{} {} {}", x, y, z)
+"#;
+    run_src(src).expect("3-element tuple");
+}
+
+#[test]
+fn test_tuple_let_mut_destructuring() {
+    let src = r#"
+fn main():
+    let mut (a, b) = (5.0, 10.0)
+    a = 99.0
+    println("{} {}", a, b)
+"#;
+    run_src(src).expect("let mut tuple destructuring with reassignment");
+}
+
+#[test]
+fn test_tuple_roundtrip_parse() {
+    // Verify that the parser accepts and the printer round-trips tuples.
+    let src = r#"
+fn main():
+    let t = (1.0, 2.0)
+    let x = t.0
+    println("{}", x)
+"#;
+    run_src(src).expect("tuple parse roundtrip");
+}

@@ -131,6 +131,14 @@ pub enum TypedStmt {
     /// `continue` — jump to the next iteration of the innermost loop.  Same
     /// CTMM unwind as `Break`.
     Continue,
+    // ── M13.5: tuples ─────────────────────────────────────────────────────────
+    /// `let [mut] (a, b, ...) = expr` — tuple destructuring.
+    /// `names` is `(binding_name, element_type)`.
+    /// The tuple box is freed immediately after extracting fields in codegen.
+    LetTuple { names: Vec<(String, ResolvedTy)>, expr: TypedExpr },
+    /// CTMM: free a tuple's heap box and release owned fields.
+    /// `droppable_fields` is `(slot_index, field_ty)` for Tensor/Variable fields.
+    DropTuple { name: String, droppable_fields: Vec<(usize, ResolvedTy)> },
 }
 
 /// One arm of a `match` statement.
@@ -214,5 +222,15 @@ pub enum TypedExprKind {
         variant_index: u32,
         payload: Vec<TypedExpr>,
         max_payload_slots: usize,
+    },
+    // ── M13.5: tuples ────────────────────────────────────────────────────────
+    /// `(e1, e2, ...)` — typed tuple construction, minimum 2 elements.
+    TupleInit {
+        elements: Vec<TypedExpr>,
+    },
+    /// `expr.0`, `expr.1` — positional field access on a tuple.
+    TupleIndex {
+        base: Box<TypedExpr>,
+        index: usize,
     },
 }

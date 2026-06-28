@@ -138,6 +138,10 @@ pub enum ExprKind {
     /// `[e1, e2, e3]` — fixed-length array literal.
     ArrayLiteral { elements: Vec<Expr> },
     FieldAccess { base: Box<Expr>, field: String },
+    /// `(e1, e2, ...)` — tuple construction, minimum 2 elements.
+    Tuple(Vec<Expr>),
+    /// `expr.0`, `expr.1` — positional field access on a tuple.
+    TupleIndex { base: Box<Expr>, index: usize },
 }
 
 // ── Statements ────────────────────────────────────────────────────────────────
@@ -186,6 +190,8 @@ pub enum StmtKind {
     /// Exhaustive — every variant must appear exactly once. Arms may bind payload
     /// fields positionally. `return` is valid as an arm terminator.
     Match { scrutinee: Expr, arms: Vec<MatchArm> },
+    /// `let [mut] (a, b, ...) = expr` — tuple destructuring.
+    LetTuple { names: Vec<String>, mutable: bool, expr: Expr },
     /// `break` — exit the innermost loop immediately.
     Break,
     /// `continue` — jump to the next iteration of the innermost loop.

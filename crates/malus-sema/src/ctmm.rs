@@ -315,6 +315,27 @@ fn hoist_gpu_in_expr(
                 ..expr
             }
         }
+        TypedExprKind::TupleInit { elements } => {
+            let new_elements = elements
+                .into_iter()
+                .map(|e| hoist_gpu_in_expr(e, hoisted, counter))
+                .collect();
+            TypedExpr {
+                kind: TypedExprKind::TupleInit { elements: new_elements },
+                span,
+                ..expr
+            }
+        }
+        TypedExprKind::TupleIndex { base, index } => {
+            TypedExpr {
+                kind: TypedExprKind::TupleIndex {
+                    base: Box::new(hoist_gpu_in_expr(*base, hoisted, counter)),
+                    index,
+                },
+                span,
+                ..expr
+            }
+        }
         _ => expr,
     }
 }
@@ -457,6 +478,19 @@ fn make_drop_stmt_for_ty(name: &str, ty: &ResolvedTy) -> Option<TypedStmt> {
         ResolvedTy::Array { elem, len } => {
             Some(TypedStmt::DropArray { name: name.to_string(), elem_ty: *elem.clone(), len: *len })
         }
+        ResolvedTy::Tuple(elements) => {
+            let droppable_fields: Vec<(usize, ResolvedTy)> = elements.iter()
+                .enumerate()
+                .filter_map(|(i, ty)| {
+                    if ty.is_tensor() || ty.is_variable() {
+                        Some((i, ty.clone()))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            Some(TypedStmt::DropTuple { name: name.to_string(), droppable_fields })
+        }
         _ => None,
     }
 }
@@ -549,6 +583,7 @@ fn inject_early_return_unwinds(
             | TypedStmt::DropStruct { name, .. }
             | TypedStmt::DropEnum { name, .. }
             | TypedStmt::DropArray { name, .. }
+            | TypedStmt::DropTuple { name, .. }
             | TypedStmt::Release { name } => {
                 drop_positions.insert(name.clone(), i);
             }
@@ -684,6 +719,7 @@ fn inject_break_continue_unwinds(body: &mut Vec<TypedStmt>, local_types: &HashMa
             | TypedStmt::DropStruct { name, .. }
             | TypedStmt::DropEnum { name, .. }
             | TypedStmt::DropArray { name, .. }
+            | TypedStmt::DropTuple { name, .. }
             | TypedStmt::Release { name } => {
                 drop_positions.insert(name.clone(), i);
             }
@@ -827,6 +863,7 @@ fn insert_barriers(body: &mut Vec<TypedStmt>) {
             | TypedStmt::DropStruct { name, .. }
             | TypedStmt::DropEnum { name, .. }
             | TypedStmt::DropArray { name, .. }
+            | TypedStmt::DropTuple { name, .. }
             | TypedStmt::Release { name } => Some(name.as_str()),
             _ => None,
         };
@@ -894,6 +931,7 @@ fn extract_gpu_producing_expr(stmt: &TypedStmt) -> Option<(Vec<String>, Option<S
         | TypedStmt::DropStruct { .. }
         | TypedStmt::DropEnum { .. }
         | TypedStmt::DropArray { .. }
+        | TypedStmt::DropTuple { .. }
         | TypedStmt::GpuBarrier
         | TypedStmt::Assign { .. }
         | TypedStmt::If { .. }
@@ -905,6 +943,7 @@ fn extract_gpu_producing_expr(stmt: &TypedStmt) -> Option<(Vec<String>, Option<S
         | TypedStmt::RetainAgg { .. }
         | TypedStmt::ReleaseAgg { .. }
         | TypedStmt::ForIn { .. }
+        | TypedStmt::LetTuple { .. }
         | TypedStmt::Break
         | TypedStmt::Continue => return None,
     };
@@ -935,16 +974,32 @@ fn extract_gpu_producing_expr(stmt: &TypedStmt) -> Option<(Vec<String>, Option<S
 /// Collect `let` bindings introduced directly in `body` (not in inner scopes).
 /// Inner bindings are handled by the recursive `annotate_body` in step 3.
 fn collect_local_bindings(body: &[TypedStmt]) -> HashSet<String> {
-    body.iter().filter_map(|s| {
-        if let TypedStmt::Let { name, .. } = s { Some(name.clone()) } else { None }
-    }).collect()
+    let mut out = HashSet::new();
+    for s in body {
+        match s {
+            TypedStmt::Let { name, .. } => { out.insert(name.clone()); }
+            TypedStmt::LetTuple { names, .. } => {
+                for (n, _) in names { out.insert(n.clone()); }
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Collect the resolved type of each `let` binding in `body` (outer scope only).
 fn collect_local_types(body: &[TypedStmt]) -> HashMap<String, ResolvedTy> {
-    body.iter().filter_map(|s| {
-        if let TypedStmt::Let { name, expr } = s { Some((name.clone(), expr.ty.clone())) } else { None }
-    }).collect()
+    let mut out = HashMap::new();
+    for s in body {
+        match s {
+            TypedStmt::Let { name, expr } => { out.insert(name.clone(), expr.ty.clone()); }
+            TypedStmt::LetTuple { names, .. } => {
+                for (n, ty) in names { out.insert(n.clone(), ty.clone()); }
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Collect names that must not be statically dropped:
@@ -1014,6 +1069,7 @@ fn collect_idents_in_stmt(stmt: &TypedStmt, out: &mut HashSet<String>) {
         | TypedStmt::DropStruct { .. }
         | TypedStmt::DropEnum { .. }
         | TypedStmt::DropArray { .. }
+        | TypedStmt::DropTuple { .. }
         | TypedStmt::GpuBarrier
         | TypedStmt::Retain { .. }
         | TypedStmt::Release { .. }
@@ -1021,6 +1077,7 @@ fn collect_idents_in_stmt(stmt: &TypedStmt, out: &mut HashSet<String>) {
         | TypedStmt::ReleaseAgg { .. }
         | TypedStmt::Break
         | TypedStmt::Continue => {}
+        TypedStmt::LetTuple { expr, .. } => collect_idents_in_expr(expr, out),
         TypedStmt::If { condition, then_body, else_body } => {
             collect_idents_in_expr(condition, out);
             for s in then_body { collect_idents_in_stmt(s, out); }
@@ -1059,7 +1116,9 @@ fn insert_variable_arc_retains(body: &mut Vec<TypedStmt>) {
     let mut i = 0;
     while i < body.len() {
         let retain_names: Vec<String> = match &body[i] {
-            TypedStmt::Let { expr, .. } | TypedStmt::Assign { expr, .. } => {
+            TypedStmt::Let { expr, .. }
+            | TypedStmt::Assign { expr, .. }
+            | TypedStmt::LetTuple { expr, .. } => {
                 variable_arc_retains_for_expr(expr)
             }
             TypedStmt::Expr(expr) | TypedStmt::Return { expr } => {
@@ -1142,6 +1201,10 @@ fn collect_idents_in_expr(expr: &crate::typed_ir::TypedExpr, out: &mut HashSet<S
         TypedExprKind::ArrayLiteral { elements } => {
             for e in elements { collect_idents_in_expr(e, out); }
         }
+        TypedExprKind::TupleInit { elements } => {
+            for e in elements { collect_idents_in_expr(e, out); }
+        }
+        TypedExprKind::TupleIndex { base, .. } => collect_idents_in_expr(base, out),
         TypedExprKind::Lit(_) => {}
     }
 }

@@ -627,6 +627,8 @@ fn flat_stmt_kinds(stmts: &[TypedStmt]) -> Vec<&'static str> {
             TypedStmt::Match { .. }      => "Match",
             TypedStmt::Break             => "Break",
             TypedStmt::Continue          => "Continue",
+            TypedStmt::LetTuple { .. }   => "LetTuple",
+            TypedStmt::DropTuple { .. }  => "DropTuple",
         };
         out.push(tag);
     }

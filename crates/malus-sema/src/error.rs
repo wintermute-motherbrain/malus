@@ -35,6 +35,23 @@ pub enum SemaError {
     // ── M12: hardening ───────────────────────────────────────────────────────
     BreakOutsideLoop { span: Span },
     ContinueOutsideLoop { span: Span },
+    // ── M13.5: tuples ────────────────────────────────────────────────────────
+    /// Tuple element type is itself a tuple (flat-only rule).
+    NestedTuple { span: Span },
+    /// Tuple type used as a struct field type (not allowed).
+    TupleInStructField { struct_name: String, field: String, span: Span },
+    /// Tuple type used as an array element type (not allowed).
+    TupleInArrayElement { span: Span },
+    /// `let (a, b, ...) = expr` arity mismatch.
+    TupleDestructureArity { expected: usize, found: usize, span: Span },
+    /// RHS of `let (a, b) = ...` is not a tuple.
+    TupleDestructureNotTuple { found: String, span: Span },
+    /// `x.N` where N is out of range for the tuple's arity.
+    TupleIndexOutOfRange { len: usize, index: usize, span: Span },
+    /// `x.N` where `x` is not a tuple.
+    TupleIndexNotTuple { found: String, span: Span },
+    /// Tuples with fewer than 2 elements are not allowed.
+    TupleTooShort { span: Span },
 }
 
 impl SemaError {
@@ -65,7 +82,15 @@ impl SemaError {
             | MatchScrutineeNotEnum { span, .. }
             | TensorShapeMismatch { span, .. }
             | BreakOutsideLoop { span }
-            | ContinueOutsideLoop { span } => Some(*span),
+            | ContinueOutsideLoop { span }
+            | NestedTuple { span }
+            | TupleInStructField { span, .. }
+            | TupleInArrayElement { span }
+            | TupleDestructureArity { span, .. }
+            | TupleDestructureNotTuple { span, .. }
+            | TupleIndexOutOfRange { span, .. }
+            | TupleIndexNotTuple { span, .. }
+            | TupleTooShort { span } => Some(*span),
             DuplicateDefinition { second, .. } | DuplicateTypeDefinition { second, .. } => Some(*second),
             MainNotFound => None,
         }
@@ -109,6 +134,14 @@ impl SemaError {
             TensorShapeMismatch { .. } => "tensor shape mismatch",
             BreakOutsideLoop { .. } => "break outside loop",
             ContinueOutsideLoop { .. } => "continue outside loop",
+            NestedTuple { .. } => "nested tuple not allowed (flat-only)",
+            TupleInStructField { .. } => "tuple type not allowed as struct field",
+            TupleInArrayElement { .. } => "tuple type not allowed as array element",
+            TupleDestructureArity { .. } => "wrong number of bindings in let destructuring",
+            TupleDestructureNotTuple { .. } => "right-hand side is not a tuple",
+            TupleIndexOutOfRange { .. } => "tuple index out of range",
+            TupleIndexNotTuple { .. } => "not a tuple type",
+            TupleTooShort { .. } => "tuple must have at least 2 elements",
             MainNotFound => "",
         }
     }
@@ -190,6 +223,22 @@ impl fmt::Display for SemaError {
                 write!(f, "`break` is only valid inside a loop body"),
             SemaError::ContinueOutsideLoop { .. } =>
                 write!(f, "`continue` is only valid inside a loop body"),
+            SemaError::NestedTuple { .. } =>
+                write!(f, "tuple element types may not themselves be tuples (flat-only rule)"),
+            SemaError::TupleInStructField { struct_name, field, .. } =>
+                write!(f, "struct '{}' field '{}' may not have a tuple type", struct_name, field),
+            SemaError::TupleInArrayElement { .. } =>
+                write!(f, "array element type may not be a tuple"),
+            SemaError::TupleDestructureArity { expected, found, .. } =>
+                write!(f, "tuple has {} element(s) but {} binding(s) provided", expected, found),
+            SemaError::TupleDestructureNotTuple { found, .. } =>
+                write!(f, "cannot destructure: expected a tuple, got {}", found),
+            SemaError::TupleIndexOutOfRange { len, index, .. } =>
+                write!(f, "tuple index {} is out of range for a {}-element tuple", index, len),
+            SemaError::TupleIndexNotTuple { found, .. } =>
+                write!(f, "cannot index with `.N`: expected a tuple, got {}", found),
+            SemaError::TupleTooShort { .. } =>
+                write!(f, "tuples must have at least 2 elements"),
         }
     }
 }

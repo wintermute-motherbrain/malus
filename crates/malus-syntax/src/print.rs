@@ -122,6 +122,11 @@ fn print_stmt(out: &mut String, stmt: &Stmt, depth: usize) {
         }
         StmtKind::Break => { writeln!(out, "{indent}break").unwrap(); }
         StmtKind::Continue => { writeln!(out, "{indent}continue").unwrap(); }
+        StmtKind::LetTuple { names, mutable, expr } => {
+            let mut_kw = if *mutable { "mut " } else { "" };
+            let binding = format!("({})", names.join(", "));
+            writeln!(out, "{indent}let {mut_kw}{binding} = {}", print_expr(expr)).unwrap();
+        }
     }
 }
 
@@ -182,6 +187,13 @@ fn print_expr(expr: &Expr) -> String {
         ExprKind::ArrayLiteral { elements } => {
             let elems_str = elements.iter().map(|e| print_expr(e)).collect::<Vec<_>>().join(", ");
             format!("[{}]", elems_str)
+        }
+        ExprKind::Tuple(elements) => {
+            let elems_str = elements.iter().map(|e| print_expr(e)).collect::<Vec<_>>().join(", ");
+            format!("({})", elems_str)
+        }
+        ExprKind::TupleIndex { base, index } => {
+            format!("{}.{}", print_expr(base), index)
         }
     }
 }
@@ -405,6 +417,11 @@ mod tests {
                     },
                 StmtKind::Break => StmtKind::Break,
                 StmtKind::Continue => StmtKind::Continue,
+                StmtKind::LetTuple { names, mutable, expr } => StmtKind::LetTuple {
+                    names,
+                    mutable,
+                    expr: erase_expr(expr, z),
+                },
             },
         }
     }
@@ -441,6 +458,13 @@ mod tests {
             },
             ExprKind::ArrayLiteral { elements } => ExprKind::ArrayLiteral {
                 elements: elements.into_iter().map(|el| erase_expr(el, z)).collect(),
+            },
+            ExprKind::Tuple(elements) => ExprKind::Tuple(
+                elements.into_iter().map(|el| erase_expr(el, z)).collect(),
+            ),
+            ExprKind::TupleIndex { base, index } => ExprKind::TupleIndex {
+                base: Box::new(erase_expr(*base, z)),
+                index,
             },
         };
         Expr { kind, span: z }
