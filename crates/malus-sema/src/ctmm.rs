@@ -1059,10 +1059,11 @@ fn insert_variable_arc_retains(body: &mut Vec<TypedStmt>) {
     let mut i = 0;
     while i < body.len() {
         let retain_names: Vec<String> = match &body[i] {
-            TypedStmt::Let { expr, .. }
-            | TypedStmt::Assign { expr, .. }
-            | TypedStmt::Expr(expr)
-            | TypedStmt::Return { expr } => {
+            TypedStmt::Let { expr, .. } | TypedStmt::Assign { expr, .. } => {
+                variable_arc_retains_for_expr(expr)
+            }
+            TypedStmt::Expr(expr) | TypedStmt::Return { expr } => {
+                // For non-binding positions only emit retains for call args.
                 if let TypedExprKind::Call { args, .. } = &expr.kind {
                     args.iter()
                         .filter(|a| a.ty.is_variable())
@@ -1081,6 +1082,32 @@ fn insert_variable_arc_retains(body: &mut Vec<TypedStmt>) {
             i += 1;
         }
         i += 1;
+    }
+}
+
+fn variable_arc_retains_for_expr(expr: &TypedExpr) -> Vec<String> {
+    match &expr.kind {
+        // let b = a — Variable alias: retain a so b is a genuine co-owner.
+        TypedExprKind::Ident(name) if expr.ty.is_variable() => vec![name.clone()],
+        // let t = v.data — .data let-bind: retain v's handle so t is a genuine Tensor owner.
+        TypedExprKind::FieldAccess { base, field }
+            if field == "data" && base.ty.is_variable() =>
+        {
+            if let TypedExprKind::Ident(n) = &base.kind {
+                vec![n.clone()]
+            } else {
+                vec![]
+            }
+        }
+        // fn call: retain any Variable ident args (caller-retains ARC).
+        TypedExprKind::Call { args, .. } => args
+            .iter()
+            .filter(|a| a.ty.is_variable())
+            .filter_map(|a| {
+                if let TypedExprKind::Ident(n) = &a.kind { Some(n.clone()) } else { None }
+            })
+            .collect(),
+        _ => vec![],
     }
 }
 

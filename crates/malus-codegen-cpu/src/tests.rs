@@ -1066,24 +1066,49 @@ fn main():
 // ── M13: Variable type codegen ────────────────────────────────────────────────
 
 #[test]
-fn test_variable_rc() {
+fn test_variable_rc_done_when() {
+    // The M13 spec done-when: wrap, identity, variable(ones/zeros), b.data, c.data.
+    let src = r#"
+fn wrap(t: Tensor<f32>) -> Variable<f32>:
+    return variable(t)
+
+fn identity(v: Variable<f32>) -> Variable<f32>:
+    return v
+
+fn main():
+    let a = variable(ones(2, 2))
+    let b = identity(a)
+    let c = variable(zeros(3, 3))
+    tensor_print(b.data)
+    tensor_print(c.data)
+"#;
+    run_src(src).expect("M13 done-when should compile and run");
+    assert_eq!(live_tensor_count(), 0, "Variable done-when: no tensor leaks");
+}
+
+#[test]
+fn test_variable_data_let_bind_no_leak() {
+    // let d = v.data must retain so d and v each own a ref; no double-free.
     let src = r#"
 fn main():
     let t = Tensor.gpu<f32>([1.0, 2.0, 3.0])
     let v = variable(t)
     let d = v.data
-    println("{}", d)
+    tensor_print(d)
 "#;
-    run_src(src).expect("Variable RC should compile and run");
+    run_src(src).expect("Variable .data let-bind should compile and run");
+    assert_eq!(live_tensor_count(), 0, "no tensor leaks after .data let-bind");
 }
 
 #[test]
-fn test_variable_data_field() {
+fn test_variable_data_inline_borrow() {
+    // Inline .data borrow (not let-bound) should not retain.
     let src = r#"
 fn main():
     let t = Tensor.gpu<f32>([42.0])
     let v = variable(t)
-    println("{}", v.data)
+    tensor_print(v.data)
 "#;
-    run_src(src).expect("v.data should return the underlying tensor handle");
+    run_src(src).expect("inline .data borrow should compile and run");
+    assert_eq!(live_tensor_count(), 0, "no tensor leaks after inline .data borrow");
 }

@@ -1,11 +1,12 @@
-fn make_var(t: Tensor<f32>) -> Variable<f32>:
-    let v = variable(t)
+fn wrap(t: Tensor<f32>) -> Variable<f32>:
+    return variable(t)
+
+fn identity(v: Variable<f32>) -> Variable<f32>:
     return v
 
 fn main():
-    let t = Tensor.gpu<f32>([1.0, 2.0, 3.0])
-    let v = variable(t)
-    let d = v.data
-    println("{}", d)
-    let v2 = make_var(t)
-    println("{}", v2.data)
+    let a = variable(ones(2, 2))
+    let b = identity(a)
+    let c = variable(zeros(3, 3))
+    tensor_print(b.data)
+    tensor_print(c.data)
