@@ -73,8 +73,22 @@ pub fn register_builtins() -> HashMap<String, BuiltinSig> {
     // sum(t) -> Tensor<f32> — eager CPU op, returns a 1-element [1] tensor
     m.insert("sum".to_string(), BuiltinSig {
         kind: BuiltinKind::Fixed(vec![tensor_f32.clone()]),
-        return_ty: tensor_f32,
+        return_ty: tensor_f32.clone(),
         return_placement: Some(Placement::Gpu),
+    });
+
+    // variable(t) -> Variable<f32> — wrap a Tensor in an RC Variable.
+    m.insert("variable".to_string(), BuiltinSig {
+        kind: BuiltinKind::Fixed(vec![tensor_f32.clone()]),
+        return_ty: ResolvedTy::Variable { dtype: ScalarTy::F32 },
+        return_placement: Some(Placement::Gpu),
+    });
+
+    // tensor_print(t) — print a tensor directly (alias for print with single tensor arg).
+    m.insert("tensor_print".to_string(), BuiltinSig {
+        kind: BuiltinKind::Fixed(vec![tensor_f32]),
+        return_ty: ResolvedTy::Unit,
+        return_placement: None,
     });
 
     m

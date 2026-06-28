@@ -616,15 +616,17 @@ fn flat_stmt_kinds(stmts: &[TypedStmt]) -> Vec<&'static str> {
             TypedStmt::If { .. }       => "If",
             TypedStmt::For { .. }      => "For",
             TypedStmt::While { .. }    => "While",
-            TypedStmt::Retain { .. }    => "Retain",
-            TypedStmt::Release { .. }   => "Release",
+            TypedStmt::Retain { .. }     => "Retain",
+            TypedStmt::Release { .. }    => "Release",
+            TypedStmt::RetainAgg { .. }  => "RetainAgg",
+            TypedStmt::ReleaseAgg { .. } => "ReleaseAgg",
             TypedStmt::DropStruct { .. } => "DropStruct",
             TypedStmt::DropEnum { .. }   => "DropEnum",
             TypedStmt::DropArray { .. }  => "DropArray",
             TypedStmt::ForIn { .. }      => "ForIn",
-            TypedStmt::Match { .. }     => "Match",
-            TypedStmt::Break            => "Break",
-            TypedStmt::Continue         => "Continue",
+            TypedStmt::Match { .. }      => "Match",
+            TypedStmt::Break             => "Break",
+            TypedStmt::Continue          => "Continue",
         };
         out.push(tag);
     }
@@ -1057,4 +1059,53 @@ fn main():
     let body = &prog.fns[0].body;
     let kinds = flat_stmt_kinds(body);
     assert!(kinds.contains(&"DropArray"), "expected DropArray in body; got {:?}", kinds);
+}
+
+// ── M13: Variable type ────────────────────────────────────────────────────────
+
+#[test]
+fn test_variable_type_checks() {
+    let src = r#"
+fn main():
+    let t = Tensor.gpu<f32>([1.0, 2.0])
+    let v = variable(t)
+    let d = v.data
+    print(d)
+"#;
+    check_src(src).expect("Variable type should check cleanly");
+}
+
+#[test]
+fn test_variable_release_emitted() {
+    let src = r#"
+fn main():
+    let t = Tensor.gpu<f32>([1.0])
+    let v = variable(t)
+    print(v.data)
+"#;
+    let prog = check_src(src).expect("check failed");
+    let body = &prog.fns[0].body;
+    let kinds = flat_stmt_kinds(body);
+    assert!(kinds.contains(&"Release"), "expected Release for Variable; got {:?}", kinds);
+}
+
+#[test]
+fn test_struct_payload_escape_now_allowed() {
+    let src = r#"
+struct Point:
+    x: f32
+
+enum Wrapper:
+    Some(pt: Point)
+    Empty
+
+fn main():
+    let w = Wrapper.Some(pt=Point(x=1.0))
+    match w:
+        Some(p):
+            let escaped = p
+        Empty:
+            print("empty")
+"#;
+    check_src(src).expect("struct payload escape should be allowed in M13");
 }

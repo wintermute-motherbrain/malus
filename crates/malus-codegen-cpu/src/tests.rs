@@ -1018,10 +1018,10 @@ fn main():
     assert!(result.is_err(), "break inside if but outside loop should be rejected");
 }
 
-// ── M12: non-tensor payload escape → sema error ──────────────────────────────
+// ── M13: non-tensor payload escape is now allowed (ARC header on aggregate boxes) ──
 
 #[test]
-fn test_struct_payload_escape_rejected() {
+fn test_struct_payload_escape_now_allowed() {
     let src = r#"
 struct Point:
     x: f32
@@ -1038,13 +1038,7 @@ fn main():
         Empty:
             println("empty")
 "#;
-    let result = check_src(src);
-    assert!(result.is_err(), "escaping struct payload should be rejected");
-    let errs = result.unwrap_err();
-    assert!(
-        errs.iter().any(|e| matches!(e, malus_sema::SemaError::NonTensorPayloadEscapes { .. })),
-        "expected NonTensorPayloadEscapes error, got: {:?}", errs
-    );
+    run_src(src).expect("escaping struct payload is allowed in M13");
 }
 
 #[test]
@@ -1067,4 +1061,29 @@ fn main():
             println("empty")
 "#;
     run_src(src).expect("reading a struct payload field should compile and run");
+}
+
+// ── M13: Variable type codegen ────────────────────────────────────────────────
+
+#[test]
+fn test_variable_rc() {
+    let src = r#"
+fn main():
+    let t = Tensor.gpu<f32>([1.0, 2.0, 3.0])
+    let v = variable(t)
+    let d = v.data
+    println("{}", d)
+"#;
+    run_src(src).expect("Variable RC should compile and run");
+}
+
+#[test]
+fn test_variable_data_field() {
+    let src = r#"
+fn main():
+    let t = Tensor.gpu<f32>([42.0])
+    let v = variable(t)
+    println("{}", v.data)
+"#;
+    run_src(src).expect("v.data should return the underlying tensor handle");
 }

@@ -92,6 +92,11 @@ pub enum TypedStmt {
     /// Decrement the tensor's reference count; frees when it reaches zero
     /// (`tensor_release`). Not emitted by M9.
     Release { name: String },
+    /// Increment the aggregate box's reference count (`aggregate_retain`). M13+.
+    RetainAgg { name: String },
+    /// Decrement the aggregate box's reference count; frees when it reaches zero
+    /// (`aggregate_release`). M13+.
+    ReleaseAgg { name: String },
     // ── M11: fixed arrays ─────────────────────────────────────────────────────
     /// `for var in <array_expr>: body`  (from AST `StmtKind::ForIn`).
     ///
@@ -104,12 +109,17 @@ pub enum TypedStmt {
     /// `droppable_fields` is `(slot_index, field_ty)` for every field that owns
     /// heap resources (Tensor, Struct, Enum, Array).  Codegen recurses based on
     /// the type so nested aggregates are fully released before the box is freed.
-    DropStruct { name: String, droppable_fields: Vec<(usize, ResolvedTy)> },
+    DropStruct {
+        name: String,
+        droppable_fields: Vec<(usize, ResolvedTy)>,
+        /// Slot indices of nested Variable/struct/enum fields that need ARC release.
+        /// Populated in M13+; empty in M12 and earlier.
+        retained_agg_slots: Vec<usize>,
+    },
     /// CTMM (M11): free an enum's heap box, releasing the active variant's
-    /// owned fields.  `variants` is `(tag_value, droppable_fields)` where
-    /// droppable_fields follows the same `(slot_index, field_ty)` convention as
-    /// `DropStruct`.  Codegen emits a tag-switch + per-arm release + shared free.
-    DropEnum { name: String, variants: Vec<(u32, Vec<(usize, ResolvedTy)>)> },
+    /// owned fields.  `variants` is `(tag_value, droppable_fields, retained_agg_slots)`.
+    /// Codegen emits a tag-switch + per-arm release + shared free.
+    DropEnum { name: String, variants: Vec<(u32, Vec<(usize, ResolvedTy)>, Vec<usize>)> },
     /// CTMM (M11): release each element of a fixed array (Phase 4 implementation).
     DropArray { name: String, elem_ty: ResolvedTy, len: usize },
     /// Exhaustive `match` on an enum binding.

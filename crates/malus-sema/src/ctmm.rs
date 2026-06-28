@@ -35,7 +35,15 @@ use crate::typed_ir::{TypedExpr, TypedExprKind, TypedFn, TypedStmt};
 /// nodes.  Kernel bodies are skipped.
 pub fn annotate_fns(fns: &mut Vec<TypedFn>) {
     for f in fns.iter_mut() {
-        annotate_body(&mut f.body);
+        let var_params: Vec<(String, ResolvedTy)> = f.params.iter()
+            .filter(|p| p.ty.is_variable())
+            .map(|p| (p.name.clone(), p.ty.clone()))
+            .collect();
+        if var_params.is_empty() {
+            annotate_body(&mut f.body);
+        } else {
+            annotate_body_seeded(&mut f.body, &var_params);
+        }
     }
 }
 
@@ -52,6 +60,7 @@ fn annotate_body_seeded(body: &mut Vec<TypedStmt>, seed: &[(String, ResolvedTy)]
     // body.  Control-flow nodes are passed through unchanged — their inner bodies
     // will be hoisted in step 3 when `annotate_body` recurses into them.
     hoist_gpu_subexprs(body);
+    insert_variable_arc_retains(body);
     hoist_gpu_producing_returns(body);
 
     // Step 3: recurse into each inner scope *before* running the outer passes.
@@ -119,7 +128,7 @@ fn annotate_match_arms(body: &mut Vec<TypedStmt>) {
         if let TypedStmt::Match { arms, .. } = stmt {
             for arm in arms.iter_mut() {
                 let tensor_binds: Vec<(String, ResolvedTy)> = arm.bindings.iter()
-                    .filter(|(_, t)| t.is_tensor())
+                    .filter(|(_, t)| t.is_tensor() || t.is_variable())
                     .cloned()
                     .collect();
                 // Prepend Retain for each tensor payload in field-declaration order.
@@ -433,10 +442,11 @@ fn insert_assign_drops(body: &mut Vec<TypedStmt>, escaping: &HashSet<String>) {
 /// Returns `None` for types that own no heap resources (scalar, bool, unit).
 fn make_drop_stmt_for_ty(name: &str, ty: &ResolvedTy) -> Option<TypedStmt> {
     match ty {
+        ResolvedTy::Variable { .. } => Some(TypedStmt::Release { name: name.to_string() }),
         ResolvedTy::Tensor { .. } => Some(TypedStmt::Drop { name: name.to_string() }),
         ResolvedTy::Struct { fields, .. } => {
             let droppable_fields = droppable_struct_fields(fields);
-            Some(TypedStmt::DropStruct { name: name.to_string(), droppable_fields })
+            Some(TypedStmt::DropStruct { name: name.to_string(), droppable_fields, retained_agg_slots: vec![] })
         }
         ResolvedTy::Enum { variants, .. } => {
             let drop_variants = droppable_enum_variants(variants);
@@ -455,7 +465,7 @@ fn droppable_struct_fields(fields: &[(String, ResolvedTy)]) -> Vec<(usize, Resol
     fields.iter()
         .enumerate()
         .filter_map(|(i, (_, ty))| {
-            if ty.is_tensor() || ty.is_struct() || ty.is_enum() {
+            if ty.is_tensor() || ty.is_variable() || ty.is_struct() || ty.is_enum() {
                 Some((i, ty.clone()))
             } else {
                 None
@@ -466,21 +476,21 @@ fn droppable_struct_fields(fields: &[(String, ResolvedTy)]) -> Vec<(usize, Resol
 
 fn droppable_enum_variants(
     variants: &[(String, Vec<(String, ResolvedTy)>)],
-) -> Vec<(u32, Vec<(usize, ResolvedTy)>)> {
+) -> Vec<(u32, Vec<(usize, ResolvedTy)>, Vec<usize>)> {
     variants.iter()
         .enumerate()
         .map(|(tag, (_, fields))| {
             let droppable = fields.iter()
                 .enumerate()
                 .filter_map(|(i, (_, ty))| {
-                    if ty.is_tensor() || ty.is_struct() || ty.is_enum() {
+                    if ty.is_tensor() || ty.is_variable() || ty.is_struct() || ty.is_enum() {
                         Some((i, ty.clone()))
                     } else {
                         None
                     }
                 })
                 .collect();
-            (tag as u32, droppable)
+            (tag as u32, droppable, vec![])
         })
         .collect()
 }
@@ -538,7 +548,8 @@ fn inject_early_return_unwinds(
             TypedStmt::Drop { name }
             | TypedStmt::DropStruct { name, .. }
             | TypedStmt::DropEnum { name, .. }
-            | TypedStmt::DropArray { name, .. } => {
+            | TypedStmt::DropArray { name, .. }
+            | TypedStmt::Release { name } => {
                 drop_positions.insert(name.clone(), i);
             }
             _ => {}
@@ -672,7 +683,8 @@ fn inject_break_continue_unwinds(body: &mut Vec<TypedStmt>, local_types: &HashMa
             TypedStmt::Drop { name }
             | TypedStmt::DropStruct { name, .. }
             | TypedStmt::DropEnum { name, .. }
-            | TypedStmt::DropArray { name, .. } => {
+            | TypedStmt::DropArray { name, .. }
+            | TypedStmt::Release { name } => {
                 drop_positions.insert(name.clone(), i);
             }
             _ => {}
@@ -814,7 +826,8 @@ fn insert_barriers(body: &mut Vec<TypedStmt>) {
             TypedStmt::Drop { name }
             | TypedStmt::DropStruct { name, .. }
             | TypedStmt::DropEnum { name, .. }
-            | TypedStmt::DropArray { name, .. } => Some(name.as_str()),
+            | TypedStmt::DropArray { name, .. }
+            | TypedStmt::Release { name } => Some(name.as_str()),
             _ => None,
         };
         if let Some(name) = drop_name {
@@ -889,6 +902,8 @@ fn extract_gpu_producing_expr(stmt: &TypedStmt) -> Option<(Vec<String>, Option<S
         | TypedStmt::Match { .. }
         | TypedStmt::Retain { .. }
         | TypedStmt::Release { .. }
+        | TypedStmt::RetainAgg { .. }
+        | TypedStmt::ReleaseAgg { .. }
         | TypedStmt::ForIn { .. }
         | TypedStmt::Break
         | TypedStmt::Continue => return None,
@@ -948,7 +963,7 @@ fn collect_escaping_in(body: &[TypedStmt], out: &mut HashSet<String>) {
     for stmt in body {
         match stmt {
             TypedStmt::Return { expr } => collect_idents_in_expr(expr, out),
-            TypedStmt::Assign { expr, .. } if expr.ty.is_tensor() => {
+            TypedStmt::Assign { expr, .. } if expr.ty.is_tensor() || expr.ty.is_variable() => {
                 collect_idents_in_expr(expr, out);
             }
             TypedStmt::If { then_body, else_body, .. } => {
@@ -1002,6 +1017,8 @@ fn collect_idents_in_stmt(stmt: &TypedStmt, out: &mut HashSet<String>) {
         | TypedStmt::GpuBarrier
         | TypedStmt::Retain { .. }
         | TypedStmt::Release { .. }
+        | TypedStmt::RetainAgg { .. }
+        | TypedStmt::ReleaseAgg { .. }
         | TypedStmt::Break
         | TypedStmt::Continue => {}
         TypedStmt::If { condition, then_body, else_body } => {
@@ -1030,6 +1047,40 @@ fn collect_idents_in_stmt(stmt: &TypedStmt, out: &mut HashSet<String>) {
                 for s in &arm.body { collect_idents_in_stmt(s, out); }
             }
         }
+    }
+}
+
+/// Insert `Retain { name }` immediately before any `Let`/`Assign`/`Expr`/`Return`
+/// statement whose top-level expression is a `Call` with Variable-typed Ident arguments.
+/// This ensures every Variable passed to a function has a matching Retain+Release pair:
+/// the caller retains before the call, the callee releases at last use (via CTMM seeding),
+/// and the caller releases its own reference after the call.
+fn insert_variable_arc_retains(body: &mut Vec<TypedStmt>) {
+    let mut i = 0;
+    while i < body.len() {
+        let retain_names: Vec<String> = match &body[i] {
+            TypedStmt::Let { expr, .. }
+            | TypedStmt::Assign { expr, .. }
+            | TypedStmt::Expr(expr)
+            | TypedStmt::Return { expr } => {
+                if let TypedExprKind::Call { args, .. } = &expr.kind {
+                    args.iter()
+                        .filter(|a| a.ty.is_variable())
+                        .filter_map(|a| {
+                            if let TypedExprKind::Ident(n) = &a.kind { Some(n.clone()) } else { None }
+                        })
+                        .collect()
+                } else {
+                    vec![]
+                }
+            }
+            _ => vec![],
+        };
+        for name in retain_names.into_iter().rev() {
+            body.insert(i, TypedStmt::Retain { name });
+            i += 1;
+        }
+        i += 1;
     }
 }
 

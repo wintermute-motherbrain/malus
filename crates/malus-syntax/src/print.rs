@@ -253,8 +253,9 @@ fn print_lit(lit: &Lit) -> String {
 
 fn print_ty(ty: &Ty) -> String {
     match ty {
-        Ty::Tensor { dtype } => format!("Tensor<{}>", print_scalar_ty(dtype)),
-        Ty::Scalar(s)        => print_scalar_ty(s).to_string(),
+        Ty::Tensor { dtype }   => format!("Tensor<{}>", print_scalar_ty(dtype)),
+        Ty::Variable { dtype } => format!("Variable<{}>", print_scalar_ty(dtype)),
+        Ty::Scalar(s)          => print_scalar_ty(s).to_string(),
         Ty::Bool             => "bool".to_string(),
         Ty::Named(n)         => n.clone(),
         Ty::Tuple(types)     => {
