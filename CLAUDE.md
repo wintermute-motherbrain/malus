@@ -4,7 +4,7 @@
 
 malus is a compiled ML DSL for Apple Silicon. Python-like syntax, dual compilation pipeline: `fn` bodies → Cranelift JIT (CPU), `kernel` bodies → Metal Shading Language (GPU). The CTMM memory model inserts static `free`/barrier calls at compile time, falling back to reference counting only when lifetimes are structurally ambiguous.
 
-## Current state: **M13.5 done — Tuples (anonymous product types, positional access, destructuring); M14 (Tape + backward) next**
+## Current state: **M14 done — Tape + backward(), 15-op VJP table, no_grad scope; M15 (zero_grad + V2 XOR capstone) next**
 
 | Milestone | Status | Crate |
 |---|---|---|
@@ -24,7 +24,7 @@ malus is a compiled ML DSL for Apple Silicon. Python-like syntax, dual compilati
 | M12 — Hardening (enum-payload retain-on-bind, zero-length guard, break/continue) | ✅ done | `malus-syntax`, `malus-sema`, `malus-codegen-cpu`, `malus-runtime` |
 | M13 — The `Variable` Type (type-directed RC, dormant retain/release ABI activated) | ✅ done | `malus-syntax`, `malus-sema`, `malus-codegen-cpu`, `malus-runtime` |
 | M13.5 — Tuples (anonymous product types, positional access, `let` destructuring, fn return types) | ✅ done | `malus-syntax`, `malus-sema`, `malus-codegen-cpu` |
-| M14 — The Tape + `backward()` (global tape, VJPs for all V1 ops, `no_grad`) | 🔲 planned | `malus-runtime`, `malus-sema`, `malus-codegen-cpu` |
+| M14 — The Tape + `backward()` (global tape, VJPs for all V1 ops, `no_grad`) | ✅ done | `malus-runtime`, `malus-sema`, `malus-codegen-cpu` |
 | M15 — Differentiable Stdlib + Capstone (`zero_grad`, V2 XOR capstone) | 🔲 planned | all crates |
 | **V3 — nanoGPT** | | |
 | M16 — Broadcasting + Axis Reductions (NumPy broadcast, `mean`/`var`/`max` over axis) | 🔲 planned | `malus-syntax`, `malus-sema`, `malus-codegen-cpu`, `malus-runtime` |
@@ -103,6 +103,7 @@ examples/
   xor.ml               # M11 done-when: 2→8→1 sigmoid MLP that learns XOR (V1 capstone)
   hardening.ml         # M12 done-when: break/continue, zeros(0), enum-payload escape
   tuples.ml            # M13.5 done-when: tuple construction, positional access, let destructuring, fn return
+  gradient_check.ml    # M14 done-when: variable(), backward(), .grad, with no_grad:, autograd gradient check
   import_demo/         # multi-file import demo (main.ml, ops.ml)
 docs/milestones/       # m1–m12 specs, v1-plan.md, v2-plan.md
 docs/spec/             # language spec (01-overview … 09-modules)
