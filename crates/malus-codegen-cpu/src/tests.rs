@@ -111,6 +111,16 @@ extern "C" fn mock_kernel_dispatch(_kernel_id: u64, handles: *const i64, count: 
 
 extern "C" fn mock_gpu_barrier() {}
 
+fn mock_binary_tensor_op(a: i64, b: i64, op: impl Fn(f32, f32) -> f32) -> i64 {
+    let (ad, as_) = with_store(|s| (s.get_data(a), s.get_shape(a)));
+    let (bd, bs) = with_store(|s| (s.get_data(b), s.get_shape(b)));
+    // Simple equal-length zip for test purposes.
+    let n = ad.len().max(bd.len());
+    let out: Vec<f32> = (0..n).map(|i| op(ad[i % ad.len()], bd[i % bd.len()])).collect();
+    let _ = (as_, bs);
+    with_store(|s| s.insert(out, vec![n]))
+}
+
 extern "C" fn mock_tensor_matmul(handle_a: i64, handle_b: i64) -> i64 {
     let (a_data, a_shape) = with_store(|s| (s.get_data(handle_a), s.get_shape(handle_a)));
     let (b_data, b_shape) = with_store(|s| (s.get_data(handle_b), s.get_shape(handle_b)));
@@ -175,6 +185,47 @@ extern "C" fn mock_tape_get_grad(_handle: i64) -> i64 { 0 }
 extern "C" fn mock_backward(_loss: i64) {}
 // M15 tape ABI.
 extern "C" fn mock_tape_zero_grad(_handles: *const i64, _count: usize) {}
+// M16 broadcast + axis reductions — delegates to the mock forward ops for testing.
+extern "C" fn mock_tensor_broadcast_add(_kernel_id: u64, a: i64, b: i64) -> i64 {
+    MOCK_DISPATCH_COUNT.fetch_add(1, Ordering::SeqCst);
+    mock_binary_tensor_op(a, b, |x, y| x + y)
+}
+extern "C" fn mock_tensor_broadcast_sub(_kernel_id: u64, a: i64, b: i64) -> i64 {
+    MOCK_DISPATCH_COUNT.fetch_add(1, Ordering::SeqCst);
+    mock_binary_tensor_op(a, b, |x, y| x - y)
+}
+extern "C" fn mock_tensor_broadcast_mul(_kernel_id: u64, a: i64, b: i64) -> i64 {
+    MOCK_DISPATCH_COUNT.fetch_add(1, Ordering::SeqCst);
+    mock_binary_tensor_op(a, b, |x, y| x * y)
+}
+extern "C" fn mock_tensor_broadcast_div(_kernel_id: u64, a: i64, b: i64) -> i64 {
+    MOCK_DISPATCH_COUNT.fetch_add(1, Ordering::SeqCst);
+    mock_binary_tensor_op(a, b, |x, y| x / y)
+}
+extern "C" fn mock_tensor_reduce_sum_axis(h: i64, _axis: i64, _keepdim: i64) -> i64 {
+    let data = with_store(|s| s.get_data(h));
+    let sum: f32 = data.iter().sum();
+    with_store(|s| s.insert(vec![sum], vec![1]))
+}
+extern "C" fn mock_tensor_reduce_mean_axis(h: i64, _axis: i64, _keepdim: i64) -> i64 {
+    let data = with_store(|s| s.get_data(h));
+    let n = data.len() as f32;
+    let mean: f32 = data.iter().sum::<f32>() / n;
+    with_store(|s| s.insert(vec![mean], vec![1]))
+}
+extern "C" fn mock_tensor_reduce_max_axis(h: i64, _axis: i64, _keepdim: i64) -> i64 {
+    let data = with_store(|s| s.get_data(h));
+    let max: f32 = data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    with_store(|s| s.insert(vec![max], vec![1]))
+}
+extern "C" fn mock_tensor_reduce_var_axis(h: i64, _axis: i64, _keepdim: i64) -> i64 {
+    let data = with_store(|s| s.get_data(h));
+    let n = data.len() as f32;
+    let mean: f32 = data.iter().sum::<f32>() / n;
+    let var: f32 = data.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / n;
+    with_store(|s| s.insert(vec![var], vec![1]))
+}
+extern "C" fn mock_tape_record_reduce(_op: i32, _x: i64, _out: i64, _axis: i64, _keepdim: i64) {}
 
 fn mock_symbols() -> RuntimeSymbols {
     RuntimeSymbols {
@@ -200,6 +251,15 @@ fn mock_symbols() -> RuntimeSymbols {
         tape_get_grad:          mock_tape_get_grad,
         backward:               mock_backward,
         tape_zero_grad:         mock_tape_zero_grad,
+        tensor_broadcast_add:   mock_tensor_broadcast_add,
+        tensor_broadcast_sub:   mock_tensor_broadcast_sub,
+        tensor_broadcast_mul:   mock_tensor_broadcast_mul,
+        tensor_broadcast_div:   mock_tensor_broadcast_div,
+        tensor_reduce_sum_axis:  mock_tensor_reduce_sum_axis,
+        tensor_reduce_mean_axis: mock_tensor_reduce_mean_axis,
+        tensor_reduce_max_axis:  mock_tensor_reduce_max_axis,
+        tensor_reduce_var_axis:  mock_tensor_reduce_var_axis,
+        tape_record_reduce:     mock_tape_record_reduce,
     }
 }
 

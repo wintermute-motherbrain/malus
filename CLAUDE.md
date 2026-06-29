@@ -4,7 +4,7 @@
 
 malus is a compiled ML DSL for Apple Silicon. Python-like syntax, dual compilation pipeline: `fn` bodies → Cranelift JIT (CPU), `kernel` bodies → Metal Shading Language (GPU). The CTMM memory model inserts static `free`/barrier calls at compile time, falling back to reference counting only when lifetimes are structurally ambiguous.
 
-## Current state: **M15 done — zero_grad, leaf-registry lifecycle fix, V2 XOR capstone; M16 (broadcasting + axis reductions) next**
+## Current state: **M16 done — NumPy broadcasting + axis reductions (sum/mean/max/var), differentiable; M17 (shapes + batched matmul) next**
 
 | Milestone | Status | Crate |
 |---|---|---|
@@ -27,7 +27,7 @@ malus is a compiled ML DSL for Apple Silicon. Python-like syntax, dual compilati
 | M14 — The Tape + `backward()` (global tape, VJPs for all V1 ops, `no_grad`) | ✅ done | `malus-runtime`, `malus-sema`, `malus-codegen-cpu` |
 | M15 — Differentiable Stdlib + Capstone (`zero_grad`, V2 XOR capstone) | ✅ done | all crates |
 | **V3 — nanoGPT** | | |
-| M16 — Broadcasting + Axis Reductions (NumPy broadcast, `mean`/`var`/`max` over axis) | 🔲 planned | `malus-syntax`, `malus-sema`, `malus-codegen-cpu`, `malus-runtime` |
+| M16 — Broadcasting + Axis Reductions (NumPy broadcast, `sum`/`mean`/`max`/`var` over axis, differentiable) | ✅ done | `malus-syntax`, `malus-sema`, `malus-codegen-cpu`, `malus-runtime` |
 | M17 — Shapes + Batched Matmul (`reshape`/`view`, `transpose(dims)`, 3-D matmul) | 🔲 planned | `malus-syntax`, `malus-sema`, `malus-codegen-cpu`, `malus-runtime` |
 | M18 — Transformer Stdlib (`softmax`, `layernorm`, `gelu`, `cross_entropy`, causal mask) | 🔲 planned | `malus-sema`, `malus-codegen-cpu`, `malus-runtime` |
 | M19 — Embeddings + Index Tensors (i32/i64 tensors, `gather`, `randn`/Philox) | 🔲 planned | all crates |

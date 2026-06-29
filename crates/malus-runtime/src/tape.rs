@@ -2,8 +2,9 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 
 use crate::metal::{
-    gpu_barrier, tensor_alloc_gpu, tensor_alloc_ones_gpu, tensor_alloc_zeros_gpu,
-    tensor_matmul, tensor_retain, tensor_release, tensor_transpose, TensorBuffer,
+    broadcast_to_shape, gpu_barrier, sum_to_shape, tensor_alloc_gpu, tensor_alloc_ones_gpu,
+    tensor_alloc_zeros_gpu, tensor_matmul, tensor_reduce_mean_axis, tensor_retain,
+    tensor_release, tensor_transpose, unsqueeze_at, TensorBuffer,
 };
 
 // ── OpTag ─────────────────────────────────────────────────────────────────────
@@ -26,9 +27,14 @@ pub enum OpTag {
     Log       = 9,
     Sqrt      = 10,
     Abs       = 11,
-    Sum       = 12,
-    Transpose = 13,
-    Neg       = 14,
+    Sum              = 12,
+    Transpose        = 13,
+    Neg              = 14,
+    // M16 axis reductions
+    ReduceSumAxis    = 15,
+    ReduceMeanAxis   = 16,
+    ReduceMaxAxis    = 17,
+    ReduceVarAxis    = 18,
 }
 
 impl OpTag {
@@ -49,6 +55,10 @@ impl OpTag {
             12 => OpTag::Sum,
             13 => OpTag::Transpose,
             14 => OpTag::Neg,
+            15 => OpTag::ReduceSumAxis,
+            16 => OpTag::ReduceMeanAxis,
+            17 => OpTag::ReduceMaxAxis,
+            18 => OpTag::ReduceVarAxis,
             _  => panic!("malus: unknown op tag {tag}"),
         }
     }
@@ -59,12 +69,14 @@ impl OpTag {
 // For binops, saved = [a, b] (both retained).
 // For unary ops, saved = [x] (input retained); node.output is retained and
 // used directly in VJPs that need the forward output (sigmoid, tanh, exp, sqrt).
-// tape_clear() releases every handle in saved + output.
+// For axis reductions, saved = [x], meta = [axis, keepdim] (non-handle scalars).
+// tape_clear() releases every handle in saved + output; meta is not released.
 
 struct TapeNode {
     op:     OpTag,
     saved:  Vec<i64>,
     output: i64,
+    meta:   Vec<i64>,
 }
 
 // ── Thread-local tape state ───────────────────────────────────────────────────
@@ -93,7 +105,7 @@ pub extern "C" fn tape_record_binop(op_tag: i32, a: i64, b: i64, out: i64) {
     tensor_retain(out);
     let op = OpTag::from_tag(op_tag);
     NODES.with(|n| {
-        n.borrow_mut().push(TapeNode { op, saved: vec![a, b], output: out });
+        n.borrow_mut().push(TapeNode { op, saved: vec![a, b], output: out, meta: vec![] });
     });
 }
 
@@ -107,7 +119,28 @@ pub extern "C" fn tape_record_unary(op_tag: i32, x: i64, out: i64) {
     tensor_retain(out);
     let op = OpTag::from_tag(op_tag);
     NODES.with(|n| {
-        n.borrow_mut().push(TapeNode { op, saved: vec![x], output: out });
+        n.borrow_mut().push(TapeNode { op, saved: vec![x], output: out, meta: vec![] });
+    });
+}
+
+/// Record an axis-reduction op onto the tape.  Retains x and out.
+/// meta = [axis, keepdim]; axis/keepdim passed as i64 because malus int literals are I64.
+/// No-op when paused.
+#[no_mangle]
+pub extern "C" fn tape_record_reduce(op_tag: i32, x: i64, out: i64, axis: i64, keepdim: i64) {
+    if !RECORDING.with(|r| r.get()) {
+        return;
+    }
+    tensor_retain(x);
+    tensor_retain(out);
+    let op = OpTag::from_tag(op_tag);
+    NODES.with(|n| {
+        n.borrow_mut().push(TapeNode {
+            op,
+            saved: vec![x],
+            output: out,
+            meta: vec![axis, keepdim],
+        });
     });
 }
 
@@ -181,6 +214,7 @@ pub extern "C" fn backward(loss: i64) {
         op:     OpTag,
         saved:  Vec<i64>,
         output: i64,
+        meta:   Vec<i64>,
     }
     let nodes: Vec<NodeSnap> = NODES.with(|n| {
         n.borrow()
@@ -189,6 +223,7 @@ pub extern "C" fn backward(loss: i64) {
                 op:     node.op,
                 saved:  node.saved.clone(),
                 output: node.output,
+                meta:   node.meta.clone(),
             })
             .collect()
     });
@@ -224,40 +259,69 @@ pub extern "C" fn backward(loss: i64) {
                 accumulate_grad(&mut grads, b, db);
             }
             OpTag::Add => {
-                // C = A + B  →  dA = dC,  dB = dC
+                // C = A + B  →  dA = reduce_to(dC, A.shape),  dB = reduce_to(dC, B.shape)
+                // Identity fast-paths when shapes match (no broadcast).
                 let (a, b) = (node.saved[0], node.saved[1]);
-                tensor_retain(dout);
-                tensor_retain(dout);
-                accumulate_grad(&mut grads, a, dout);
-                accumulate_grad(&mut grads, b, dout);
+                let da = sum_to_shape(dout, &tb(a).shape.clone());
+                let db = sum_to_shape(dout, &tb(b).shape.clone());
+                accumulate_grad(&mut grads, a, da);
+                accumulate_grad(&mut grads, b, db);
             }
             OpTag::Sub => {
-                // C = A - B  →  dA = dC,  dB = -dC
+                // C = A - B  →  dA = reduce_to(dC, A.shape),  dB = -reduce_to(dC, B.shape)
                 let (a, b) = (node.saved[0], node.saved[1]);
-                tensor_retain(dout);
+                let da = sum_to_shape(dout, &tb(a).shape.clone());
                 let neg_dout = scalar_mul(dout, -1.0);
-                accumulate_grad(&mut grads, a, dout);
-                accumulate_grad(&mut grads, b, neg_dout);
+                let db = sum_to_shape(neg_dout, &tb(b).shape.clone());
+                tensor_release(neg_dout);
+                accumulate_grad(&mut grads, a, da);
+                accumulate_grad(&mut grads, b, db);
             }
             OpTag::Mul => {
-                // C = A * B  →  dA = dC * B,  dB = A * dC
+                // C = A * B  →  dA = reduce_to(dC * broadcast(B), A.shape)
+                //               dB = reduce_to(broadcast(A) * dC, B.shape)
                 let (a, b) = (node.saved[0], node.saved[1]);
-                let da = elem_mul(dout, b);
-                let db = elem_mul(a, dout);
+                let out_shape = tb(dout).shape.clone();
+                let a_shape = tb(a).shape.clone();
+                let b_shape = tb(b).shape.clone();
+                let b_bc = broadcast_to_shape(b, &out_shape);
+                let da_full = elem_mul(dout, b_bc);
+                tensor_release(b_bc);
+                let da = sum_to_shape(da_full, &a_shape);
+                tensor_release(da_full);
+                let a_bc = broadcast_to_shape(a, &out_shape);
+                let db_full = elem_mul(a_bc, dout);
+                tensor_release(a_bc);
+                let db = sum_to_shape(db_full, &b_shape);
+                tensor_release(db_full);
                 accumulate_grad(&mut grads, a, da);
                 accumulate_grad(&mut grads, b, db);
             }
             OpTag::Div => {
-                // C = A / B  →  dA = dC / B,  dB = -dC * A / B²
+                // C = A / B  →  dA = reduce_to(dC / broadcast(B), A.shape)
+                //               dB = reduce_to(-dC * broadcast(A) / broadcast(B)², B.shape)
                 let (a, b) = (node.saved[0], node.saved[1]);
-                let da = elem_div(dout, b);
-                let b_sq = elem_mul(b, b);
-                let tmp = elem_mul(dout, a);
+                let out_shape = tb(dout).shape.clone();
+                let a_shape = tb(a).shape.clone();
+                let b_shape = tb(b).shape.clone();
+                let b_bc = broadcast_to_shape(b, &out_shape);
+                let da_full = elem_div(dout, b_bc);
+                tensor_release(b_bc);
+                let da = sum_to_shape(da_full, &a_shape);
+                tensor_release(da_full);
+                let a_bc = broadcast_to_shape(a, &out_shape);
+                let tmp = elem_mul(dout, a_bc);
+                tensor_release(a_bc);
                 let neg_tmp = scalar_mul(tmp, -1.0);
                 tensor_release(tmp);
-                let db = elem_div(neg_tmp, b_sq);
+                let b_bc2 = broadcast_to_shape(b, &out_shape);
+                let b_sq = elem_mul(b_bc2, b_bc2);
+                tensor_release(b_bc2);
+                let db_full = elem_div(neg_tmp, b_sq);
                 tensor_release(neg_tmp);
                 tensor_release(b_sq);
+                let db = sum_to_shape(db_full, &b_shape);
+                tensor_release(db_full);
                 accumulate_grad(&mut grads, a, da);
                 accumulate_grad(&mut grads, b, db);
             }
@@ -344,6 +408,83 @@ pub extern "C" fn backward(loss: i64) {
                 // y = -x  →  dx = -dC
                 let x = node.saved[0];
                 let dx = scalar_mul(dout, -1.0);
+                accumulate_grad(&mut grads, x, dx);
+            }
+            OpTag::ReduceSumAxis => {
+                // y = sum(x, axis, keepdim)  →  dx = broadcast_to(unsqueeze_if_needed(dout), x.shape)
+                let x = node.saved[0];
+                let axis = node.meta[0] as usize;
+                let keepdim = node.meta[1] != 0;
+                let x_shape = tb(x).shape.clone();
+                let dout_exp = if keepdim { tensor_retain(dout); dout } else { unsqueeze_at(dout, axis) };
+                let dx = broadcast_to_shape(dout_exp, &x_shape);
+                tensor_release(dout_exp);
+                accumulate_grad(&mut grads, x, dx);
+            }
+            OpTag::ReduceMeanAxis => {
+                // y = mean(x, axis, keepdim)  →  dx = broadcast_to(dout / N, x.shape)
+                let x = node.saved[0];
+                let axis = node.meta[0] as usize;
+                let keepdim = node.meta[1] != 0;
+                let x_shape = tb(x).shape.clone();
+                let n = x_shape[axis] as f32;
+                let dout_scaled = scalar_mul(dout, 1.0 / n);
+                let dout_exp = if keepdim {
+                    tensor_retain(dout_scaled); dout_scaled
+                } else {
+                    let u = unsqueeze_at(dout_scaled, axis);
+                    tensor_release(dout_scaled);
+                    u
+                };
+                let dx = broadcast_to_shape(dout_exp, &x_shape);
+                tensor_release(dout_exp);
+                accumulate_grad(&mut grads, x, dx);
+            }
+            OpTag::ReduceMaxAxis => {
+                // y = max(x, axis, keepdim)  →  dx = dout_bc * (x == max_val) mask
+                // node.output holds the per-axis max values (retained by tape).
+                let x = node.saved[0];
+                let out = node.output;
+                let axis = node.meta[0] as usize;
+                let keepdim = node.meta[1] != 0;
+                let x_shape = tb(x).shape.clone();
+                let out_exp = if keepdim { tensor_retain(out); out } else { unsqueeze_at(out, axis) };
+                let out_bc = broadcast_to_shape(out_exp, &x_shape);
+                tensor_release(out_exp);
+                let mask = elem_cmp_eq(x, out_bc);
+                tensor_release(out_bc);
+                let dout_exp = if keepdim { tensor_retain(dout); dout } else { unsqueeze_at(dout, axis) };
+                let dout_bc = broadcast_to_shape(dout_exp, &x_shape);
+                tensor_release(dout_exp);
+                let dx = elem_mul(dout_bc, mask);
+                tensor_release(dout_bc);
+                tensor_release(mask);
+                accumulate_grad(&mut grads, x, dx);
+            }
+            OpTag::ReduceVarAxis => {
+                // y = var(x, axis, keepdim) population  →  dx = dout * 2 * (x - mean) / N
+                let x = node.saved[0];
+                let axis = node.meta[0] as usize;
+                let keepdim = node.meta[1] != 0;
+                let x_shape = tb(x).shape.clone();
+                let n = x_shape[axis] as f32;
+                // Recompute mean (cold path; keepdim=1 for easy broadcasting).
+                let mean_h = tensor_reduce_mean_axis(x, axis as i64, 1);
+                let mean_bc = broadcast_to_shape(mean_h, &x_shape);
+                tensor_release(mean_h);
+                // 2 * (x - mean) / N
+                let x_minus_mean = elem_sub(x, mean_bc);
+                tensor_release(mean_bc);
+                let coeff = 2.0 / n;
+                let scaled = scalar_mul(x_minus_mean, coeff);
+                tensor_release(x_minus_mean);
+                // Expand dout to x.shape
+                let dout_exp = if keepdim { tensor_retain(dout); dout } else { unsqueeze_at(dout, axis) };
+                let dout_bc = broadcast_to_shape(dout_exp, &x_shape);
+                tensor_release(dout_exp);
+                let dx = elem_mul(dout_bc, scaled);
+                tensor_release(dout_bc);
+                tensor_release(scaled);
                 accumulate_grad(&mut grads, x, dx);
             }
         }
@@ -477,6 +618,18 @@ fn alloc_like(template: i64, data: &[f32]) -> i64 {
 fn elem_add(a: i64, b: i64) -> i64 {
     let (ad, bd) = (read(a), read(b));
     let out: Vec<f32> = ad.iter().zip(bd.iter()).map(|(x, y)| x + y).collect();
+    alloc_like(a, &out)
+}
+
+fn elem_sub(a: i64, b: i64) -> i64 {
+    let (ad, bd) = (read(a), read(b));
+    let out: Vec<f32> = ad.iter().zip(bd.iter()).map(|(x, y)| x - y).collect();
+    alloc_like(a, &out)
+}
+
+fn elem_cmp_eq(a: i64, b: i64) -> i64 {
+    let (ad, bd) = (read(a), read(b));
+    let out: Vec<f32> = ad.iter().zip(bd.iter()).map(|(x, y)| if x == y { 1.0 } else { 0.0 }).collect();
     alloc_like(a, &out)
 }
 

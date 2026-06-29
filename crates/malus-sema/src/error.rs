@@ -56,6 +56,11 @@ pub enum SemaError {
     /// `return`/`break`/`continue` inside a `with no_grad:` body would skip
     /// `tape_resume()`. Rejected in M14 (D6).
     EarlyExitInNoGrad { span: Span },
+    // ── M16: axis reductions ─────────────────────────────────────────────────
+    /// Unknown keyword argument passed to a reduction builtin (e.g. `axis=`, `keepdim=`).
+    UnknownReductionArg { name: String, span: Span },
+    /// `mean`, `max`, or `var` require an `axis=N` argument.
+    MissingReductionAxis { callee: String, span: Span },
 }
 
 impl SemaError {
@@ -95,7 +100,9 @@ impl SemaError {
             | TupleIndexOutOfRange { span, .. }
             | TupleIndexNotTuple { span, .. }
             | TupleTooShort { span }
-            | EarlyExitInNoGrad { span } => Some(*span),
+            | EarlyExitInNoGrad { span }
+            | UnknownReductionArg { span, .. }
+            | MissingReductionAxis { span, .. } => Some(*span),
             DuplicateDefinition { second, .. } | DuplicateTypeDefinition { second, .. } => Some(*second),
             MainNotFound => None,
         }
@@ -148,6 +155,8 @@ impl SemaError {
             TupleIndexNotTuple { .. } => "not a tuple type",
             TupleTooShort { .. } => "tuple must have at least 2 elements",
             EarlyExitInNoGrad { .. } => "early exit inside no_grad block",
+            UnknownReductionArg { .. } => "unknown keyword argument",
+            MissingReductionAxis { .. } => "axis= is required",
             MainNotFound => "",
         }
     }
@@ -248,6 +257,10 @@ impl fmt::Display for SemaError {
                 write!(f, "tuples must have at least 2 elements"),
             SemaError::EarlyExitInNoGrad { .. } =>
                 write!(f, "`return`/`break`/`continue` may not cross a `with no_grad:` boundary"),
+            SemaError::UnknownReductionArg { name, .. } =>
+                write!(f, "unknown keyword argument '{}' — only `axis` and `keepdim` are accepted", name),
+            SemaError::MissingReductionAxis { callee, .. } =>
+                write!(f, "'{}' requires an `axis=N` argument", callee),
         }
     }
 }

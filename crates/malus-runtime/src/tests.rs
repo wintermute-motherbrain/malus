@@ -5,8 +5,10 @@ use crate::{
     tensor_alloc_gpu, tensor_alloc_zeros_gpu, tensor_alloc_ones_gpu,
     tensor_retain, tensor_release, tensor_free, tensor_print, tensor_len,
     tensor_matmul, tensor_transpose, tensor_sum,
+    tensor_broadcast_add, tensor_broadcast_sub, tensor_broadcast_mul, tensor_broadcast_div,
+    tensor_reduce_sum_axis, tensor_reduce_mean_axis, tensor_reduce_max_axis, tensor_reduce_var_axis,
     kernel_dispatch, gpu_barrier,
-    tape_record_binop, tape_record_unary, tape_register_leaf,
+    tape_record_binop, tape_record_unary, tape_record_reduce, tape_register_leaf,
     tape_pause, tape_resume, tape_get_grad, tape_clear,
     backward, tape_zero_grad, OpTag, tape_reset,
 };
@@ -394,6 +396,10 @@ fn test_optag_from_tag_drift() {
     assert_eq!(OpTag::from_tag(12), OpTag::Sum);
     assert_eq!(OpTag::from_tag(13), OpTag::Transpose);
     assert_eq!(OpTag::from_tag(14), OpTag::Neg);
+    assert_eq!(OpTag::from_tag(15), OpTag::ReduceSumAxis);
+    assert_eq!(OpTag::from_tag(16), OpTag::ReduceMeanAxis);
+    assert_eq!(OpTag::from_tag(17), OpTag::ReduceMaxAxis);
+    assert_eq!(OpTag::from_tag(18), OpTag::ReduceVarAxis);
 }
 
 #[test]
@@ -847,5 +853,229 @@ fn test_rewrap_registry_stays_bounded() {
     assert!(grads  == 0, "LEAF_GRAD must be empty after zero_grad + re-wrap, got {grads}");
 
     tensor_release(w);
+    tape_reset();
+}
+
+// ── M16: broadcasting + axis reduction tests ──────────────────────────────────
+
+fn read_shape(handle: i64) -> Vec<usize> {
+    let tb = unsafe { &*(handle as *const TensorBuffer) };
+    tb.shape.clone()
+}
+
+fn alloc_nd(data: &[f32], shape: &[usize]) -> i64 {
+    assert_eq!(data.len(), shape.iter().product::<usize>());
+    tensor_alloc_gpu(0, shape.as_ptr(), shape.len(), data.as_ptr())
+}
+
+#[test]
+fn test_broadcast_add_equal_shapes_fast_path() {
+    // Equal shapes: goes through GPU fast path (kernel_dispatch with the registered add kernel).
+    init_add_kernel();
+    let a = alloc_f32(&[1.0, 2.0, 3.0, 4.0]);
+    let b = alloc_f32(&[10.0, 20.0, 30.0, 40.0]);
+    let out = tensor_broadcast_add(0, a, b); // kernel_id=0 = registered add kernel
+    gpu_barrier();
+    let result = read_f32(out);
+    assert_eq!(result, [11.0, 22.0, 33.0, 44.0]);
+    tensor_free(a);
+    tensor_free(b);
+    tensor_free(out);
+}
+
+#[test]
+fn test_broadcast_add_rank_expansion() {
+    // (8,) + (4,8) → (4,8) via CPU broadcast loop.
+    let b_data: Vec<f32> = (1..=8).map(|x| x as f32).collect();
+    let a_data: Vec<f32> = vec![1.0f32; 32];
+    let b = alloc_nd(&b_data, &[8]);
+    let a = alloc_nd(&a_data, &[4, 8]);
+    let out = tensor_broadcast_add(0, a, b);
+    let result = read_f32(out);
+    let shape = read_shape(out);
+    assert_eq!(shape, vec![4, 8]);
+    // Each of the 4 rows should be [2,3,4,5,6,7,8,9].
+    for row in 0..4 {
+        for col in 0..8 {
+            let expected = 1.0 + (col as f32 + 1.0);
+            assert!((result[row * 8 + col] - expected).abs() < 1e-5,
+                    "row={} col={} expected={} got={}", row, col, expected, result[row * 8 + col]);
+        }
+    }
+    tensor_free(a);
+    tensor_free(b);
+    tensor_free(out);
+}
+
+#[test]
+fn test_broadcast_sub_scalar_row() {
+    // (1,4) - (3,4) → (3,4)
+    let a = alloc_nd(&[1.0, 2.0, 3.0, 4.0], &[1, 4]);
+    let b = alloc_nd(&[1.0; 12], &[3, 4]);
+    let out = tensor_broadcast_sub(0, a, b);
+    let result = read_f32(out);
+    let expected: Vec<f32> = [1.0, 2.0, 3.0, 4.0].iter().cycle().take(12)
+        .zip(vec![1.0f32; 12].iter()).map(|(x, y)| x - y).collect();
+    for (i, (r, e)) in result.iter().zip(expected.iter()).enumerate() {
+        assert!((r - e).abs() < 1e-5, "index {} expected {} got {}", i, e, r);
+    }
+    tensor_free(a);
+    tensor_free(b);
+    tensor_free(out);
+}
+
+#[test]
+fn test_reduce_sum_axis0_no_keepdim() {
+    // sum([[1,2,3],[4,5,6]], axis=0) → [5,7,9]
+    let h = alloc_nd(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
+    let out = tensor_reduce_sum_axis(h, 0, 0);
+    let result = read_f32(out);
+    let shape = read_shape(out);
+    assert_eq!(shape, vec![3]);
+    assert_eq!(result, vec![5.0, 7.0, 9.0]);
+    tensor_free(h);
+    tensor_free(out);
+}
+
+#[test]
+fn test_reduce_sum_axis1_keepdim() {
+    // sum([[1,2,3],[4,5,6]], axis=1, keepdim=1) → [[6],[15]]
+    let h = alloc_nd(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
+    let out = tensor_reduce_sum_axis(h, 1, 1);
+    let result = read_f32(out);
+    let shape = read_shape(out);
+    assert_eq!(shape, vec![2, 1]);
+    assert_eq!(result, vec![6.0, 15.0]);
+    tensor_free(h);
+    tensor_free(out);
+}
+
+#[test]
+fn test_reduce_mean_axis0() {
+    let h = alloc_nd(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
+    let out = tensor_reduce_mean_axis(h, 0, 0);
+    let result = read_f32(out);
+    let shape = read_shape(out);
+    assert_eq!(shape, vec![3]);
+    let expected = vec![2.5, 3.5, 4.5];
+    for (r, e) in result.iter().zip(expected.iter()) {
+        assert!((r - e).abs() < 1e-5);
+    }
+    tensor_free(h);
+    tensor_free(out);
+}
+
+#[test]
+fn test_reduce_max_axis1() {
+    let h = alloc_nd(&[1.0, 5.0, 3.0, 4.0, 2.0, 6.0], &[2, 3]);
+    let out = tensor_reduce_max_axis(h, 1, 0);
+    let result = read_f32(out);
+    let shape = read_shape(out);
+    assert_eq!(shape, vec![2]);
+    assert_eq!(result, vec![5.0, 6.0]);
+    tensor_free(h);
+    tensor_free(out);
+}
+
+#[test]
+fn test_reduce_var_axis0() {
+    // var of [1,4] along axis 0 = var([1,4]) = ((1-2.5)^2 + (4-2.5)^2)/2 = 2.25
+    let h = alloc_nd(&[1.0, 2.0, 4.0, 8.0], &[2, 2]);
+    let out = tensor_reduce_var_axis(h, 0, 0);
+    let result = read_f32(out);
+    let shape = read_shape(out);
+    assert_eq!(shape, vec![2]);
+    // col0: mean=2.5, var=((1-2.5)^2+(4-2.5)^2)/2=2.25
+    // col1: mean=5.0, var=((2-5)^2+(8-5)^2)/2=9.0
+    assert!((result[0] - 2.25).abs() < 1e-4, "col0 var expected 2.25 got {}", result[0]);
+    assert!((result[1] - 9.0).abs() < 1e-4, "col1 var expected 9.0 got {}", result[1]);
+    tensor_free(h);
+    tensor_free(out);
+}
+
+#[test]
+fn test_reduce_negative_axis() {
+    // axis=-1 on (3,4) should equal axis=1.
+    let data: Vec<f32> = (0..12).map(|x| x as f32).collect();
+    let h = alloc_nd(&data, &[3, 4]);
+    let out_pos = tensor_reduce_sum_axis(h, 1, 0);
+    let out_neg = tensor_reduce_sum_axis(h, -1, 0);
+    assert_eq!(read_f32(out_pos), read_f32(out_neg));
+    assert_eq!(read_shape(out_pos), read_shape(out_neg));
+    tensor_free(h);
+    tensor_free(out_pos);
+    tensor_free(out_neg);
+}
+
+#[test]
+fn test_tape_record_reduce_backward_sum() {
+    // sum(x, axis=0) backward: dx = broadcast_to(dout, x.shape).
+    tape_reset();
+    let x_data = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let x = alloc_nd(&x_data, &[2, 3]);
+    tensor_retain(x);
+    tape_register_leaf(x);
+
+    let out = tensor_reduce_sum_axis(x, 0, 0); // shape [3]
+    tensor_retain(out);
+    tape_record_reduce(OpTag::ReduceSumAxis as i32, x, out, 0, 0);
+
+    backward(out);
+
+    let dx = tape_get_grad(x);
+    let dx_data = read_f32(dx);
+    let dx_shape = read_shape(dx);
+    // dx should be ones of shape [2,3] (dout=[1,1,1] broadcast to [2,3]).
+    assert_eq!(dx_shape, vec![2, 3]);
+    for v in &dx_data { assert!((v - 1.0).abs() < 1e-5, "expected 1.0 got {v}"); }
+    tensor_release(dx);
+    tensor_release(x);
+    tensor_free(out);
+    tape_reset();
+}
+
+#[test]
+fn test_broadcast_add_backward() {
+    // (1,3) + (2,3) — sum VJP reduces dout to each operand's shape.
+    tape_reset();
+    let a_data = vec![1.0f32, 1.0, 1.0];
+    let b_data = vec![1.0f32; 6];
+    let a = alloc_nd(&a_data, &[1, 3]);
+    let b = alloc_nd(&b_data, &[2, 3]);
+    tensor_retain(a);
+    tensor_retain(b);
+    tape_register_leaf(a);
+    tape_register_leaf(b);
+
+    let out = tensor_broadcast_add(0, a, b); // shape [2,3]
+    tensor_retain(out);
+    tape_record_binop(OpTag::Add as i32, a, b, out);
+
+    // Use sum to get a scalar loss.
+    let loss_h = tensor_sum(out);
+    tensor_retain(loss_h);
+    tape_record_unary(OpTag::Sum as i32, out, loss_h);
+
+    backward(loss_h);
+
+    let da = tape_get_grad(a);
+    let db = tape_get_grad(b);
+
+    let da_data = read_f32(da);
+    let db_data = read_f32(db);
+
+    // dout is all ones shape [2,3]; da = sum over axis 0 → shape [1,3], each = 2.
+    assert_eq!(read_shape(da), vec![1, 3]);
+    for v in &da_data { assert!((v - 2.0).abs() < 1e-4, "da expected 2.0 got {v}"); }
+    // db = dout [2,3] — no reduction needed, each = 1.
+    assert_eq!(read_shape(db), vec![2, 3]);
+    for v in &db_data { assert!((v - 1.0).abs() < 1e-4, "db expected 1.0 got {v}"); }
+
+    tensor_release(da);
+    tensor_release(db);
+    tensor_release(a);
+    tensor_release(b);
+    tensor_free(out);
+    tensor_free(loss_h);
     tape_reset();
 }

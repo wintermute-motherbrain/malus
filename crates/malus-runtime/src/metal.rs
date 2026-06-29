@@ -319,6 +319,314 @@ pub extern "C" fn tensor_sum(handle: i64) -> i64 {
     tensor_alloc_gpu(0, shape.as_ptr(), 1, &total)
 }
 
+// ── Broadcasting + axis reductions ───────────────────────────────────────────
+//
+// Broadcasting: NumPy right-aligned rule (D1/D2 in M16 plan). Shapes are
+// runtime-only (ADR-0013); detection and validation happen here, not in sema.
+//
+// Equal-shape element-wise ops keep the existing GPU kernel path; broadcasting
+// falls back to an eager CPU loop and returns a ready tensor.
+
+fn broadcast_result_shape(sa: &[usize], sb: &[usize]) -> Vec<usize> {
+    let n = sa.len().max(sb.len());
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let da = if i + sa.len() >= n { sa[i + sa.len() - n] } else { 1 };
+        let db = if i + sb.len() >= n { sb[i + sb.len() - n] } else { 1 };
+        let d = match (da, db) {
+            (x, y) if x == y => x,
+            (x, 1) => x,
+            (1, y) => y,
+            _ => panic!(
+                "malus: broadcast shape mismatch at dim {}: {} vs {}\n  left shape:  {:?}\n  right shape: {:?}",
+                i, da, db, sa, sb
+            ),
+        };
+        out.push(d);
+    }
+    out
+}
+
+fn broadcast_cpu_loop(
+    a_data: &[f32], a_shape: &[usize],
+    b_data: &[f32], b_shape: &[usize],
+    out_data: &mut [f32], out_shape: &[usize],
+    op: impl Fn(f32, f32) -> f32,
+) {
+    let n = out_shape.len();
+    let mut pa = vec![1usize; n];
+    let mut pb = vec![1usize; n];
+    let offset_a = n - a_shape.len();
+    let offset_b = n - b_shape.len();
+    for (i, &d) in a_shape.iter().enumerate() { pa[offset_a + i] = d; }
+    for (i, &d) in b_shape.iter().enumerate() { pb[offset_b + i] = d; }
+    for flat in 0..out_data.len() {
+        let mut rem = flat;
+        let mut out_idx = vec![0usize; n];
+        for dim in (0..n).rev() {
+            out_idx[dim] = rem % out_shape[dim];
+            rem /= out_shape[dim];
+        }
+        let mut a_flat = 0usize;
+        let mut b_flat = 0usize;
+        for dim in 0..n {
+            a_flat = a_flat * pa[dim] + (out_idx[dim] % pa[dim]);
+            b_flat = b_flat * pb[dim] + (out_idx[dim] % pb[dim]);
+        }
+        out_data[flat] = op(a_data[a_flat], b_data[b_flat]);
+    }
+}
+
+fn tensor_broadcast_op(kernel_id: u64, a_h: i64, b_h: i64, op: impl Fn(f32, f32) -> f32) -> i64 {
+    let a = unsafe { &*(a_h as *const TensorBuffer) };
+    let b = unsafe { &*(b_h as *const TensorBuffer) };
+    if a.shape == b.shape {
+        let handles = [a_h, b_h];
+        kernel_dispatch(kernel_id, handles.as_ptr(), 2)
+    } else {
+        gpu_barrier();
+        let out_shape = broadcast_result_shape(&a.shape, &b.shape);
+        let a_data = unsafe { std::slice::from_raw_parts(a.buffer.contents() as *const f32, a.len) };
+        let b_data = unsafe { std::slice::from_raw_parts(b.buffer.contents() as *const f32, b.len) };
+        let out_len: usize = out_shape.iter().product();
+        let mut out_data = vec![0.0f32; out_len.max(1)];
+        broadcast_cpu_loop(a_data, &a.shape, b_data, &b.shape, &mut out_data, &out_shape, op);
+        tensor_alloc_gpu(0, out_shape.as_ptr(), out_shape.len(), out_data.as_ptr())
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn tensor_broadcast_add(kernel_id: u64, a: i64, b: i64) -> i64 {
+    tensor_broadcast_op(kernel_id, a, b, |x, y| x + y)
+}
+
+#[no_mangle]
+pub extern "C" fn tensor_broadcast_sub(kernel_id: u64, a: i64, b: i64) -> i64 {
+    tensor_broadcast_op(kernel_id, a, b, |x, y| x - y)
+}
+
+#[no_mangle]
+pub extern "C" fn tensor_broadcast_mul(kernel_id: u64, a: i64, b: i64) -> i64 {
+    tensor_broadcast_op(kernel_id, a, b, |x, y| x * y)
+}
+
+#[no_mangle]
+pub extern "C" fn tensor_broadcast_div(kernel_id: u64, a: i64, b: i64) -> i64 {
+    tensor_broadcast_op(kernel_id, a, b, |x, y| x / y)
+}
+
+// ── Axis reduction helpers ────────────────────────────────────────────────────
+
+fn normalize_axis(axis: i32, ndims: usize) -> usize {
+    let a = if axis < 0 { axis + ndims as i32 } else { axis };
+    if a < 0 || (a as usize) >= ndims {
+        panic!("malus: axis {} is out of range for tensor with {} dimensions", axis, ndims);
+    }
+    a as usize
+}
+
+fn reduce_axis_shape(in_shape: &[usize], axis: usize, keepdim: bool) -> Vec<usize> {
+    if keepdim {
+        let mut s = in_shape.to_vec();
+        s[axis] = 1;
+        s
+    } else {
+        in_shape.iter().enumerate()
+            .filter(|&(i, _)| i != axis)
+            .map(|(_, &d)| d)
+            .collect()
+    }
+}
+
+fn reduce_out_flat(in_idx: &[usize], axis: usize, keepdim: bool, out_shape: &[usize]) -> usize {
+    let mut flat = 0usize;
+    let mut out_i = 0usize;
+    for (dim, &idx) in in_idx.iter().enumerate() {
+        if dim == axis {
+            if keepdim {
+                flat = flat * out_shape[out_i]; // out_idx = 0 for reduced dim
+                out_i += 1;
+            }
+        } else {
+            flat = flat * out_shape[out_i] + idx;
+            out_i += 1;
+        }
+    }
+    flat
+}
+
+fn reduce_elements(
+    in_data: &[f32],
+    in_shape: &[usize],
+    axis: usize,
+    keepdim: bool,
+    out_shape: &[usize],
+    out_data: &mut [f32],
+    reduce_fn: impl Fn(f32, f32) -> f32,
+) {
+    let ndims = in_shape.len();
+    for flat in 0..in_data.len() {
+        let mut rem = flat;
+        let mut in_idx = vec![0usize; ndims];
+        for dim in (0..ndims).rev() {
+            in_idx[dim] = rem % in_shape[dim];
+            rem /= in_shape[dim];
+        }
+        let out_flat = reduce_out_flat(&in_idx, axis, keepdim, out_shape);
+        out_data[out_flat] = reduce_fn(out_data[out_flat], in_data[flat]);
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn tensor_reduce_sum_axis(h: i64, axis: i64, keepdim: i64) -> i64 {
+    gpu_barrier();
+    let tb = unsafe { &*(h as *const TensorBuffer) };
+    let axis_u = normalize_axis(axis as i32, tb.shape.len());
+    let keepdim_b = keepdim != 0;
+    let out_shape = reduce_axis_shape(&tb.shape, axis_u, keepdim_b);
+    let out_len: usize = out_shape.iter().product::<usize>().max(1);
+    let mut out_data = vec![0.0f32; out_len];
+    let in_data = unsafe { std::slice::from_raw_parts(tb.buffer.contents() as *const f32, tb.len) };
+    reduce_elements(in_data, &tb.shape, axis_u, keepdim_b, &out_shape, &mut out_data, |a, b| a + b);
+    tensor_alloc_gpu(0, out_shape.as_ptr(), out_shape.len(), out_data.as_ptr())
+}
+
+#[no_mangle]
+pub extern "C" fn tensor_reduce_mean_axis(h: i64, axis: i64, keepdim: i64) -> i64 {
+    gpu_barrier();
+    let tb = unsafe { &*(h as *const TensorBuffer) };
+    let axis_u = normalize_axis(axis as i32, tb.shape.len());
+    let keepdim_b = keepdim != 0;
+    let n = tb.shape[axis_u] as f32;
+    let out_shape = reduce_axis_shape(&tb.shape, axis_u, keepdim_b);
+    let out_len: usize = out_shape.iter().product::<usize>().max(1);
+    let mut out_data = vec![0.0f32; out_len];
+    let in_data = unsafe { std::slice::from_raw_parts(tb.buffer.contents() as *const f32, tb.len) };
+    reduce_elements(in_data, &tb.shape, axis_u, keepdim_b, &out_shape, &mut out_data, |a, b| a + b);
+    for v in out_data.iter_mut() { *v /= n; }
+    tensor_alloc_gpu(0, out_shape.as_ptr(), out_shape.len(), out_data.as_ptr())
+}
+
+#[no_mangle]
+pub extern "C" fn tensor_reduce_max_axis(h: i64, axis: i64, keepdim: i64) -> i64 {
+    gpu_barrier();
+    let tb = unsafe { &*(h as *const TensorBuffer) };
+    let axis_u = normalize_axis(axis as i32, tb.shape.len());
+    let keepdim_b = keepdim != 0;
+    let out_shape = reduce_axis_shape(&tb.shape, axis_u, keepdim_b);
+    let out_len: usize = out_shape.iter().product::<usize>().max(1);
+    let mut out_data = vec![f32::NEG_INFINITY; out_len];
+    let in_data = unsafe { std::slice::from_raw_parts(tb.buffer.contents() as *const f32, tb.len) };
+    reduce_elements(in_data, &tb.shape, axis_u, keepdim_b, &out_shape, &mut out_data, f32::max);
+    tensor_alloc_gpu(0, out_shape.as_ptr(), out_shape.len(), out_data.as_ptr())
+}
+
+#[no_mangle]
+pub extern "C" fn tensor_reduce_var_axis(h: i64, axis: i64, keepdim: i64) -> i64 {
+    gpu_barrier();
+    let tb = unsafe { &*(h as *const TensorBuffer) };
+    let axis_u = normalize_axis(axis as i32, tb.shape.len());
+    let keepdim_b = keepdim != 0;
+    let n = tb.shape[axis_u] as f32;
+    let out_shape = reduce_axis_shape(&tb.shape, axis_u, keepdim_b);
+    let out_len: usize = out_shape.iter().product::<usize>().max(1);
+    let in_data = unsafe { std::slice::from_raw_parts(tb.buffer.contents() as *const f32, tb.len) };
+    let ndims = tb.shape.len();
+    let in_shape = tb.shape.clone();
+
+    let mut mean_data = vec![0.0f32; out_len];
+    reduce_elements(in_data, &in_shape, axis_u, keepdim_b, &out_shape, &mut mean_data, |a, b| a + b);
+    for v in mean_data.iter_mut() { *v /= n; }
+
+    let mut var_data = vec![0.0f32; out_len];
+    for flat in 0..in_data.len() {
+        let mut rem = flat;
+        let mut in_idx = vec![0usize; ndims];
+        for dim in (0..ndims).rev() {
+            in_idx[dim] = rem % in_shape[dim];
+            rem /= in_shape[dim];
+        }
+        let out_flat = reduce_out_flat(&in_idx, axis_u, keepdim_b, &out_shape);
+        let diff = in_data[flat] - mean_data[out_flat];
+        var_data[out_flat] += diff * diff;
+    }
+    for v in var_data.iter_mut() { *v /= n; }
+    tensor_alloc_gpu(0, out_shape.as_ptr(), out_shape.len(), var_data.as_ptr())
+}
+
+// ── VJP helpers (pub(crate) for tape.rs) ─────────────────────────────────────
+
+/// Expand `h` to `out_shape` using NumPy broadcast semantics.
+/// Returns a retained handle (caller must release). Identity (retain only) when shapes match.
+pub(crate) fn broadcast_to_shape(h: i64, out_shape: &[usize]) -> i64 {
+    let t = unsafe { &*(h as *const TensorBuffer) };
+    if t.shape.as_slice() == out_shape {
+        tensor_retain(h);
+        return h;
+    }
+    let n = out_shape.len();
+    let mut padded = vec![1usize; n - t.shape.len()];
+    padded.extend_from_slice(&t.shape);
+    let in_data = unsafe { std::slice::from_raw_parts(t.buffer.contents() as *const f32, t.len) };
+    let out_len: usize = out_shape.iter().product();
+    let mut out_data = vec![0.0f32; out_len.max(1)];
+    for flat in 0..out_len {
+        let mut rem = flat;
+        let mut out_idx = vec![0usize; n];
+        for dim in (0..n).rev() {
+            out_idx[dim] = rem % out_shape[dim];
+            rem /= out_shape[dim];
+        }
+        let mut in_flat = 0usize;
+        for dim in 0..n {
+            in_flat = in_flat * padded[dim] + (out_idx[dim] % padded[dim]);
+        }
+        out_data[flat] = in_data[in_flat];
+    }
+    tensor_alloc_gpu(0, out_shape.as_ptr(), out_shape.len(), out_data.as_ptr())
+}
+
+/// Sum `grad` down to `target_shape` (the operand shape before broadcasting).
+/// Returns a retained handle. Identity (retain only) when shapes already match.
+pub(crate) fn sum_to_shape(grad: i64, target_shape: &[usize]) -> i64 {
+    let t = unsafe { &*(grad as *const TensorBuffer) };
+    if t.shape.as_slice() == target_shape {
+        tensor_retain(grad);
+        return grad;
+    }
+    let n = t.shape.len();
+    let n_target = target_shape.len();
+    let mut padded = vec![1usize; n - n_target];
+    padded.extend_from_slice(target_shape);
+    let in_data = unsafe { std::slice::from_raw_parts(t.buffer.contents() as *const f32, t.len) };
+    let out_len: usize = target_shape.iter().product::<usize>().max(1);
+    let mut out_data = vec![0.0f32; out_len];
+    for flat in 0..t.len {
+        let mut rem = flat;
+        let mut in_idx = vec![0usize; n];
+        for dim in (0..n).rev() {
+            in_idx[dim] = rem % t.shape[dim];
+            rem /= t.shape[dim];
+        }
+        let mut out_flat = 0usize;
+        for dim in 0..n {
+            out_flat = out_flat * padded[dim] + (in_idx[dim] % padded[dim]);
+        }
+        out_data[out_flat] += in_data[flat];
+    }
+    tensor_alloc_gpu(0, target_shape.as_ptr(), target_shape.len(), out_data.as_ptr())
+}
+
+/// Insert a size-1 dimension at `axis` (reshape; no data copy cost beyond alloc).
+/// Returns an owned handle (refcount=1).
+pub(crate) fn unsqueeze_at(h: i64, axis: usize) -> i64 {
+    let t = unsafe { &*(h as *const TensorBuffer) };
+    let data = unsafe { std::slice::from_raw_parts(t.buffer.contents() as *const f32, t.len) };
+    let mut new_shape = t.shape.clone();
+    new_shape.insert(axis, 1);
+    tensor_alloc_gpu(0, new_shape.as_ptr(), new_shape.len(), data.as_ptr())
+}
+
 // ── Kernel dispatch ───────────────────────────────────────────────────────────
 
 #[no_mangle]

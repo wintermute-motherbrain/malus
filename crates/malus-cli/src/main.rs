@@ -131,6 +131,15 @@ fn run_script(path: &str) {
             tape_get_grad:          malus_runtime::tape_get_grad,
             backward:               malus_runtime::backward,
             tape_zero_grad:         malus_runtime::tape_zero_grad,
+            tensor_broadcast_add:   malus_runtime::tensor_broadcast_add,
+            tensor_broadcast_sub:   malus_runtime::tensor_broadcast_sub,
+            tensor_broadcast_mul:   malus_runtime::tensor_broadcast_mul,
+            tensor_broadcast_div:   malus_runtime::tensor_broadcast_div,
+            tensor_reduce_sum_axis:  malus_runtime::tensor_reduce_sum_axis,
+            tensor_reduce_mean_axis:  malus_runtime::tensor_reduce_mean_axis,
+            tensor_reduce_max_axis:  malus_runtime::tensor_reduce_max_axis,
+            tensor_reduce_var_axis:  malus_runtime::tensor_reduce_var_axis,
+            tape_record_reduce:     malus_runtime::tape_record_reduce,
         };
         if let Err(e) = malus_codegen_cpu::compile_and_run(&typed, &symbols, &kernel_ids) {
             eprintln!("error: {e}");

@@ -1077,6 +1077,11 @@ fn check_call(
             ))
         }
         ResolvedCallee::Builtin(sig) => {
+            // Reduction builtins (sum/mean/max/var) accept named args axis=/keepdim=
+            // and return early via a dedicated checker.
+            if let BuiltinKind::Reduction = &sig.kind {
+                return check_reduction_call(&callee_name, args, span, ctx);
+            }
             let is_print_call = callee_name == "print" || callee_name == "println";
             let typed_args: Vec<TypedExpr> = match &sig.kind {
                 BuiltinKind::Variadic => {
@@ -1135,6 +1140,7 @@ fn check_call(
                     }
                     out
                 }
+                BuiltinKind::Reduction => unreachable!("Reduction handled above"),
             };
             // Validate format string arg count for print/println.
             if is_print_call {
@@ -1184,6 +1190,136 @@ fn check_call(
             ))
         }
     }
+}
+
+// ── Reduction call checking ───────────────────────────────────────────────────
+//
+// Handles `sum`, `mean`, `max`, `var` with optional named args `axis=i32` and
+// `keepdim=i32` (0/1).  Normalizes to positional [tensor, axis, keepdim] for
+// axis reductions.  For `sum` with no `axis=`, falls through to the 1-arg
+// whole-tensor path.  Variable<f32> input propagates to Variable<f32> output.
+
+fn check_reduction_call(
+    callee: &str,
+    raw_args: &[CallArg],
+    span: Span,
+    ctx: &mut BodyCtx<'_>,
+) -> Option<TypedExpr> {
+    let tensor_f32 = ResolvedTy::Tensor { dtype: ScalarTy::F32 };
+
+    let mut tensor_raw: Option<&malus_syntax::ast::Expr> = None;
+    let mut axis_raw: Option<&malus_syntax::ast::Expr> = None;
+    let mut keepdim_raw: Option<&malus_syntax::ast::Expr> = None;
+
+    for ca in raw_args {
+        match ca.name.as_deref() {
+            None => {
+                if tensor_raw.is_some() {
+                    let positional_count = raw_args.iter().filter(|a| a.name.is_none()).count();
+                    ctx.errors.push(SemaError::ArgCountMismatch {
+                        callee: callee.to_string(),
+                        expected: 1,
+                        found: positional_count,
+                        span,
+                    });
+                    return None;
+                }
+                tensor_raw = Some(&ca.value);
+            }
+            Some("axis") => axis_raw = Some(&ca.value),
+            Some("keepdim") => keepdim_raw = Some(&ca.value),
+            Some(bad) => {
+                ctx.errors.push(SemaError::UnknownReductionArg {
+                    name: bad.to_string(),
+                    span: ca.value.span,
+                });
+                return None;
+            }
+        }
+    }
+
+    let tensor_raw = match tensor_raw {
+        Some(e) => e,
+        None => {
+            ctx.errors.push(SemaError::ArgCountMismatch {
+                callee: callee.to_string(),
+                expected: 1,
+                found: 0,
+                span,
+            });
+            return None;
+        }
+    };
+
+    let checked_tensor = check_expr(tensor_raw, Some(&tensor_f32), ctx)?;
+    let is_variable = checked_tensor.ty.is_variable();
+
+    // sum(t) with no axis= — whole-tensor backward-compatible 1-arg form.
+    if callee == "sum" && axis_raw.is_none() {
+        let return_ty = if is_variable {
+            if let ResolvedTy::Variable { dtype } = &checked_tensor.ty {
+                ResolvedTy::Variable { dtype: dtype.clone() }
+            } else {
+                tensor_f32
+            }
+        } else {
+            tensor_f32
+        };
+        return Some(typed_expr(
+            TypedExprKind::Call { callee: callee.to_string(), args: vec![checked_tensor] },
+            return_ty,
+            Some(Placement::Gpu),
+            span,
+        ));
+    }
+
+    // mean/max/var (and axis-form sum) — axis= required.
+    let axis_raw = match axis_raw {
+        Some(e) => e,
+        None => {
+            ctx.errors.push(SemaError::MissingReductionAxis {
+                callee: callee.to_string(),
+                span,
+            });
+            return None;
+        }
+    };
+
+    let checked_axis = check_expr(axis_raw, Some(&ResolvedTy::Scalar(ScalarTy::I32)), ctx)?;
+
+    // keepdim defaults to 0 (false).
+    // Scalar(I64) because check_lit always returns I64 for int literals regardless of hint,
+    // so the explicit-keepdim and default-keepdim paths agree on type.
+    let checked_keepdim = if let Some(kd) = keepdim_raw {
+        check_expr(kd, Some(&ResolvedTy::Scalar(ScalarTy::I32)), ctx)?
+    } else {
+        typed_expr(
+            TypedExprKind::Lit(Lit::Int(0)),
+            ResolvedTy::Scalar(ScalarTy::I64),
+            None,
+            span,
+        )
+    };
+
+    let return_ty = if is_variable {
+        if let ResolvedTy::Variable { dtype } = &checked_tensor.ty {
+            ResolvedTy::Variable { dtype: dtype.clone() }
+        } else {
+            tensor_f32
+        }
+    } else {
+        tensor_f32
+    };
+
+    Some(typed_expr(
+        TypedExprKind::Call {
+            callee: callee.to_string(),
+            args: vec![checked_tensor, checked_axis, checked_keepdim],
+        },
+        return_ty,
+        Some(Placement::Gpu),
+        span,
+    ))
 }
 
 fn check_tensor_literal(

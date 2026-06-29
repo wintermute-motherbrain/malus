@@ -115,6 +115,16 @@ pub struct RuntimeSymbols {
     pub backward:               extern "C" fn(i64),
     // M15 tape ABI.
     pub tape_zero_grad:         extern "C" fn(*const i64, usize),
+    // M16 broadcast + axis reductions.
+    pub tensor_broadcast_add:      extern "C" fn(u64, i64, i64) -> i64,
+    pub tensor_broadcast_sub:      extern "C" fn(u64, i64, i64) -> i64,
+    pub tensor_broadcast_mul:      extern "C" fn(u64, i64, i64) -> i64,
+    pub tensor_broadcast_div:      extern "C" fn(u64, i64, i64) -> i64,
+    pub tensor_reduce_sum_axis:    extern "C" fn(i64, i64, i64) -> i64,
+    pub tensor_reduce_mean_axis:   extern "C" fn(i64, i64, i64) -> i64,
+    pub tensor_reduce_max_axis:    extern "C" fn(i64, i64, i64) -> i64,
+    pub tensor_reduce_var_axis:    extern "C" fn(i64, i64, i64) -> i64,
+    pub tape_record_reduce:        extern "C" fn(i32, i64, i64, i64, i64),
 }
 
 // ── Error ─────────────────────────────────────────────────────────────────────
@@ -167,9 +177,13 @@ const OPTAG_EXP:       i32 = 8;
 const OPTAG_LOG:       i32 = 9;
 const OPTAG_SQRT:      i32 = 10;
 const OPTAG_ABS:       i32 = 11;
-const OPTAG_SUM:       i32 = 12;
-const OPTAG_TRANSPOSE: i32 = 13;
-const OPTAG_NEG:       i32 = 14;
+const OPTAG_SUM:              i32 = 12;
+const OPTAG_TRANSPOSE:        i32 = 13;
+const OPTAG_NEG:              i32 = 14;
+const OPTAG_REDUCE_SUM_AXIS:  i32 = 15;
+const OPTAG_REDUCE_MEAN_AXIS: i32 = 16;
+const OPTAG_REDUCE_MAX_AXIS:  i32 = 17;
+const OPTAG_REDUCE_VAR_AXIS:  i32 = 18;
 
 fn binop_to_optag(op: &BinOp) -> Option<i32> {
     match op {
@@ -307,6 +321,16 @@ struct Codegen<'m> {
     rt_backward:           FuncId,
     // M15: tape ABI.
     rt_tape_zero_grad:     FuncId,
+    // M16: broadcast + axis reductions.
+    rt_tensor_broadcast_add:    FuncId,
+    rt_tensor_broadcast_sub:    FuncId,
+    rt_tensor_broadcast_mul:    FuncId,
+    rt_tensor_broadcast_div:    FuncId,
+    rt_tensor_reduce_sum_axis:  FuncId,
+    rt_tensor_reduce_mean_axis: FuncId,
+    rt_tensor_reduce_max_axis:  FuncId,
+    rt_tensor_reduce_var_axis:  FuncId,
+    rt_tape_record_reduce:      FuncId,
 }
 
 impl<'m> Codegen<'m> {
@@ -1179,7 +1203,7 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
 
             TypedExprKind::BinOp { op, lhs, rhs } => {
                 match (&lhs.ty, &rhs.ty) {
-                    // Variable ⊕ Variable — same forward as Tensor, plus tape_record_binop.
+                    // Variable ⊕ Variable — broadcast-aware forward + tape_record_binop.
                     (ResolvedTy::Variable { dtype: ld }, ResolvedTy::Variable { dtype: rd })
                         if ld == rd && *ld == ScalarTy::F32 =>
                     {
@@ -1193,14 +1217,14 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                             let call = self.builder.ins().call(matmul_ref, &[a, b]);
                             self.builder.inst_results(call).to_vec()[0]
                         } else if let Some(kernel_name) = elementwise_builtin_name(op) {
-                            self.lower_kernel_dispatch_with_handles(kernel_name, &[a, b])?
+                            self.lower_broadcast_binop(kernel_name, a, b)?
                         } else {
                             return Err(CodegenError::UnsupportedExpr(format!("Variable BinOp {:?} not supported", op)));
                         };
                         self.call_tape_record_binop(op_tag, a, b, out);
                         Ok(out)
                     }
-                    // tensor ⊕ tensor — matmul or element-wise builtin kernel
+                    // Tensor ⊕ Tensor — matmul or broadcast-aware element-wise.
                     (ResolvedTy::Tensor { dtype: ld }, ResolvedTy::Tensor { dtype: rd })
                         if ld == rd && *ld == ScalarTy::F32 =>
                     {
@@ -1210,8 +1234,10 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                             let matmul_ref = self.import_func(self.codegen.rt_tensor_matmul);
                             let call = self.builder.ins().call(matmul_ref, &[a, b]);
                             Ok(self.builder.inst_results(call).to_vec()[0])
-                        } else if let Some(name) = elementwise_builtin_name(op) {
-                            self.lower_kernel_dispatch(name, &[lhs.as_ref(), rhs.as_ref()])
+                        } else if let Some(kernel_name) = elementwise_builtin_name(op) {
+                            let a = self.lower_expr(lhs)?;
+                            let b = self.lower_expr(rhs)?;
+                            self.lower_broadcast_binop(kernel_name, a, b)
                         } else {
                             Err(CodegenError::UnsupportedExpr(format!("binop {:?} on tensors not supported", op)))
                         }
@@ -1349,18 +1375,36 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                     }
                 } else if callee == "zeros" || callee == "ones" {
                     self.lower_zeros_ones(callee, args)
-                } else if callee == "transpose" || callee == "sum" {
+                } else if callee == "transpose" {
                     if expr.ty.is_variable() {
-                        let op_tag = unary_builtin_to_optag(callee).ok_or_else(|| {
-                            CodegenError::UnsupportedExpr(format!("no OpTag for Variable builtin '{callee}'"))
-                        })?;
                         let x = self.lower_expr(&args[0])?;
-                        let out = self.lower_eager_cpu_op_with_handle(callee, x)?;
-                        self.call_tape_record_unary(op_tag, x, out);
+                        let out = self.lower_eager_cpu_op_with_handle("transpose", x)?;
+                        self.call_tape_record_unary(OPTAG_TRANSPOSE, x, out);
                         Ok(out)
                     } else {
-                        self.lower_eager_cpu_op(callee, args)
+                        self.lower_eager_cpu_op("transpose", args)
                     }
+                } else if callee == "sum" && args.len() == 1 {
+                    // sum(t) — whole-tensor sum (no axis).
+                    if expr.ty.is_variable() {
+                        let x = self.lower_expr(&args[0])?;
+                        let out = self.lower_eager_cpu_op_with_handle("sum", x)?;
+                        self.call_tape_record_unary(OPTAG_SUM, x, out);
+                        Ok(out)
+                    } else {
+                        self.lower_eager_cpu_op("sum", args)
+                    }
+                } else if callee == "sum" || callee == "mean" || callee == "max" || callee == "var" {
+                    // sum(t, axis=N, keepdim=K) or mean/max/var(t, axis=N, keepdim=K) — axis reduction.
+                    // args are positional [tensor, axis, keepdim] after sema normalization.
+                    let op_tag = match callee.as_str() {
+                        "sum"  => OPTAG_REDUCE_SUM_AXIS,
+                        "mean" => OPTAG_REDUCE_MEAN_AXIS,
+                        "max"  => OPTAG_REDUCE_MAX_AXIS,
+                        "var"  => OPTAG_REDUCE_VAR_AXIS,
+                        _      => unreachable!(),
+                    };
+                    self.lower_axis_reduction(op_tag, expr.ty.is_variable(), args)
                 } else if callee == "variable" {
                     // variable(t) — wrap Tensor in Variable: retain + tape_register_leaf.
                     let handle = self.lower_expr(&args[0])?;
@@ -2017,6 +2061,73 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
         let func_ref = self.import_func(self.codegen.rt_tape_zero_grad);
         self.builder.ins().call(func_ref, &[handles_ptr, count]);
     }
+
+    // M16 helpers.
+
+    /// Call tensor_broadcast_add/sub/mul/div(kernel_id, a, b) -> out.
+    /// kernel_name is the MSL kernel name like "malus_add".
+    fn lower_broadcast_binop(
+        &mut self,
+        kernel_name: &str,
+        a: cranelift_codegen::ir::Value,
+        b: cranelift_codegen::ir::Value,
+    ) -> Result<cranelift_codegen::ir::Value, CodegenError> {
+        let kernel_id = *self.codegen.kernel_ids.get(kernel_name)
+            .ok_or_else(|| CodegenError::UnknownKernel { name: kernel_name.to_string() })?;
+        let id_val = self.builder.ins().iconst(I64, kernel_id as i64);
+        let func_id = match kernel_name {
+            "malus_add" => self.codegen.rt_tensor_broadcast_add,
+            "malus_sub" => self.codegen.rt_tensor_broadcast_sub,
+            "malus_mul" => self.codegen.rt_tensor_broadcast_mul,
+            "malus_div" => self.codegen.rt_tensor_broadcast_div,
+            _ => return Err(CodegenError::UnsupportedExpr(format!("no broadcast fn for kernel '{kernel_name}'"))),
+        };
+        let func_ref = self.import_func(func_id);
+        let call = self.builder.ins().call(func_ref, &[id_val, a, b]);
+        Ok(self.builder.inst_results(call).to_vec()[0])
+    }
+
+    /// Lower an axis reduction (sum/mean/max/var with axis/keepdim args).
+    /// args = [tensor, axis_expr, keepdim_expr] after sema normalization.
+    fn lower_axis_reduction(
+        &mut self,
+        op_tag: i32,
+        is_variable: bool,
+        args: &[malus_sema::TypedExpr],
+    ) -> Result<cranelift_codegen::ir::Value, CodegenError> {
+        let x = self.lower_expr(&args[0])?;
+        // Sema normalizes axis and keepdim to Scalar(I32); lower_expr returns an I32 Cranelift value.
+        let axis_i32 = self.lower_expr(&args[1])?;
+        let keepdim_i32 = self.lower_expr(&args[2])?;
+        let func_id = match op_tag {
+            OPTAG_REDUCE_SUM_AXIS  => self.codegen.rt_tensor_reduce_sum_axis,
+            OPTAG_REDUCE_MEAN_AXIS => self.codegen.rt_tensor_reduce_mean_axis,
+            OPTAG_REDUCE_MAX_AXIS  => self.codegen.rt_tensor_reduce_max_axis,
+            OPTAG_REDUCE_VAR_AXIS  => self.codegen.rt_tensor_reduce_var_axis,
+            _ => unreachable!("invalid axis reduction op_tag {}", op_tag),
+        };
+        let func_ref = self.import_func(func_id);
+        let call = self.builder.ins().call(func_ref, &[x, axis_i32, keepdim_i32]);
+        let out = self.builder.inst_results(call).to_vec()[0];
+        if is_variable {
+            self.call_tape_record_reduce(op_tag, x, out, axis_i32, keepdim_i32);
+        }
+        Ok(out)
+    }
+
+    fn call_tape_record_reduce(
+        &mut self,
+        op_tag: i32,
+        x: cranelift_codegen::ir::Value,
+        out: cranelift_codegen::ir::Value,
+        axis: cranelift_codegen::ir::Value,   // I64 (from lowered Scalar(I64) literal)
+        keepdim: cranelift_codegen::ir::Value, // I64
+    ) {
+        let tag_val = self.builder.ins().iconst(I32, op_tag as i64);
+        let func_ref = self.import_func(self.codegen.rt_tape_record_reduce);
+        // sig: (I32, I64, I64, I64, I64)
+        self.builder.ins().call(func_ref, &[tag_val, x, out, axis, keepdim]);
+    }
 }
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -2076,6 +2187,16 @@ pub fn compile_and_run(
     jit_builder.symbol("backward",               symbols.backward               as *const u8);
     // M15 tape ABI.
     jit_builder.symbol("tape_zero_grad",         symbols.tape_zero_grad         as *const u8);
+    // M16 broadcast + axis reductions.
+    jit_builder.symbol("tensor_broadcast_add",   symbols.tensor_broadcast_add   as *const u8);
+    jit_builder.symbol("tensor_broadcast_sub",   symbols.tensor_broadcast_sub   as *const u8);
+    jit_builder.symbol("tensor_broadcast_mul",   symbols.tensor_broadcast_mul   as *const u8);
+    jit_builder.symbol("tensor_broadcast_div",   symbols.tensor_broadcast_div   as *const u8);
+    jit_builder.symbol("tensor_reduce_sum_axis",  symbols.tensor_reduce_sum_axis  as *const u8);
+    jit_builder.symbol("tensor_reduce_mean_axis", symbols.tensor_reduce_mean_axis as *const u8);
+    jit_builder.symbol("tensor_reduce_max_axis",  symbols.tensor_reduce_max_axis  as *const u8);
+    jit_builder.symbol("tensor_reduce_var_axis",  symbols.tensor_reduce_var_axis  as *const u8);
+    jit_builder.symbol("tape_record_reduce",     symbols.tape_record_reduce     as *const u8);
 
     let mut module = JITModule::new(jit_builder);
     let ptr = module.target_config().pointer_type();
@@ -2274,6 +2395,54 @@ pub fn compile_and_run(
     let rt_tape_zero_grad = module.declare_function("tape_zero_grad", Linkage::Import, &sig_tape_zero_grad)
         .map_err(|e| CodegenError::JitError(e.to_string()))?;
 
+    // M16: tensor_broadcast_add/sub/mul/div(kernel_id: u64, a: i64, b: i64) -> i64
+    let sig_broadcast_binop = {
+        let mut s = Signature::new(call_conv);
+        s.params.push(AbiParam::new(I64)); // kernel_id (u64 → I64)
+        s.params.push(AbiParam::new(I64)); // a
+        s.params.push(AbiParam::new(I64)); // b
+        s.returns.push(AbiParam::new(I64));
+        s
+    };
+    let rt_tensor_broadcast_add = module.declare_function("tensor_broadcast_add", Linkage::Import, &sig_broadcast_binop)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
+    let rt_tensor_broadcast_sub = module.declare_function("tensor_broadcast_sub", Linkage::Import, &sig_broadcast_binop)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
+    let rt_tensor_broadcast_mul = module.declare_function("tensor_broadcast_mul", Linkage::Import, &sig_broadcast_binop)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
+    let rt_tensor_broadcast_div = module.declare_function("tensor_broadcast_div", Linkage::Import, &sig_broadcast_binop)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
+    // M16: tensor_reduce_*_axis(h: i64, axis: i64, keepdim: i64) -> i64
+    // axis/keepdim are I64 because malus integer literals always lower to I64.
+    let sig_reduce_axis = {
+        let mut s = Signature::new(call_conv);
+        s.params.push(AbiParam::new(I64)); // h
+        s.params.push(AbiParam::new(I64)); // axis
+        s.params.push(AbiParam::new(I64)); // keepdim
+        s.returns.push(AbiParam::new(I64));
+        s
+    };
+    let rt_tensor_reduce_sum_axis = module.declare_function("tensor_reduce_sum_axis", Linkage::Import, &sig_reduce_axis)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
+    let rt_tensor_reduce_mean_axis = module.declare_function("tensor_reduce_mean_axis", Linkage::Import, &sig_reduce_axis)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
+    let rt_tensor_reduce_max_axis = module.declare_function("tensor_reduce_max_axis", Linkage::Import, &sig_reduce_axis)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
+    let rt_tensor_reduce_var_axis = module.declare_function("tensor_reduce_var_axis", Linkage::Import, &sig_reduce_axis)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
+    // M16: tape_record_reduce(op: i32, x: i64, out: i64, axis: i64, keepdim: i64)
+    let sig_tape_record_reduce = {
+        let mut s = Signature::new(call_conv);
+        s.params.push(AbiParam::new(I32)); // op_tag
+        s.params.push(AbiParam::new(I64)); // x
+        s.params.push(AbiParam::new(I64)); // out
+        s.params.push(AbiParam::new(I64)); // axis
+        s.params.push(AbiParam::new(I64)); // keepdim
+        s
+    };
+    let rt_tape_record_reduce = module.declare_function("tape_record_reduce", Linkage::Import, &sig_tape_record_reduce)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
+
     // First pass: declare all user fn signatures.
     let mut func_ids: HashMap<String, FuncId> = HashMap::new();
     for typed_fn in &program.fns {
@@ -2326,6 +2495,15 @@ pub fn compile_and_run(
         rt_tape_get_grad,
         rt_backward,
         rt_tape_zero_grad,
+        rt_tensor_broadcast_add,
+        rt_tensor_broadcast_sub,
+        rt_tensor_broadcast_mul,
+        rt_tensor_broadcast_div,
+        rt_tensor_reduce_sum_axis,
+        rt_tensor_reduce_mean_axis,
+        rt_tensor_reduce_max_axis,
+        rt_tensor_reduce_var_axis,
+        rt_tape_record_reduce,
     };
 
     // Second pass: compile each fn body.

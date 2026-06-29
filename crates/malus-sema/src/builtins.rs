@@ -13,6 +13,10 @@ pub enum BuiltinKind {
     ShapeArgs,
     /// Accepts any number of args, each constrained to a single type (e.g., zero_grad).
     VariadicTyped(ResolvedTy),
+    /// Axis reduction: one tensor + optional named args `axis=i32`, `keepdim=bool`.
+    /// Normalized to positional [tensor, axis, keepdim] in check_call.
+    /// For `sum` the axis arg is optional (no axis = whole-tensor sum, unchanged).
+    Reduction,
 }
 
 #[derive(Debug, Clone)]
@@ -72,12 +76,20 @@ pub fn register_builtins() -> HashMap<String, BuiltinSig> {
         return_placement: Some(Placement::Gpu),
     });
 
-    // sum(t) -> Tensor<f32> — eager CPU op, returns a 1-element [1] tensor
+    // sum(t) — whole-tensor sum (returns [1] tensor) OR axis reduction (see Reduction kind).
+    // mean/max/var require axis=N.
     m.insert("sum".to_string(), BuiltinSig {
-        kind: BuiltinKind::Fixed(vec![tensor_f32.clone()]),
+        kind: BuiltinKind::Reduction,
         return_ty: tensor_f32.clone(),
         return_placement: Some(Placement::Gpu),
     });
+    for name in &["mean", "max", "var"] {
+        m.insert(name.to_string(), BuiltinSig {
+            kind: BuiltinKind::Reduction,
+            return_ty: tensor_f32.clone(),
+            return_placement: Some(Placement::Gpu),
+        });
+    }
 
     // variable(t) -> Variable<f32> — wrap a Tensor in an RC Variable.
     m.insert("variable".to_string(), BuiltinSig {
