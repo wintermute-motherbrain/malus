@@ -125,6 +125,10 @@ pub struct RuntimeSymbols {
     pub tensor_reduce_max_axis:    extern "C" fn(i64, i64, i64) -> i64,
     pub tensor_reduce_var_axis:    extern "C" fn(i64, i64, i64) -> i64,
     pub tape_record_reduce:        extern "C" fn(i32, i64, i64, i64, i64),
+    // M17 shapes + batched matmul.
+    pub tensor_reshape:            extern "C" fn(i64, *const usize, usize) -> i64,
+    pub tensor_permute:            extern "C" fn(i64, *const usize, usize) -> i64,
+    pub tape_record_perm:          extern "C" fn(i32, i64, i64, *const usize, usize),
 }
 
 // ── Error ─────────────────────────────────────────────────────────────────────
@@ -184,6 +188,7 @@ const OPTAG_REDUCE_SUM_AXIS:  i32 = 15;
 const OPTAG_REDUCE_MEAN_AXIS: i32 = 16;
 const OPTAG_REDUCE_MAX_AXIS:  i32 = 17;
 const OPTAG_REDUCE_VAR_AXIS:  i32 = 18;
+const OPTAG_RESHAPE:          i32 = 19;
 
 fn binop_to_optag(op: &BinOp) -> Option<i32> {
     match op {
@@ -331,6 +336,10 @@ struct Codegen<'m> {
     rt_tensor_reduce_max_axis:  FuncId,
     rt_tensor_reduce_var_axis:  FuncId,
     rt_tape_record_reduce:      FuncId,
+    // M17: shapes + batched matmul.
+    rt_tensor_reshape:          FuncId,
+    rt_tensor_permute:          FuncId,
+    rt_tape_record_perm:        FuncId,
 }
 
 impl<'m> Codegen<'m> {
@@ -1375,15 +1384,8 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                     }
                 } else if callee == "zeros" || callee == "ones" {
                     self.lower_zeros_ones(callee, args)
-                } else if callee == "transpose" {
-                    if expr.ty.is_variable() {
-                        let x = self.lower_expr(&args[0])?;
-                        let out = self.lower_eager_cpu_op_with_handle("transpose", x)?;
-                        self.call_tape_record_unary(OPTAG_TRANSPOSE, x, out);
-                        Ok(out)
-                    } else {
-                        self.lower_eager_cpu_op("transpose", args)
-                    }
+                } else if callee == "reshape" || callee == "transpose" || callee == "permute" {
+                    self.lower_shape_op(callee, args, expr.ty.is_variable())
                 } else if callee == "sum" && args.len() == 1 {
                     // sum(t) — whole-tensor sum (no axis).
                     if expr.ty.is_variable() {
@@ -2128,6 +2130,79 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
         // sig: (I32, I64, I64, I64, I64)
         self.builder.ins().call(func_ref, &[tag_val, x, out, axis, keepdim]);
     }
+
+    // M17 helpers.
+
+    fn call_tape_record_perm(
+        &mut self,
+        op_tag: i32,
+        x: cranelift_codegen::ir::Value,
+        out: cranelift_codegen::ir::Value,
+        dims_ptr: cranelift_codegen::ir::Value, // ptr (*const usize)
+        ndims: cranelift_codegen::ir::Value,    // ptr (usize)
+    ) {
+        let tag_val = self.builder.ins().iconst(I32, op_tag as i64);
+        let func_ref = self.import_func(self.codegen.rt_tape_record_perm);
+        self.builder.ins().call(func_ref, &[tag_val, x, out, dims_ptr, ndims]);
+    }
+
+    /// Lower reshape(t, d0..dn), transpose(t[, i, j]), or permute(t, p0..pn).
+    /// args[0] = tensor/variable; args[1..] = dim args (may be empty for no-arg transpose).
+    fn lower_shape_op(
+        &mut self,
+        callee: &str,
+        args: &[malus_sema::TypedExpr],
+        is_variable: bool,
+    ) -> Result<cranelift_codegen::ir::Value, CodegenError> {
+        let handle = self.lower_expr(&args[0])?;
+        let dim_args = &args[1..];
+        let n = dim_args.len() as u32;
+
+        // Build stack slot for variadic dim args (identical idiom to lower_zeros_ones).
+        let (dims_ptr, ndims_val) = if n == 0 {
+            // No dim args (e.g. transpose(t) — 0-arg 2-D reverse).
+            // Pass null ptr + 0 count; runtime normalize_perm handles this.
+            let null_ptr = self.builder.ins().iconst(self.codegen.ptr_type(), 0);
+            let zero     = self.builder.ins().iconst(self.codegen.ptr_type(), 0);
+            (null_ptr, zero)
+        } else {
+            let slot = self.builder.create_sized_stack_slot(
+                cranelift_codegen::ir::StackSlotData::new(
+                    cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                    n * 8,
+                    3,
+                )
+            );
+            for (i, arg) in dim_args.iter().enumerate() {
+                let val = self.lower_expr(arg)?;
+                self.builder.ins().stack_store(val, slot, (i as i32) * 8);
+            }
+            let ptr = self.builder.ins().stack_addr(self.codegen.ptr_type(), slot, 0);
+            let cnt = self.builder.ins().iconst(self.codegen.ptr_type(), n as i64);
+            (ptr, cnt)
+        };
+
+        let out = if callee == "reshape" {
+            let func_ref = self.import_func(self.codegen.rt_tensor_reshape);
+            let call = self.builder.ins().call(func_ref, &[handle, dims_ptr, ndims_val]);
+            self.builder.inst_results(call).to_vec()[0]
+        } else {
+            // "transpose" or "permute" — both lower to tensor_permute.
+            let func_ref = self.import_func(self.codegen.rt_tensor_permute);
+            let call = self.builder.ins().call(func_ref, &[handle, dims_ptr, ndims_val]);
+            self.builder.inst_results(call).to_vec()[0]
+        };
+
+        if is_variable {
+            if callee == "reshape" {
+                self.call_tape_record_unary(OPTAG_RESHAPE, handle, out);
+            } else {
+                // transpose and permute both record as OPTAG_TRANSPOSE with the raw dims.
+                self.call_tape_record_perm(OPTAG_TRANSPOSE, handle, out, dims_ptr, ndims_val);
+            }
+        }
+        Ok(out)
+    }
 }
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -2197,6 +2272,10 @@ pub fn compile_and_run(
     jit_builder.symbol("tensor_reduce_max_axis",  symbols.tensor_reduce_max_axis  as *const u8);
     jit_builder.symbol("tensor_reduce_var_axis",  symbols.tensor_reduce_var_axis  as *const u8);
     jit_builder.symbol("tape_record_reduce",     symbols.tape_record_reduce     as *const u8);
+    // M17 shapes + batched matmul.
+    jit_builder.symbol("tensor_reshape",         symbols.tensor_reshape         as *const u8);
+    jit_builder.symbol("tensor_permute",         symbols.tensor_permute         as *const u8);
+    jit_builder.symbol("tape_record_perm",       symbols.tape_record_perm       as *const u8);
 
     let mut module = JITModule::new(jit_builder);
     let ptr = module.target_config().pointer_type();
@@ -2443,6 +2522,32 @@ pub fn compile_and_run(
     let rt_tape_record_reduce = module.declare_function("tape_record_reduce", Linkage::Import, &sig_tape_record_reduce)
         .map_err(|e| CodegenError::JitError(e.to_string()))?;
 
+    // M17: tensor_reshape / tensor_permute (handle, dims_ptr, ndims) -> i64
+    //      tape_record_perm(op: i32, x: i64, out: i64, dims_ptr: *const usize, ndims: usize)
+    let sig_shape_op = {
+        let mut s = Signature::new(call_conv);
+        s.params.push(AbiParam::new(I64)); // handle
+        s.params.push(AbiParam::new(ptr)); // dims_ptr (*const usize)
+        s.params.push(AbiParam::new(ptr)); // ndims (usize)
+        s.returns.push(AbiParam::new(I64));
+        s
+    };
+    let rt_tensor_reshape = module.declare_function("tensor_reshape", Linkage::Import, &sig_shape_op)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
+    let rt_tensor_permute = module.declare_function("tensor_permute", Linkage::Import, &sig_shape_op)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
+    let sig_tape_record_perm = {
+        let mut s = Signature::new(call_conv);
+        s.params.push(AbiParam::new(I32)); // op_tag
+        s.params.push(AbiParam::new(I64)); // x
+        s.params.push(AbiParam::new(I64)); // out
+        s.params.push(AbiParam::new(ptr)); // dims_ptr (*const usize)
+        s.params.push(AbiParam::new(ptr)); // ndims (usize)
+        s
+    };
+    let rt_tape_record_perm = module.declare_function("tape_record_perm", Linkage::Import, &sig_tape_record_perm)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
+
     // First pass: declare all user fn signatures.
     let mut func_ids: HashMap<String, FuncId> = HashMap::new();
     for typed_fn in &program.fns {
@@ -2504,6 +2609,9 @@ pub fn compile_and_run(
         rt_tensor_reduce_max_axis,
         rt_tensor_reduce_var_axis,
         rt_tape_record_reduce,
+        rt_tensor_reshape,
+        rt_tensor_permute,
+        rt_tape_record_perm,
     };
 
     // Second pass: compile each fn body.

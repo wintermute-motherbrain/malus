@@ -17,6 +17,11 @@ pub enum BuiltinKind {
     /// Normalized to positional [tensor, axis, keepdim] in check_call.
     /// For `sum` the axis arg is optional (no axis = whole-tensor sum, unchanged).
     Reduction,
+    /// Tensor-then-shape-args: first arg is a tensor/variable, remaining args are
+    /// i64 dim/axis values.  Used by reshape(t, d0..dn), transpose(t[, i, j]),
+    /// permute(t, p0..pn).  Normalized to positional [tensor, d0..dn] in check_call.
+    /// Variable propagation: if arg0 is Variable the return type is Variable.
+    TensorThenShapeArgs,
 }
 
 #[derive(Debug, Clone)]
@@ -69,12 +74,17 @@ pub fn register_builtins() -> HashMap<String, BuiltinSig> {
         });
     }
 
-    // transpose(t) -> Tensor<f32> — eager CPU op, 2-D only in V1
-    m.insert("transpose".to_string(), BuiltinSig {
-        kind: BuiltinKind::Fixed(vec![tensor_f32.clone()]),
-        return_ty: tensor_f32.clone(),
-        return_placement: Some(Placement::Gpu),
-    });
+    // transpose(t[, i, j]) — swap two axes (or reverse a 2-D tensor with no args).
+    // permute(t, p0..p_rank) — reorder all axes.
+    // reshape(t, d0..dn)    — zero-copy contiguous reshape.
+    // All: TensorThenShapeArgs; Variable input propagates to Variable output.
+    for name in &["transpose", "permute", "reshape"] {
+        m.insert(name.to_string(), BuiltinSig {
+            kind: BuiltinKind::TensorThenShapeArgs,
+            return_ty: tensor_f32.clone(),
+            return_placement: Some(Placement::Gpu),
+        });
+    }
 
     // sum(t) — whole-tensor sum (returns [1] tensor) OR axis reduction (see Reduction kind).
     // mean/max/var require axis=N.

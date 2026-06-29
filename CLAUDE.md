@@ -4,7 +4,7 @@
 
 malus is a compiled ML DSL for Apple Silicon. Python-like syntax, dual compilation pipeline: `fn` bodies → Cranelift JIT (CPU), `kernel` bodies → Metal Shading Language (GPU). The CTMM memory model inserts static `free`/barrier calls at compile time, falling back to reference counting only when lifetimes are structurally ambiguous.
 
-## Current state: **M16 done — NumPy broadcasting + axis reductions (sum/mean/max/var), differentiable; M17 (shapes + batched matmul) next**
+## Current state: **M17 done — reshape, transpose/permute, 3-D batched matmul, all differentiable; M18 (transformer stdlib) next**
 
 | Milestone | Status | Crate |
 |---|---|---|
@@ -28,7 +28,7 @@ malus is a compiled ML DSL for Apple Silicon. Python-like syntax, dual compilati
 | M15 — Differentiable Stdlib + Capstone (`zero_grad`, V2 XOR capstone) | ✅ done | all crates |
 | **V3 — nanoGPT** | | |
 | M16 — Broadcasting + Axis Reductions (NumPy broadcast, `sum`/`mean`/`max`/`var` over axis, differentiable) | ✅ done | `malus-syntax`, `malus-sema`, `malus-codegen-cpu`, `malus-runtime` |
-| M17 — Shapes + Batched Matmul (`reshape`/`view`, `transpose(dims)`, 3-D matmul) | 🔲 planned | `malus-syntax`, `malus-sema`, `malus-codegen-cpu`, `malus-runtime` |
+| M17 — Shapes + Batched Matmul (`reshape`, `transpose`/`permute`, 3-D/batched matmul) | ✅ done | `malus-syntax`, `malus-sema`, `malus-codegen-cpu`, `malus-runtime` |
 | M18 — Transformer Stdlib (`softmax`, `layernorm`, `gelu`, `cross_entropy`, causal mask) | 🔲 planned | `malus-sema`, `malus-codegen-cpu`, `malus-runtime` |
 | M19 — Embeddings + Index Tensors (i32/i64 tensors, `gather`, `randn`/Philox) | 🔲 planned | all crates |
 | M20 — Lvalue Assignment + AdamW (`a[i]=e`, `s.f=e`, stdlib AdamW) | 🔲 planned | `malus-syntax`, `malus-sema`, `malus-codegen-cpu` |
@@ -64,6 +64,11 @@ These decisions were made during V3 planning. Do not re-litigate them without us
 | Index tensor dtype | i32/i64 only | Narrow carve-out for embedding lookup; full f16/bf16 compute generality stays deferred. |
 | Broadcasting | NumPy right-aligned (M16) | Retires the `ones41 @ b` bias-broadcast trick. |
 | Axis reductions | `keepdim` parameter (M16) | Required for layernorm and softmax normalization. |
+| reshape buffer model | Clone `MTLBuffer` handle into independent `TensorBuffer` (M17) | Zero-copy; no CTMM special-casing; safe under immutability. Overrules spec text. See ADR-0023. |
+| reshape vs view | `reshape` only; `view` reserved (M17) | Zero-copy M17 reshape *is* view semantics. Shipping both names would advertise a non-existent distinction. See ADR-0022. |
+| transpose vs permute | Separate builtins, shared runtime engine (M17) | PyTorch `torch.transpose` swaps two axes; `torch.permute` reorders all. Overloading one name would be a future breaking change. See ADR-0022. |
+| Batched matmul scope | Both-3-D identical-batch only (M17) | Covers attention (Q@Kᵀ, scores@V) after head-folding; 2-D⊗3-D broadcast deferred as additive. |
+| API parity principle | API surface tracks PyTorch's actual contracts (M17) | New names must match their PyTorch counterpart contract; deferral is additive, never breaking. See ADR-0022. |
 | File I/O scope | Minimal `read_file` + 3 string primitives | Capstone needs real data; I/O scope strictly fenced. See ADR-0018. |
 
 ## V1 Design Decisions
@@ -174,9 +179,9 @@ The `i64` handle is a raw pointer to a heap-allocated `TensorBuffer { buffer: me
 | Tuple elements as struct fields or array elements | Post-M13.5 | Sema rejects these positions; requires recursive drop in DropStruct/RC path (ADR-0020) |
 | `match` on tuples | Post-M13.5 | Destructure with `let (a, b) = x` instead; match arm patterns deferred |
 | Nested tuples (`((a, b), c)`) | Post-M13.5 | Flat-only in M13.5; element types may not themselves be tuples (ADR-0020) |
-| NumPy-style broadcasting | M16 | Element-count must match today; right-aligned broadcast deferred |
-| Axis reductions (`mean`, `var`, `max` with keepdim) | M16 | Only whole-tensor `sum` exists |
-| `reshape`/`view`, batched/3-D matmul | M17 | matmul is 2-D only |
+| NumPy-style broadcasting | ✅ M16 | Done |
+| Axis reductions (`mean`, `var`, `max` with keepdim) | ✅ M16 | Done |
+| `reshape`/`transpose`/`permute`, batched/3-D matmul | ✅ M17 | Done; `view` reserved for strided non-contiguous post-V3 |
 | Transformer stdlib (softmax, layernorm, GELU, cross-entropy) | M18 | Not yet implemented |
 | Index tensors, `gather`/embedding, `randn` | M19 | Only f32 tensors today |
 | Lvalue assignment (`a[i]=e`, `s.f=e`) | M20 | `Assign.target` is a bare name only |

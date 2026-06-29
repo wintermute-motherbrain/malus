@@ -255,35 +255,73 @@ pub extern "C" fn tensor_matmul(handle_a: i64, handle_b: i64) -> i64 {
     let a = unsafe { &*(handle_a as *const TensorBuffer) };
     let b = unsafe { &*(handle_b as *const TensorBuffer) };
 
-    if a.shape.len() != 2 {
-        panic!("malus: tensor_matmul requires a 2-D tensor, got shape {:?} for first arg", a.shape);
-    }
-    if b.shape.len() != 2 {
-        panic!("malus: tensor_matmul requires a 2-D tensor, got shape {:?} for second arg", b.shape);
-    }
-    let (m, k) = (a.shape[0], a.shape[1]);
-    let (k2, n) = (b.shape[0], b.shape[1]);
-    if k != k2 {
-        panic!(
-            "malus: matmul shape mismatch: [{m}x{k}] @ [{k2}x{n}] — inner dims {k} != {k2}\n  left shape:  {:?}\n  right shape: {:?}",
-            a.shape, b.shape
-        );
-    }
-
-    let a_data = unsafe { std::slice::from_raw_parts(a.buffer.contents() as *const f32, a.len) };
-    let b_data = unsafe { std::slice::from_raw_parts(b.buffer.contents() as *const f32, b.len) };
-
-    let mut out_data = vec![0.0f32; m * n];
-    for i in 0..m {
-        for j in 0..n {
-            for kk in 0..k {
-                out_data[i * n + j] += a_data[i * k + kk] * b_data[kk * n + j];
+    match (a.shape.len(), b.shape.len()) {
+        (2, 2) => {
+            let (m, k) = (a.shape[0], a.shape[1]);
+            let (k2, n) = (b.shape[0], b.shape[1]);
+            if k != k2 {
+                panic!(
+                    "malus: matmul shape mismatch: [{m}x{k}] @ [{k2}x{n}] — inner dims {k} != {k2}\n  \
+                     left shape:  {:?}\n  right shape: {:?}",
+                    a.shape, b.shape
+                );
             }
+            let a_data = unsafe { std::slice::from_raw_parts(a.buffer.contents() as *const f32, a.len) };
+            let b_data = unsafe { std::slice::from_raw_parts(b.buffer.contents() as *const f32, b.len) };
+            let mut out_data = vec![0.0f32; m * n];
+            for i in 0..m {
+                for j in 0..n {
+                    for kk in 0..k {
+                        out_data[i * n + j] += a_data[i * k + kk] * b_data[kk * n + j];
+                    }
+                }
+            }
+            let out_shape = [m, n];
+            tensor_alloc_gpu(0, out_shape.as_ptr(), 2, out_data.as_ptr())
         }
+        (3, 3) => {
+            let (batch, m, k) = (a.shape[0], a.shape[1], a.shape[2]);
+            let (batch2, k2, n) = (b.shape[0], b.shape[1], b.shape[2]);
+            if batch != batch2 {
+                panic!(
+                    "malus: batched matmul batch dims must match: {} vs {}\n  \
+                     left shape:  {:?}\n  right shape: {:?}",
+                    batch, batch2, a.shape, b.shape
+                );
+            }
+            if k != k2 {
+                panic!(
+                    "malus: batched matmul inner dims must match: {} vs {}\n  \
+                     left shape:  {:?}\n  right shape: {:?}",
+                    k, k2, a.shape, b.shape
+                );
+            }
+            let a_data = unsafe { std::slice::from_raw_parts(a.buffer.contents() as *const f32, a.len) };
+            let b_data = unsafe { std::slice::from_raw_parts(b.buffer.contents() as *const f32, b.len) };
+            let out_len = batch * m * n;
+            let mut out_data = vec![0.0f32; out_len];
+            for bx in 0..batch {
+                let a_off = bx * m * k;
+                let b_off = bx * k * n;
+                let c_off = bx * m * n;
+                for i in 0..m {
+                    for j in 0..n {
+                        for kk in 0..k {
+                            out_data[c_off + i * n + j] +=
+                                a_data[a_off + i * k + kk] * b_data[b_off + kk * n + j];
+                        }
+                    }
+                }
+            }
+            let out_shape = [batch, m, n];
+            tensor_alloc_gpu(0, out_shape.as_ptr(), 3, out_data.as_ptr())
+        }
+        _ => panic!(
+            "malus: tensor_matmul requires both inputs to be 2-D or both 3-D\n  \
+             left shape:  {:?}\n  right shape: {:?}",
+            a.shape, b.shape
+        ),
     }
-
-    let out_shape = [m, n];
-    tensor_alloc_gpu(0, out_shape.as_ptr(), 2, out_data.as_ptr())
 }
 
 #[no_mangle]
@@ -552,6 +590,146 @@ pub extern "C" fn tensor_reduce_var_axis(h: i64, axis: i64, keepdim: i64) -> i64
     }
     for v in var_data.iter_mut() { *v /= n; }
     tensor_alloc_gpu(0, out_shape.as_ptr(), out_shape.len(), var_data.as_ptr())
+}
+
+// ── M17: reshape, permute, batched matmul ────────────────────────────────────
+
+/// Normalize a list of raw dim args into a full permutation of `[0..rank)`.
+/// 0 args  → reverse (rank must be 2, i.e. the no-arg transpose shorthand).
+/// 2 args  → identity perm with those two axes swapped (any rank ≥ 2).
+/// rank args → the full permutation itself; validated to be a bijection.
+/// anything else → panic.
+pub(crate) fn normalize_perm(raw: &[usize], rank: usize) -> Vec<usize> {
+    match raw.len() {
+        0 => {
+            if rank != 2 {
+                panic!("malus: transpose() with no dim args requires a 2-D tensor, got rank {rank}");
+            }
+            vec![1, 0]
+        }
+        2 => {
+            let (i, j) = (raw[0], raw[1]);
+            if i >= rank || j >= rank {
+                panic!("malus: transpose axis {i} or {j} out of range for rank-{rank} tensor");
+            }
+            let mut perm: Vec<usize> = (0..rank).collect();
+            perm.swap(i, j);
+            perm
+        }
+        n if n == rank => {
+            let mut seen = vec![false; rank];
+            for &p in raw {
+                if p >= rank {
+                    panic!("malus: permute dim {p} out of range for rank-{rank} tensor");
+                }
+                if seen[p] {
+                    panic!("malus: permute has duplicate dim {p}");
+                }
+                seen[p] = true;
+            }
+            raw.to_vec()
+        }
+        n => panic!(
+            "malus: permute/transpose got {n} dim args for rank-{rank} tensor; \
+             expected 0 (reverse 2-D), 2 (swap two axes), or {rank} (full permute)\n  \
+             hint: transpose(t) reverses a 2-D tensor; \
+             transpose(t,i,j) swaps two axes; \
+             permute(t,p0..p_rank) reorders all axes"
+        ),
+    }
+}
+
+pub(crate) fn invert_perm(perm: &[usize]) -> Vec<usize> {
+    let mut inv = vec![0usize; perm.len()];
+    for (i, &p) in perm.iter().enumerate() {
+        inv[p] = i;
+    }
+    inv
+}
+
+/// Apply a fully-normalized permutation to a tensor.  No barrier — callers
+/// that read GPU data must have already called gpu_barrier().
+pub(crate) fn permute_by_perm(handle: i64, perm: &[usize]) -> i64 {
+    let tb_in = unsafe { &*(handle as *const TensorBuffer) };
+    let rank = tb_in.shape.len();
+    assert_eq!(perm.len(), rank, "permute_by_perm: perm len {} != rank {}", perm.len(), rank);
+    let out_shape: Vec<usize> = perm.iter().map(|&p| tb_in.shape[p]).collect();
+    // Row-major strides for the input.
+    let mut in_strides = vec![1usize; rank];
+    for i in (0..rank.saturating_sub(1)).rev() {
+        in_strides[i] = in_strides[i + 1] * tb_in.shape[i + 1];
+    }
+    let out_len: usize = out_shape.iter().product::<usize>().max(1);
+    let in_data = unsafe { std::slice::from_raw_parts(tb_in.buffer.contents() as *const f32, tb_in.len) };
+    let mut out_data = vec![0.0f32; out_len];
+    // Row-major strides for the output.
+    let mut out_strides = vec![1usize; rank];
+    for i in (0..rank.saturating_sub(1)).rev() {
+        out_strides[i] = out_strides[i + 1] * out_shape[i + 1];
+    }
+    for flat in 0..out_len {
+        let mut rem = flat;
+        let mut out_idx = vec![0usize; rank];
+        for dim in (0..rank).rev() {
+            out_idx[dim] = rem % out_shape[dim];
+            rem /= out_shape[dim];
+        }
+        // out_dim d corresponds to in_dim perm[d], so in_idx[perm[d]] = out_idx[d].
+        let mut in_flat = 0usize;
+        for d in 0..rank {
+            in_flat += out_idx[d] * in_strides[perm[d]];
+        }
+        out_data[flat] = in_data[in_flat];
+    }
+    tensor_alloc_gpu(0, out_shape.as_ptr(), out_shape.len(), out_data.as_ptr())
+}
+
+/// Zero-copy reshape: clone the MTLBuffer handle into a new TensorBuffer with
+/// a different shape field.  No data copy — metal::Buffer::clone() is an
+/// Obj-C retain on the same MTLBuffer.  Safe because M17 tensors are immutable.
+pub(crate) fn reshape_to(handle: i64, new_shape: &[usize]) -> i64 {
+    let tb = unsafe { &*(handle as *const TensorBuffer) };
+    let new_tb = TensorBuffer {
+        buffer: tb.buffer.clone(),
+        dtype:  tb.dtype,
+        len:    tb.len,
+        shape:  new_shape.to_vec(),
+        ref_count: std::sync::atomic::AtomicUsize::new(1),
+    };
+    Box::into_raw(Box::new(new_tb)) as i64
+}
+
+/// Public ABI: permute a tensor's axes.  Calls gpu_barrier() then
+/// normalize_perm + permute_by_perm.
+#[no_mangle]
+pub extern "C" fn tensor_permute(handle: i64, perm_ptr: *const usize, ndims: usize) -> i64 {
+    gpu_barrier();
+    let tb_in = unsafe { &*(handle as *const TensorBuffer) };
+    let raw: Vec<usize> = if ndims == 0 || perm_ptr.is_null() {
+        vec![]
+    } else {
+        unsafe { std::slice::from_raw_parts(perm_ptr, ndims) }.to_vec()
+    };
+    let perm = normalize_perm(&raw, tb_in.shape.len());
+    permute_by_perm(handle, &perm)
+}
+
+/// Public ABI: zero-copy reshape.  Panics on element-count mismatch (ADR-0013).
+#[no_mangle]
+pub extern "C" fn tensor_reshape(handle: i64, dims_ptr: *const usize, ndims: usize) -> i64 {
+    let tb = unsafe { &*(handle as *const TensorBuffer) };
+    let new_shape: Vec<usize> = unsafe { std::slice::from_raw_parts(dims_ptr, ndims) }.to_vec();
+    let new_len: usize = new_shape.iter().product();
+    if new_len != tb.len {
+        panic!(
+            "malus: reshape element count mismatch: \
+             input shape {:?} has {} elements, \
+             target shape {:?} would have {}\n  \
+             input shape:  {:?}\n  target shape: {:?}",
+            tb.shape, tb.len, new_shape, new_len, tb.shape, new_shape
+        );
+    }
+    reshape_to(handle, &new_shape)
 }
 
 // ── VJP helpers (pub(crate) for tape.rs) ─────────────────────────────────────

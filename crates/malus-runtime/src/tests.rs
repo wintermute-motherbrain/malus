@@ -7,8 +7,9 @@ use crate::{
     tensor_matmul, tensor_transpose, tensor_sum,
     tensor_broadcast_add, tensor_broadcast_sub, tensor_broadcast_mul, tensor_broadcast_div,
     tensor_reduce_sum_axis, tensor_reduce_mean_axis, tensor_reduce_max_axis, tensor_reduce_var_axis,
+    tensor_reshape, tensor_permute,
     kernel_dispatch, gpu_barrier,
-    tape_record_binop, tape_record_unary, tape_record_reduce, tape_register_leaf,
+    tape_record_binop, tape_record_unary, tape_record_reduce, tape_record_perm, tape_register_leaf,
     tape_pause, tape_resume, tape_get_grad, tape_clear,
     backward, tape_zero_grad, OpTag, tape_reset,
 };
@@ -50,6 +51,17 @@ fn alloc_2d(data: &[f32], rows: usize, cols: usize) -> i64 {
     assert_eq!(data.len(), rows * cols);
     let shape = [rows, cols];
     tensor_alloc_gpu(0, shape.as_ptr(), 2, data.as_ptr())
+}
+
+fn alloc_3d(data: &[f32], d0: usize, d1: usize, d2: usize) -> i64 {
+    assert_eq!(data.len(), d0 * d1 * d2);
+    let shape = [d0, d1, d2];
+    tensor_alloc_gpu(0, shape.as_ptr(), 3, data.as_ptr())
+}
+
+fn shape_of(handle: i64) -> Vec<usize> {
+    let tb = unsafe { &*(handle as *const TensorBuffer) };
+    tb.shape.clone()
 }
 
 fn read_f32(handle: i64) -> Vec<f32> {
@@ -400,6 +412,7 @@ fn test_optag_from_tag_drift() {
     assert_eq!(OpTag::from_tag(16), OpTag::ReduceMeanAxis);
     assert_eq!(OpTag::from_tag(17), OpTag::ReduceMaxAxis);
     assert_eq!(OpTag::from_tag(18), OpTag::ReduceVarAxis);
+    assert_eq!(OpTag::from_tag(19), OpTag::Reshape);
 }
 
 #[test]
@@ -1077,5 +1090,197 @@ fn test_broadcast_add_backward() {
     tensor_release(b);
     tensor_free(out);
     tensor_free(loss_h);
+    tape_reset();
+}
+
+// ── M17: reshape, permute, batched matmul ────────────────────────────────────
+
+#[test]
+fn test_tensor_reshape_zero_copy() {
+    let data: Vec<f32> = (0..24).map(|i| i as f32).collect();
+    let h = alloc_3d(&data, 2, 3, 4);
+    // Reshape (2,3,4) → (6,4)
+    let new_shape = [6usize, 4];
+    let out = tensor_reshape(h, new_shape.as_ptr(), 2);
+    assert_eq!(shape_of(out), vec![6, 4]);
+    // Data content unchanged (zero-copy means same bytes).
+    assert_eq!(read_f32(out), data);
+    // Verify zero-copy: both buffers point to the same underlying MTLBuffer.
+    let tb_h   = unsafe { &*(h   as *const TensorBuffer) };
+    let tb_out = unsafe { &*(out as *const TensorBuffer) };
+    assert_eq!(
+        tb_h.buffer.contents(),
+        tb_out.buffer.contents(),
+        "reshape must share the underlying MTLBuffer"
+    );
+    tensor_free(h);
+    tensor_free(out);
+}
+
+// Note: reshape element-count mismatch panics cannot be tested with #[should_panic] because
+// the panic path goes through Metal which aborts rather than unwinds.  The check exists in
+// metal.rs; this is validated manually / by reading the panic message.
+
+#[test]
+fn test_tensor_permute_2d_no_args() {
+    // transpose(t) with 0 args: reverses a 2-D tensor [2,3] → [3,2]
+    let data = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let h = alloc_2d(&data, 2, 3);
+    let out = tensor_permute(h, std::ptr::null(), 0);
+    assert_eq!(shape_of(out), vec![3, 2]);
+    // Manual transpose reference: row 0 → col 0, etc.
+    let expected = [1.0f32, 4.0, 2.0, 5.0, 3.0, 6.0];
+    assert_eq!(read_f32(out), &expected);
+    tensor_free(h);
+    tensor_free(out);
+}
+
+#[test]
+fn test_tensor_permute_swap_two_axes() {
+    // transpose(t, 0, 2): (2,3,4) → (4,3,2)
+    let data: Vec<f32> = (0..24).map(|i| i as f32).collect();
+    let h = alloc_3d(&data, 2, 3, 4);
+    let perm = [0usize, 2, 1];
+    let out = tensor_permute(h, perm.as_ptr(), 3);
+    // perm [0,2,1] swaps axes 1 and 2: (2,3,4) → (2,4,3)
+    assert_eq!(shape_of(out), vec![2, 4, 3]);
+    tensor_free(h);
+    tensor_free(out);
+}
+
+#[test]
+fn test_tensor_permute_full_3d() {
+    // permute(t, 2, 0, 1): (2,3,4) → (4,2,3)
+    let data: Vec<f32> = (0..24).map(|i| i as f32).collect();
+    let h = alloc_3d(&data, 2, 3, 4);
+    let perm = [2usize, 0, 1];
+    let out = tensor_permute(h, perm.as_ptr(), 3);
+    assert_eq!(shape_of(out), vec![4, 2, 3]);
+    tensor_free(h);
+    tensor_free(out);
+}
+
+// Note: permute invalid arg-count panics also abort via Metal; cannot use #[should_panic].
+
+#[test]
+fn test_tensor_matmul_batched_3d() {
+    // (2,2,3) @ (2,3,2) → (2,2,2)
+    // Batch 0: [[1,2,3],[4,5,6]] @ [[1,0],[0,1],[1,0]] = [[4,2],[10,5]]
+    // (just checking shape and non-panic)
+    let a_data: Vec<f32> = vec![1.,2.,3., 4.,5.,6., 7.,8.,9., 10.,11.,12.];
+    let b_data: Vec<f32> = vec![1.,0., 0.,1., 1.,0.,   0.,1., 1.,0., 0.,1.];
+    let a = alloc_3d(&a_data, 2, 2, 3);
+    let b = alloc_3d(&b_data, 2, 3, 2);
+    let out = tensor_matmul(a, b);
+    assert_eq!(shape_of(out), vec![2, 2, 2]);
+    let result = read_f32(out);
+    // Batch 0 row 0: 1*1+2*0+3*1=4, 1*0+2*1+3*0=2
+    assert!((result[0] - 4.0).abs() < 1e-5);
+    assert!((result[1] - 2.0).abs() < 1e-5);
+    tensor_free(a);
+    tensor_free(b);
+    tensor_free(out);
+}
+
+// Note: tensor_matmul mixed-rank panics abort via Metal; cannot use #[should_panic].
+
+#[test]
+fn test_reshape_vjp() {
+    // Variable reshape: (4,) → (2,2), sum all, backward.
+    // dout = 1, dx should be all-ones with shape (4,).
+    tape_reset();
+    let data = [1.0f32, 2.0, 3.0, 4.0];
+    let h = alloc_f32(&data);
+    tensor_retain(h);
+    tape_register_leaf(h);
+
+    let new_shape = [2usize, 2];
+    let y = tensor_reshape(h, new_shape.as_ptr(), 2);
+    tensor_retain(y);
+    tape_record_unary(OpTag::Reshape as i32, h, y);
+
+    let loss = tensor_sum(y);
+    tensor_retain(loss);
+    tape_record_unary(OpTag::Sum as i32, y, loss);
+
+    backward(loss);
+    let grad = tape_get_grad(h);
+    let grad_data = read_f32(grad);
+    assert_eq!(grad_data.len(), 4);
+    for v in &grad_data {
+        assert!((v - 1.0).abs() < 1e-5, "reshape VJP: expected 1.0 grad, got {v}");
+    }
+    tensor_free(grad);
+    tensor_release(h);
+    tape_reset();
+}
+
+#[test]
+fn test_permute_vjp_2d_transpose() {
+    // B = permute(A, []) where A is (2,3) → B is (3,2), sum, backward.
+    // dB = ones(3,2). dA = permute(dB, [1,0]) = ones(2,3).
+    tape_reset();
+    let data: Vec<f32> = (1..=6).map(|i| i as f32).collect();
+    let a = alloc_2d(&data, 2, 3);
+    tensor_retain(a);
+    tape_register_leaf(a);
+
+    let b = tensor_permute(a, std::ptr::null(), 0);
+    tensor_retain(b);
+    tape_record_perm(OpTag::Transpose as i32, a, b, std::ptr::null(), 0);
+
+    let loss = tensor_sum(b);
+    tensor_retain(loss);
+    tape_record_unary(OpTag::Sum as i32, b, loss);
+
+    backward(loss);
+    let grad = tape_get_grad(a);
+    let grad_data = read_f32(grad);
+    assert_eq!(grad_data.len(), 6);
+    for v in &grad_data {
+        assert!((v - 1.0).abs() < 1e-5, "permute VJP: expected 1.0 grad, got {v}");
+    }
+    tensor_free(grad);
+    tensor_release(a);
+    tape_reset();
+}
+
+#[test]
+fn test_batched_matmul_vjp() {
+    // Q=(2,2,3), K=(2,3,2), scores=Q@K=(2,2,2), loss=sum(scores).
+    // All ones: each element of scores is 3.0 (dot of 3-vector of ones).
+    // dQ[b] = dC[b] @ K[b]^T = ones(2,2) @ ones(2,3) = 2*ones(2,3).
+    // dK[b] = Q[b]^T @ dC[b] = ones(3,2) @ ones(2,2) = 2*ones(3,2).
+    tape_reset();
+    let q_data = vec![1.0f32; 12];
+    let k_data = vec![1.0f32; 12];
+    let q = alloc_3d(&q_data, 2, 2, 3);
+    let k = alloc_3d(&k_data, 2, 3, 2);
+    tensor_retain(q);
+    tensor_retain(k);
+    tape_register_leaf(q);
+    tape_register_leaf(k);
+
+    let scores = tensor_matmul(q, k);
+    tensor_retain(scores);
+    tape_record_binop(OpTag::Matmul as i32, q, k, scores);
+
+    let loss = tensor_sum(scores);
+    tensor_retain(loss);
+    tape_record_unary(OpTag::Sum as i32, scores, loss);
+
+    backward(loss);
+    let gq = tape_get_grad(q);
+    let gk = tape_get_grad(k);
+    assert_eq!(shape_of(gq), vec![2, 2, 3]);
+    assert_eq!(shape_of(gk), vec![2, 3, 2]);
+    for v in read_f32(gq) {
+        assert!((v - 2.0).abs() < 1e-5, "batched matmul VJP dQ: expected 2.0, got {v}");
+    }
+    for v in read_f32(gk) {
+        assert!((v - 2.0).abs() < 1e-5, "batched matmul VJP dK: expected 2.0, got {v}");
+    }
+    tensor_release(q);
+    tensor_release(k);
     tape_reset();
 }

@@ -77,6 +77,22 @@ _Avoid_: shape broadcasting (fine informally), implicit replication
 A reduction op (`sum`, `mean`, `max`, `var`) applied over a specific tensor axis, optionally preserving the reduced dimension as size 1 (`keepdim=true`). Distinct from V1's whole-tensor `sum` (which always returns a `[1]` tensor). Added in M16.
 _Avoid_: reduce, fold
 
+**reshape**:
+A zero-copy contiguous shape change. `reshape(t, d0, d1, ...)` returns a new `TensorBuffer` that shares the underlying `MTLBuffer` with the input (Obj-C retain on the same allocation, no data copy). Panics at runtime if the element counts differ. Equivalent to PyTorch `view` semantics in M17 (always contiguous, zero-copy). The name `view` is reserved for a future non-contiguous strided-view operation. Differentiable: VJP reshapes the output gradient back to the input shape.
+_Avoid_: view (reserved), copy-reshape, data reshape
+
+**transpose**:
+A two-axis swap. `transpose(t)` reverses a 2-D tensor (equivalent to `permute(t, 1, 0)`); `transpose(t, i, j)` swaps axes `i` and `j` in a tensor of any rank. Distinct from `permute` — `torch.transpose` in PyTorch only ever swaps two axes; the malus name inherits that contract. Differentiable: VJP applies the inverse permutation.
+_Avoid_: permute (different operation), flip axes
+
+**permute**:
+A full axis reorder. `permute(t, p0, p1, ..., p_{rank-1})` reorders all axes according to the permutation vector. Analogous to `torch.permute`. Requires exactly `rank` dim arguments. Differentiable: VJP applies the inverse permutation.
+_Avoid_: transpose (different operation — transposes only two axes)
+
+**Batched matmul**:
+A `tensor_matmul` call where both operands are 3-D with identical leading batch dimension `B`: `(B, M, K) @ (B, K, N) → (B, M, N)`. Computed as `B` independent 2-D matmuls (eager CPU loops, M17; MPS-accelerated in M21 per ADR-0017). VJP is per-slice: `dA[b] = dC[b] @ B[b]^T`, `dB[b] = A[b]^T @ dC[b]`.
+_Avoid_: batched matrix multiply (fine informally), bmm
+
 **Index tensor**:
 A `Tensor<i32>` or `Tensor<i64>` used as an index into another tensor (e.g. for embedding lookup). Not differentiable — integer tensors are never `Variable`. Added in M19 as a narrow dtype carve-out; full non-f32 float compute generality is post-V3.
 _Avoid_: integer tensor (fine informally, but "index tensor" conveys the use)

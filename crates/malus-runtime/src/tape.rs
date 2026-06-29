@@ -2,9 +2,10 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 
 use crate::metal::{
-    broadcast_to_shape, gpu_barrier, sum_to_shape, tensor_alloc_gpu, tensor_alloc_ones_gpu,
+    broadcast_to_shape, gpu_barrier, invert_perm, normalize_perm, permute_by_perm,
+    reshape_to, sum_to_shape, tensor_alloc_gpu, tensor_alloc_ones_gpu,
     tensor_alloc_zeros_gpu, tensor_matmul, tensor_reduce_mean_axis, tensor_retain,
-    tensor_release, tensor_transpose, unsqueeze_at, TensorBuffer,
+    tensor_release, unsqueeze_at, TensorBuffer,
 };
 
 // ── OpTag ─────────────────────────────────────────────────────────────────────
@@ -35,6 +36,8 @@ pub enum OpTag {
     ReduceMeanAxis   = 16,
     ReduceMaxAxis    = 17,
     ReduceVarAxis    = 18,
+    // M17 shapes + batched matmul
+    Reshape          = 19,
 }
 
 impl OpTag {
@@ -59,6 +62,7 @@ impl OpTag {
             16 => OpTag::ReduceMeanAxis,
             17 => OpTag::ReduceMaxAxis,
             18 => OpTag::ReduceVarAxis,
+            19 => OpTag::Reshape,
             _  => panic!("malus: unknown op tag {tag}"),
         }
     }
@@ -141,6 +145,33 @@ pub extern "C" fn tape_record_reduce(op_tag: i32, x: i64, out: i64, axis: i64, k
             output: out,
             meta: vec![axis, keepdim],
         });
+    });
+}
+
+/// Record a permutation op (transpose/permute) onto the tape.  Retains x and
+/// out; copies dims from dims_ptr into meta as i64 values.  No-op when paused.
+#[no_mangle]
+pub extern "C" fn tape_record_perm(
+    op_tag: i32,
+    x: i64,
+    out: i64,
+    dims_ptr: *const usize,
+    ndims: usize,
+) {
+    if !RECORDING.with(|r| r.get()) {
+        return;
+    }
+    tensor_retain(x);
+    tensor_retain(out);
+    let op = OpTag::from_tag(op_tag);
+    let meta: Vec<i64> = if ndims == 0 || dims_ptr.is_null() {
+        vec![]
+    } else {
+        unsafe { std::slice::from_raw_parts(dims_ptr, ndims) }
+            .iter().map(|&v| v as i64).collect()
+    };
+    NODES.with(|n| {
+        n.borrow_mut().push(TapeNode { op, saved: vec![x], output: out, meta });
     });
 }
 
@@ -248,15 +279,29 @@ pub extern "C" fn backward(loss: i64) {
         match node.op {
             OpTag::Matmul => {
                 // C = A @ B  →  dA = dC @ Bᵀ,  dB = Aᵀ @ dC
+                // Branches on rank: 2-D uses [1,0] perm; 3-D uses [0,2,1] (last-two swap).
                 let (a, b) = (node.saved[0], node.saved[1]);
-                let bt = tensor_transpose(b);
-                let da = tensor_matmul(dout, bt);
-                tensor_release(bt);
-                let at = tensor_transpose(a);
-                let db = tensor_matmul(at, dout);
-                tensor_release(at);
-                accumulate_grad(&mut grads, a, da);
-                accumulate_grad(&mut grads, b, db);
+                let rank = tb(a).shape.len();
+                if rank == 2 {
+                    let bt = permute_by_perm(b, &[1, 0]);
+                    let da = tensor_matmul(dout, bt);
+                    tensor_release(bt);
+                    let at = permute_by_perm(a, &[1, 0]);
+                    let db = tensor_matmul(at, dout);
+                    tensor_release(at);
+                    accumulate_grad(&mut grads, a, da);
+                    accumulate_grad(&mut grads, b, db);
+                } else {
+                    // 3-D batched: transpose last two dims of each operand.
+                    let bt = permute_by_perm(b, &[0, 2, 1]);
+                    let da = tensor_matmul(dout, bt);
+                    tensor_release(bt);
+                    let at = permute_by_perm(a, &[0, 2, 1]);
+                    let db = tensor_matmul(at, dout);
+                    tensor_release(at);
+                    accumulate_grad(&mut grads, a, da);
+                    accumulate_grad(&mut grads, b, db);
+                }
             }
             OpTag::Add => {
                 // C = A + B  →  dA = reduce_to(dC, A.shape),  dB = reduce_to(dC, B.shape)
@@ -399,9 +444,21 @@ pub extern "C" fn backward(loss: i64) {
                 accumulate_grad(&mut grads, x, dx);
             }
             OpTag::Transpose => {
-                // B = Aᵀ  →  dA = dBᵀ
+                // B = permute(A, perm)  →  dA = permute(dB, inverse_perm)
+                // meta holds the raw dim args recorded at forward time.
                 let x = node.saved[0];
-                let dx = tensor_transpose(dout);
+                let rank = tb(x).shape.len();
+                let raw: Vec<usize> = node.meta.iter().map(|&v| v as usize).collect();
+                let perm = normalize_perm(&raw, rank);
+                let inv  = invert_perm(&perm);
+                let dx   = permute_by_perm(dout, &inv);
+                accumulate_grad(&mut grads, x, dx);
+            }
+            OpTag::Reshape => {
+                // y = reshape(x, new_shape)  →  dx = reshape(dy, x.shape)
+                let x = node.saved[0];
+                let x_shape = tb(x).shape.clone();
+                let dx = reshape_to(dout, &x_shape);
                 accumulate_grad(&mut grads, x, dx);
             }
             OpTag::Neg => {

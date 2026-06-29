@@ -12,6 +12,7 @@ pub use metal::{
     tensor_matmul, tensor_transpose, tensor_sum,
     tensor_broadcast_add, tensor_broadcast_sub, tensor_broadcast_mul, tensor_broadcast_div,
     tensor_reduce_sum_axis, tensor_reduce_mean_axis, tensor_reduce_max_axis, tensor_reduce_var_axis,
+    tensor_reshape, tensor_permute,
     kernel_dispatch, gpu_barrier, Dtype, TensorBuffer,
 };
 
@@ -20,7 +21,8 @@ mod tape;
 
 #[cfg(target_os = "macos")]
 pub use tape::{
-    tape_record_binop, tape_record_unary, tape_record_reduce, tape_register_leaf,
+    tape_record_binop, tape_record_unary, tape_record_reduce, tape_record_perm,
+    tape_register_leaf,
     tape_pause, tape_resume, tape_get_grad, tape_clear,
     backward, tape_zero_grad, OpTag, tape_reset,
 };

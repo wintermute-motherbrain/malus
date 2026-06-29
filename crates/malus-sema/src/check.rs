@@ -1082,6 +1082,11 @@ fn check_call(
             if let BuiltinKind::Reduction = &sig.kind {
                 return check_reduction_call(&callee_name, args, span, ctx);
             }
+            // TensorThenShapeArgs builtins (reshape/transpose/permute) return early
+            // via a dedicated checker.
+            if let BuiltinKind::TensorThenShapeArgs = &sig.kind {
+                return check_shape_op_call(&callee_name, args, span, ctx);
+            }
             let is_print_call = callee_name == "print" || callee_name == "println";
             let typed_args: Vec<TypedExpr> = match &sig.kind {
                 BuiltinKind::Variadic => {
@@ -1141,6 +1146,7 @@ fn check_call(
                     out
                 }
                 BuiltinKind::Reduction => unreachable!("Reduction handled above"),
+                BuiltinKind::TensorThenShapeArgs => unreachable!("TensorThenShapeArgs handled above"),
             };
             // Validate format string arg count for print/println.
             if is_print_call {
@@ -1190,6 +1196,72 @@ fn check_call(
             ))
         }
     }
+}
+
+// ── Shape-op call checking ────────────────────────────────────────────────────
+//
+// Handles reshape(t, d0..dn), transpose(t[, i, j]), permute(t, p0..pn).
+// First arg must be Tensor<f32> or Variable<f32>; remaining args are i64 dims.
+// Normalizes to positional [tensor, d0..dn].  Variable input propagates to
+// Variable output (same as reduction checking).  No shape/count validation in
+// sema — runtime panics on mismatch (ADR-0013).
+
+fn check_shape_op_call(
+    callee: &str,
+    raw_args: &[CallArg],
+    span: Span,
+    ctx: &mut BodyCtx<'_>,
+) -> Option<TypedExpr> {
+    let tensor_f32 = ResolvedTy::Tensor { dtype: ScalarTy::F32 };
+
+    // Positional-only: named args are not allowed for shape ops.
+    for arg in raw_args {
+        if arg.name.is_some() {
+            ctx.errors.push(SemaError::ArgCountMismatch {
+                callee: callee.to_string(),
+                expected: 0,
+                found: 0,
+                span,
+            });
+            return None;
+        }
+    }
+    let positional: Vec<&malus_syntax::ast::Expr> =
+        raw_args.iter().map(|a| &a.value).collect();
+
+    if positional.is_empty() {
+        ctx.errors.push(SemaError::ArgCountMismatch {
+            callee: callee.to_string(),
+            expected: 1,
+            found: 0,
+            span,
+        });
+        return None;
+    }
+
+    // Check the leading tensor/variable arg.
+    let checked_tensor = check_expr(positional[0], Some(&tensor_f32), ctx)?;
+    let is_variable = checked_tensor.ty.is_variable();
+
+    // Check each remaining dim arg with an I64 hint (shape args are i64 scalars).
+    let mut typed_args: Vec<TypedExpr> = vec![checked_tensor];
+    for dim_arg in &positional[1..] {
+        typed_args.push(check_expr(dim_arg, Some(&ResolvedTy::Scalar(ScalarTy::I64)), ctx)?);
+    }
+
+    // Propagate Variable: if input is Variable<f32>, output is Variable<f32>.
+    let return_ty = if is_variable {
+        ResolvedTy::Variable { dtype: ScalarTy::F32 }
+    } else {
+        tensor_f32
+    };
+
+    Some(typed_expr(
+        TypedExprKind::Call { callee: callee.to_string(), args: typed_args },
+        return_ty,
+        Some(Placement::Gpu),
+        span,
+    ))
 }
 
 // ── Reduction call checking ───────────────────────────────────────────────────

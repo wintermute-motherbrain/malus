@@ -227,6 +227,18 @@ extern "C" fn mock_tensor_reduce_var_axis(h: i64, _axis: i64, _keepdim: i64) -> 
 }
 extern "C" fn mock_tape_record_reduce(_op: i32, _x: i64, _out: i64, _axis: i64, _keepdim: i64) {}
 
+// M17 mocks.
+extern "C" fn mock_tensor_reshape(h: i64, _dims_ptr: *const usize, _ndims: usize) -> i64 {
+    // Return a clone of the original handle for test purposes.
+    with_store(|s| { let d = s.get_data(h); let sh = s.get_shape(h); s.insert(d, sh) })
+}
+extern "C" fn mock_tensor_permute(h: i64, _perm_ptr: *const usize, _ndims: usize) -> i64 {
+    with_store(|s| { let d = s.get_data(h); let sh = s.get_shape(h); s.insert(d, sh) })
+}
+extern "C" fn mock_tape_record_perm(
+    _op: i32, _x: i64, _out: i64, _dims_ptr: *const usize, _ndims: usize,
+) {}
+
 fn mock_symbols() -> RuntimeSymbols {
     RuntimeSymbols {
         tensor_alloc_gpu:       mock_tensor_alloc_gpu,
@@ -260,6 +272,9 @@ fn mock_symbols() -> RuntimeSymbols {
         tensor_reduce_max_axis:  mock_tensor_reduce_max_axis,
         tensor_reduce_var_axis:  mock_tensor_reduce_var_axis,
         tape_record_reduce:     mock_tape_record_reduce,
+        tensor_reshape:         mock_tensor_reshape,
+        tensor_permute:         mock_tensor_permute,
+        tape_record_perm:       mock_tape_record_perm,
     }
 }
 

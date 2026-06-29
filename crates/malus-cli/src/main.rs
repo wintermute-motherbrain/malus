@@ -140,6 +140,9 @@ fn run_script(path: &str) {
             tensor_reduce_max_axis:  malus_runtime::tensor_reduce_max_axis,
             tensor_reduce_var_axis:  malus_runtime::tensor_reduce_var_axis,
             tape_record_reduce:     malus_runtime::tape_record_reduce,
+            tensor_reshape:         malus_runtime::tensor_reshape,
+            tensor_permute:         malus_runtime::tensor_permute,
+            tape_record_perm:       malus_runtime::tape_record_perm,
         };
         if let Err(e) = malus_codegen_cpu::compile_and_run(&typed, &symbols, &kernel_ids) {
             eprintln!("error: {e}");
