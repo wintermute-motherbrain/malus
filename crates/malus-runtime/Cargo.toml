@@ -19,3 +19,10 @@ objc2-metal = { version = "0.3", default-features = false, features = [
     "MTLLibrary",
     "MTLTypes",
 ] }
+objc2-metal-performance-shaders = { version = "0.3", default-features = false, features = [
+    "MPSCore",
+    "MPSCoreTypes",
+    "MPSKernel",
+    "MPSMatrix",
+    "MPSMatrixMultiplication",
+] }

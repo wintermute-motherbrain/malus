@@ -19,8 +19,11 @@ The cost is a second execution model: CTMM marks these eager results as pending 
 CPU reads. Those barriers are no-ops when there is no pending command buffer — a perf
 and purity cost, not a correctness one.
 
-## Migration path
+## Migration path (completed in M21)
 
-Replace `tensor_matmul` in `malus-runtime/src/metal.rs` with an MPS-backed
-implementation using `MPSMatrixMultiplication`. The C-ABI signature and call sites in
-codegen-cpu are unchanged; only the runtime body changes.
+`tensor_matmul` was replaced with an MPS-backed implementation using
+`MPSMatrixMultiplication` from `objc2-metal-performance-shaders 0.3`. The C-ABI
+signature and call sites in codegen-cpu are unchanged; only the runtime body changed.
+The runtime was simultaneously ported from the deprecated `metal-rs 0.29` / `objc 0.2`
+stack to `objc2 0.6` + `objc2-metal 0.3`. `tensor_transpose` and `tensor_sum` remain as
+eager CPU loops (not on the critical path). See ADR-0017 for the scope decision.

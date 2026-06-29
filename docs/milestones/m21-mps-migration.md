@@ -1,10 +1,35 @@
 # M21 — MPS Migration
 
-**Crates:** `malus-runtime`.
+**Crates:** `malus-runtime`.  **Status:** ✅ done (two-commit approach).
 
-Migrate `tensor_matmul`, `tensor_matmul_batched`, and the axis reductions needed by the transformer (`tensor_reduce_sum_axis`, `tensor_reduce_mean_axis`) from eager CPU loops to Metal Performance Shaders / custom Metal kernels. The results become **pending tensors** so CTMM can batch command buffers across chained ops. Amends ADR-0012 and ADR-0017. Everything outside `malus-runtime` is unchanged.
+## What shipped
 
-## Done-When
+**Commit 1 — objc2-metal port (zero behavior change):** Replaced the deprecated
+`metal-rs 0.29` / `objc 0.2` / `foreign-types 0.5` stack with `objc2 0.6` +
+`objc2-metal 0.3` + `objc2-foundation 0.3`. All Metal types are now
+`Retained<ProtocolObject<dyn MTL…>>`; the `msg_send![…, retain]` dance in
+`kernel_dispatch` was eliminated; `buffer.contents()` returns `NonNull<c_void>` and
+requires `.as_ptr()` before casting. 379 existing tests stayed green.
+
+**Commit 2 — MPS matmul:** Replaced the CPU triple-loop `tensor_matmul` with
+`MPSMatrixMultiplication` from `objc2-metal-performance-shaders 0.3`. Three shape
+regimes: 2-D, 3-D batched (loop per batch slice), and 3-D⊗2-D broadcast. The
+implementation is **eager**: calls `gpu_barrier()` first, encodes all MPS ops into a
+fresh command buffer, commits, and waits. Returns a ready tensor; CTMM and codegen-cpu
+are unchanged. The old CPU impl is kept as `tensor_matmul_cpu` for differential tests.
+
+## Scope changes from the original spec
+
+The original spec said pending tensors and included axis reductions and optionally
+transpose. After grilling, the scope was narrowed:
+
+- **Eager not pending** — the 10× speedup comes from AMX compute, not command-buffer
+  batching. Chained-GPU batching is marginal for malus because the softmax/layernorm/
+  gelu ops between matmuls are CPU-eager and would force barriers anyway.
+- **matmul only** — axis reductions and transpose stay CPU loops; they are not on the
+  critical matmul path.
+
+## Done-when
 
 `examples/mps_bench.ml` compiles, produces correct results, and demonstrates speedup:
 
@@ -23,43 +48,12 @@ fn main():
     println("MPS matmul: OK")
 ```
 
-MPS results match the old CPU loop results within 1e-3 (float rounding allowed). On an M-series Mac with 512×512 matrices, MPS matmul runs at least 10× faster than the CPU loop (measured via the CLI timing flag or a Rust benchmark).
+MPS results match the CPU reference within 1e-3 (verified in `tests.rs` for all three
+regimes). The speedup test (`#[test] #[ignore]`) asserts ≥10× on M-series.
 
-Existing VJP unit tests (from M14/M17) still pass — the VJPs call `tensor_matmul` and must produce correct gradients through the MPS path.
+## Out of scope (post-V3)
 
-## Scope
-
-### 1. `MPSMatrixMultiplication` for 2-D and Batched Matmul
-
-**Runtime (`malus-runtime/src/metal.rs`):** Replace the triple-nested CPU loop in `tensor_matmul` (currently at `:248–282`) with an `MPSMatrixMultiplication` call:
-
-- Create `MPSMatrix` descriptors from `TensorBuffer.shape` and `MTLBuffer`.
-- Encode `MPSMatrixMultiplication.encode(commandBuffer:...)` into the current `command_buffer` (do not commit — let `gpu_barrier` commit it).
-- Return a new `TensorBuffer` of shape `[M, N]` whose `MTLBuffer` is the MPS output — a **pending tensor** (no `gpu_barrier` called here).
-
-For 3-D batched matmul: use `MPSMatrixMultiplication` in a loop over the batch dimension, encoding one MPS op per batch into the same command buffer. Return a `[B, M, N]` pending tensor.
-
-The removal of the internal `gpu_barrier()` call from `tensor_matmul` (currently at `:249`) is intentional — MPS encodes into the command buffer rather than flushing it. Callers that need a ready tensor must still call `gpu_barrier()` explicitly or rely on CTMM's barrier insertion.
-
-### 2. MPS Axis Reductions
-
-**Runtime (`malus-runtime/src/metal.rs`):** Replace `tensor_reduce_sum_axis` and `tensor_reduce_mean_axis` (added in M16 as CPU loops) with `MPSMatrixVectorMultiplication` or a custom Metal kernel for the common transformer reduction patterns (sum/mean over the last axis of a 2-D or 3-D tensor). Return pending tensors.
-
-A custom Metal kernel is acceptable for reductions if the MPS reduction API is cumbersome for arbitrary axes. The kernel should handle `[N, D]` → `[N, 1]` (axis=1) and `[B, N, D]` → `[B, N, 1]` (axis=2) patterns, which cover the transformer's layernorm and softmax normalization.
-
-### 3. `tensor_transpose` — Optional MPS Path
-
-Optionally migrate 2-D `tensor_transpose` to a Metal kernel (trivially parallelizable). The performance gain is smaller than matmul; only migrate if the implementation is straightforward. The CPU loop path is kept as a fallback.
-
-### 4. VJP Compatibility
-
-The VJPs for `matmul` (M14) and batched matmul (M17) call `tensor_matmul` / `tensor_transpose` internally in their Rust backward closures. Since these now return pending tensors, the backward closures must call `gpu_barrier()` before reading back gradients to CPU for leaf `.grad` accumulation. Update each affected VJP closure to insert the barrier.
-
-Alternatively: leaf `.grad` accumulation can also go through Metal if the accumulate-into-leaf op is itself encoded as a GPU op. This is cleaner but requires more work; either approach is acceptable as long as VJP tests pass.
-
-## Out of Scope
-
-- MPS for softmax, layernorm, GELU, cross-entropy (these are CPU loops in M18/M19; post-V3)
-- MPS for `var` / `max` reductions (post-V3)
-- Metal Performance Shaders Graph (MPSGraph) for kernel fusion (post-V3)
-- Non-f32 MPS dispatch (post-V3)
+- MPS for softmax, layernorm, GELU, cross-entropy
+- MPS for axis reductions (`sum`, `mean`, `max`, `var`) and transpose
+- Pending-tensor MPS (command-buffer batching across chained ops)
+- Non-f32 MPS dispatch

@@ -4,11 +4,15 @@ use std::sync::{Mutex, OnceLock};
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
+use objc2::AnyThread;
 use objc2_foundation::NSString;
 use objc2_metal::{
     MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
     MTLComputeCommandEncoder, MTLComputePipelineState, MTLCreateSystemDefaultDevice,
     MTLDevice, MTLLibrary, MTLResourceOptions, MTLSize,
+};
+use objc2_metal_performance_shaders::{
+    MPSDataType, MPSMatrix, MPSMatrixDescriptor, MPSMatrixMultiplication,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -327,12 +331,8 @@ pub extern "C" fn gpu_barrier() {
 
 // ── Eager CPU ops (matmul, transpose, sum) ────────────────────────────────────
 //
-// These commit any pending GPU work before reading shared buffers on the CPU,
-// then compute in plain Rust and return a ready (non-pending) output tensor.
-// Migration to MPS is deferred to post-V1 (see ADR-0012).
-
-#[no_mangle]
-pub extern "C" fn tensor_matmul(handle_a: i64, handle_b: i64) -> i64 {
+// CPU reference matmul — kept as ground-truth for MPS correctness tests.
+pub fn tensor_matmul_cpu(handle_a: i64, handle_b: i64) -> i64 {
     gpu_barrier();
     let a = unsafe { &*(handle_a as *const TensorBuffer) };
     let b = unsafe { &*(handle_b as *const TensorBuffer) };
@@ -399,7 +399,6 @@ pub extern "C" fn tensor_matmul(handle_a: i64, handle_b: i64) -> i64 {
             tensor_alloc_gpu(0, out_shape.as_ptr(), 3, out_data.as_ptr())
         }
         (3, 2) => {
-            // Broadcast a 2-D weight over the batch dim: (B, M, K) @ (K, N) → (B, M, N)
             let (batch, m, k) = (a.shape[0], a.shape[1], a.shape[2]);
             let (k2, n) = (b.shape[0], b.shape[1]);
             if k != k2 {
@@ -426,6 +425,141 @@ pub extern "C" fn tensor_matmul(handle_a: i64, handle_b: i64) -> i64 {
             }
             let out_shape = [batch, m, n];
             tensor_alloc_gpu(0, out_shape.as_ptr(), 3, out_data.as_ptr())
+        }
+        _ => panic!(
+            "malus: tensor_matmul requires both inputs to be 2-D, both 3-D, or (3-D, 2-D)\n  \
+             left shape:  {:?}\n  right shape: {:?}",
+            a.shape, b.shape
+        ),
+    }
+}
+
+// MPS matmul — dispatches to the AMX coprocessor via MPSMatrixMultiplication.
+// Returns a ready tensor (gpu_barrier() + commit + waitUntilCompleted inside).
+#[no_mangle]
+pub extern "C" fn tensor_matmul(handle_a: i64, handle_b: i64) -> i64 {
+    gpu_barrier(); // flush any pending element-wise kernels before MPS reads buffers
+    let a = unsafe { &*(handle_a as *const TensorBuffer) };
+    let b = unsafe { &*(handle_b as *const TensorBuffer) };
+    let ctx = context();
+
+    match (a.shape.len(), b.shape.len()) {
+        (2, 2) => {
+            let (m, k) = (a.shape[0], a.shape[1]);
+            let (k2, n) = (b.shape[0], b.shape[1]);
+            if k != k2 {
+                panic!(
+                    "malus: matmul shape mismatch: [{m}x{k}] @ [{k2}x{n}] — inner dims {k} != {k2}\n  \
+                     left shape:  {:?}\n  right shape: {:?}",
+                    a.shape, b.shape
+                );
+            }
+            if m == 0 || k == 0 || n == 0 {
+                return tensor_matmul_cpu(handle_a, handle_b);
+            }
+            let out_shape = [m, n];
+            let c_handle = tensor_alloc_gpu(0, out_shape.as_ptr(), 2, std::ptr::null());
+            let c_tb = unsafe { &*(c_handle as *const TensorBuffer) };
+            unsafe {
+                let desc_a = MPSMatrixDescriptor::matrixDescriptorWithRows_columns_rowBytes_dataType(m, k, k * 4, MPSDataType::Float32);
+                let desc_b = MPSMatrixDescriptor::matrixDescriptorWithRows_columns_rowBytes_dataType(k, n, n * 4, MPSDataType::Float32);
+                let desc_c = MPSMatrixDescriptor::matrixDescriptorWithRows_columns_rowBytes_dataType(m, n, n * 4, MPSDataType::Float32);
+                let mat_a = MPSMatrix::initWithBuffer_descriptor(MPSMatrix::alloc(),&*a.buffer, &desc_a);
+                let mat_b = MPSMatrix::initWithBuffer_descriptor(MPSMatrix::alloc(),&*b.buffer, &desc_b);
+                let mat_c = MPSMatrix::initWithBuffer_descriptor(MPSMatrix::alloc(),&*c_tb.buffer, &desc_c);
+                let mm = MPSMatrixMultiplication::initWithDevice_resultRows_resultColumns_interiorColumns(
+                    MPSMatrixMultiplication::alloc(),&*ctx.device, m, n, k);
+                let cmd_buf = ctx.command_queue.commandBuffer()
+                    .expect("malus: MPS matmul failed to create command buffer");
+                mm.encodeToCommandBuffer_leftMatrix_rightMatrix_resultMatrix(&*cmd_buf, &mat_a, &mat_b, &mat_c);
+                cmd_buf.commit();
+                cmd_buf.waitUntilCompleted();
+            }
+            c_handle
+        }
+        (3, 3) => {
+            let (batch, m, k) = (a.shape[0], a.shape[1], a.shape[2]);
+            let (batch2, k2, n) = (b.shape[0], b.shape[1], b.shape[2]);
+            if batch != batch2 {
+                panic!(
+                    "malus: batched matmul batch dims must match: {} vs {}\n  \
+                     left shape:  {:?}\n  right shape: {:?}",
+                    batch, batch2, a.shape, b.shape
+                );
+            }
+            if k != k2 {
+                panic!(
+                    "malus: batched matmul inner dims must match: {} vs {}\n  \
+                     left shape:  {:?}\n  right shape: {:?}",
+                    k, k2, a.shape, b.shape
+                );
+            }
+            if batch == 0 || m == 0 || k == 0 || n == 0 {
+                return tensor_matmul_cpu(handle_a, handle_b);
+            }
+            let out_shape = [batch, m, n];
+            let c_handle = tensor_alloc_gpu(0, out_shape.as_ptr(), 3, std::ptr::null());
+            let c_tb = unsafe { &*(c_handle as *const TensorBuffer) };
+            unsafe {
+                let desc_a = MPSMatrixDescriptor::matrixDescriptorWithRows_columns_rowBytes_dataType(m, k, k * 4, MPSDataType::Float32);
+                let desc_b = MPSMatrixDescriptor::matrixDescriptorWithRows_columns_rowBytes_dataType(k, n, n * 4, MPSDataType::Float32);
+                let desc_c = MPSMatrixDescriptor::matrixDescriptorWithRows_columns_rowBytes_dataType(m, n, n * 4, MPSDataType::Float32);
+                let mm = MPSMatrixMultiplication::initWithDevice_resultRows_resultColumns_interiorColumns(
+                    MPSMatrixMultiplication::alloc(),&*ctx.device, m, n, k);
+                let cmd_buf = ctx.command_queue.commandBuffer()
+                    .expect("malus: MPS batched matmul failed to create command buffer");
+                for bx in 0..batch {
+                    let a_off = bx * m * k * 4;
+                    let b_off = bx * k * n * 4;
+                    let c_off = bx * m * n * 4;
+                    let mat_a = MPSMatrix::initWithBuffer_offset_descriptor(MPSMatrix::alloc(),&*a.buffer, a_off, &desc_a);
+                    let mat_b = MPSMatrix::initWithBuffer_offset_descriptor(MPSMatrix::alloc(),&*b.buffer, b_off, &desc_b);
+                    let mat_c = MPSMatrix::initWithBuffer_offset_descriptor(MPSMatrix::alloc(),&*c_tb.buffer, c_off, &desc_c);
+                    mm.encodeToCommandBuffer_leftMatrix_rightMatrix_resultMatrix(&*cmd_buf, &mat_a, &mat_b, &mat_c);
+                }
+                cmd_buf.commit();
+                cmd_buf.waitUntilCompleted();
+            }
+            c_handle
+        }
+        (3, 2) => {
+            // Broadcast 2-D weight over the batch dim: (B, M, K) @ (K, N) → (B, M, N)
+            let (batch, m, k) = (a.shape[0], a.shape[1], a.shape[2]);
+            let (k2, n) = (b.shape[0], b.shape[1]);
+            if k != k2 {
+                panic!(
+                    "malus: matmul shape mismatch: [{batch}x{m}x{k}] @ [{k2}x{n}] — inner dims {k} != {k2}\n  \
+                     left shape:  {:?}\n  right shape: {:?}",
+                    a.shape, b.shape
+                );
+            }
+            if batch == 0 || m == 0 || k == 0 || n == 0 {
+                return tensor_matmul_cpu(handle_a, handle_b);
+            }
+            let out_shape = [batch, m, n];
+            let c_handle = tensor_alloc_gpu(0, out_shape.as_ptr(), 3, std::ptr::null());
+            let c_tb = unsafe { &*(c_handle as *const TensorBuffer) };
+            unsafe {
+                let desc_a = MPSMatrixDescriptor::matrixDescriptorWithRows_columns_rowBytes_dataType(m, k, k * 4, MPSDataType::Float32);
+                let desc_b = MPSMatrixDescriptor::matrixDescriptorWithRows_columns_rowBytes_dataType(k, n, n * 4, MPSDataType::Float32);
+                let desc_c = MPSMatrixDescriptor::matrixDescriptorWithRows_columns_rowBytes_dataType(m, n, n * 4, MPSDataType::Float32);
+                // B is the same 2-D matrix for every batch slice
+                let mat_b = MPSMatrix::initWithBuffer_descriptor(MPSMatrix::alloc(),&*b.buffer, &desc_b);
+                let mm = MPSMatrixMultiplication::initWithDevice_resultRows_resultColumns_interiorColumns(
+                    MPSMatrixMultiplication::alloc(),&*ctx.device, m, n, k);
+                let cmd_buf = ctx.command_queue.commandBuffer()
+                    .expect("malus: MPS 3x2 matmul failed to create command buffer");
+                for bx in 0..batch {
+                    let a_off = bx * m * k * 4;
+                    let c_off = bx * m * n * 4;
+                    let mat_a = MPSMatrix::initWithBuffer_offset_descriptor(MPSMatrix::alloc(),&*a.buffer, a_off, &desc_a);
+                    let mat_c = MPSMatrix::initWithBuffer_offset_descriptor(MPSMatrix::alloc(),&*c_tb.buffer, c_off, &desc_c);
+                    mm.encodeToCommandBuffer_leftMatrix_rightMatrix_resultMatrix(&*cmd_buf, &mat_a, &mat_b, &mat_c);
+                }
+                cmd_buf.commit();
+                cmd_buf.waitUntilCompleted();
+            }
+            c_handle
         }
         _ => panic!(
             "malus: tensor_matmul requires both inputs to be 2-D, both 3-D, or (3-D, 2-D)\n  \

@@ -6,7 +6,7 @@ use crate::{
     Dtype, TensorBuffer, runtime_init,
     tensor_alloc_gpu, tensor_alloc_zeros_gpu, tensor_alloc_ones_gpu,
     tensor_retain, tensor_release, tensor_free, tensor_print, tensor_len,
-    tensor_matmul, tensor_transpose, tensor_sum,
+    tensor_matmul, tensor_matmul_cpu, tensor_transpose, tensor_sum,
     tensor_broadcast_add, tensor_broadcast_sub, tensor_broadcast_mul, tensor_broadcast_div,
     tensor_reduce_sum_axis, tensor_reduce_mean_axis, tensor_reduce_max_axis, tensor_reduce_var_axis,
     tensor_reshape, tensor_permute,
@@ -1453,4 +1453,107 @@ fn test_randn_deterministic_per_call_counter() {
     assert_ne!(d1, d2, "consecutive randn calls should differ (different call counter)");
     tensor_free(h1);
     tensor_free(h2);
+}
+
+// ── M21: MPS matmul correctness tests ────────────────────────────────────────
+
+fn make_random_f32(n: usize, seed_offset: f32) -> Vec<f32> {
+    (0..n).map(|i| ((i as f32 * 6.283 + seed_offset).sin() * 0.5 + 0.5) * 2.0 - 1.0).collect()
+}
+
+fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max)
+}
+
+#[test]
+fn test_mps_matmul_2d_correctness() {
+    let (m, k, n) = (32, 64, 48);
+    let a_data = make_random_f32(m * k, 0.0);
+    let b_data = make_random_f32(k * n, 1.0);
+    let shape_a = [m, k];
+    let shape_b = [k, n];
+    let ha = tensor_alloc_gpu(0, shape_a.as_ptr(), 2, a_data.as_ptr());
+    let hb = tensor_alloc_gpu(0, shape_b.as_ptr(), 2, b_data.as_ptr());
+    let h_mps = tensor_matmul(ha, hb);
+    let h_cpu = tensor_matmul_cpu(ha, hb);
+    let mps_out = read_f32(h_mps);
+    let cpu_out = read_f32(h_cpu);
+    let diff = max_abs_diff(&mps_out, &cpu_out);
+    tensor_free(ha); tensor_free(hb); tensor_free(h_mps); tensor_free(h_cpu);
+    assert!(diff < 1e-3, "MPS 2D matmul max-abs-diff {diff} >= 1e-3");
+}
+
+#[test]
+fn test_mps_matmul_3d_batched_correctness() {
+    let (batch, m, k, n) = (4, 16, 32, 24);
+    let a_data = make_random_f32(batch * m * k, 2.0);
+    let b_data = make_random_f32(batch * k * n, 3.0);
+    let shape_a = [batch, m, k];
+    let shape_b = [batch, k, n];
+    let ha = tensor_alloc_gpu(0, shape_a.as_ptr(), 3, a_data.as_ptr());
+    let hb = tensor_alloc_gpu(0, shape_b.as_ptr(), 3, b_data.as_ptr());
+    let h_mps = tensor_matmul(ha, hb);
+    let h_cpu = tensor_matmul_cpu(ha, hb);
+    let mps_out = read_f32(h_mps);
+    let cpu_out = read_f32(h_cpu);
+    let diff = max_abs_diff(&mps_out, &cpu_out);
+    tensor_free(ha); tensor_free(hb); tensor_free(h_mps); tensor_free(h_cpu);
+    assert!(diff < 1e-3, "MPS 3D batched matmul max-abs-diff {diff} >= 1e-3");
+}
+
+#[test]
+fn test_mps_matmul_3x2_broadcast_correctness() {
+    let (batch, m, k, n) = (4, 16, 32, 24);
+    let a_data = make_random_f32(batch * m * k, 4.0);
+    let b_data = make_random_f32(k * n, 5.0);
+    let shape_a = [batch, m, k];
+    let shape_b = [k, n];
+    let ha = tensor_alloc_gpu(0, shape_a.as_ptr(), 3, a_data.as_ptr());
+    let hb = tensor_alloc_gpu(0, shape_b.as_ptr(), 2, b_data.as_ptr());
+    let h_mps = tensor_matmul(ha, hb);
+    let h_cpu = tensor_matmul_cpu(ha, hb);
+    let mps_out = read_f32(h_mps);
+    let cpu_out = read_f32(h_cpu);
+    let diff = max_abs_diff(&mps_out, &cpu_out);
+    tensor_free(ha); tensor_free(hb); tensor_free(h_mps); tensor_free(h_cpu);
+    assert!(diff < 1e-3, "MPS 3x2 broadcast matmul max-abs-diff {diff} >= 1e-3");
+}
+
+#[test]
+#[ignore]
+fn test_mps_matmul_speedup() {
+    let (m, k, n) = (512, 512, 512);
+    let a_data = make_random_f32(m * k, 0.0);
+    let b_data = make_random_f32(k * n, 1.0);
+    let shape_a = [m, k];
+    let shape_b = [k, n];
+
+    // Warm up both paths
+    let ha = tensor_alloc_gpu(0, shape_a.as_ptr(), 2, a_data.as_ptr());
+    let hb = tensor_alloc_gpu(0, shape_b.as_ptr(), 2, b_data.as_ptr());
+    let hw = tensor_matmul(ha, hb); tensor_free(hw);
+    let hw = tensor_matmul_cpu(ha, hb); tensor_free(hw);
+
+    let iters = 3usize;
+
+    let t_cpu = {
+        let start = std::time::Instant::now();
+        for _ in 0..iters { let h = tensor_matmul_cpu(ha, hb); tensor_free(h); }
+        start.elapsed()
+    };
+
+    let t_mps = {
+        let start = std::time::Instant::now();
+        for _ in 0..iters { let h = tensor_matmul(ha, hb); tensor_free(h); }
+        start.elapsed()
+    };
+
+    tensor_free(ha); tensor_free(hb);
+
+    let speedup = t_cpu.as_secs_f64() / t_mps.as_secs_f64();
+    println!("CPU {:.1}ms  MPS {:.1}ms  speedup {:.1}×",
+        t_cpu.as_millis() as f64 / iters as f64,
+        t_mps.as_millis() as f64 / iters as f64,
+        speedup);
+    assert!(speedup >= 10.0, "expected ≥10× speedup, got {speedup:.1}×");
 }
