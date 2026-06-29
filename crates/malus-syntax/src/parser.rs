@@ -218,6 +218,12 @@ impl Parser {
         let mut params = Vec::new();
         while !matches!(self.current_kind(), TokenKind::RParen | TokenKind::Eof) {
             let start = self.current_span();
+            let is_mut = if matches!(self.current_kind(), TokenKind::Mut) {
+                self.advance();
+                true
+            } else {
+                false
+            };
             let (name, _) = self.expect_ident()?;
             self.expect(&TokenKind::Colon)?;
             let ty = self.parse_type()?;
@@ -225,6 +231,7 @@ impl Parser {
             params.push(Param {
                 name,
                 ty,
+                is_mut,
                 span: Span::new(start.file, start.start as usize, end.start as usize),
             });
             if matches!(self.current_kind(), TokenKind::Comma) {
@@ -525,19 +532,22 @@ impl Parser {
             }
             _ => {
                 let expr = self.parse_expr()?;
-                // Check for assignment: <ident> = <expr>
-                if let ExprKind::Ident(target) = &expr.kind {
-                    if self.current_kind() == &TokenKind::Eq {
-                        let target = target.clone();
-                        self.advance();
-                        let rhs = self.parse_expr()?;
-                        let end = rhs.span;
-                        self.expect_newline_or_eof()?;
-                        return Ok(Stmt {
-                            kind: StmtKind::Assign { target, expr: rhs },
-                            span: Span::new(start.file, start.start as usize, end.end as usize),
-                        });
-                    }
+                // Check for assignment: <lvalue> = <expr>
+                // Valid lvalue LHS forms: Ident, Index (a[i]), FieldAccess (s.f).
+                let is_lvalue = matches!(
+                    &expr.kind,
+                    ExprKind::Ident(_) | ExprKind::Index { .. } | ExprKind::FieldAccess { .. }
+                );
+                if is_lvalue && self.current_kind() == &TokenKind::Eq {
+                    let target = expr;
+                    self.advance();
+                    let rhs = self.parse_expr()?;
+                    let end = rhs.span;
+                    self.expect_newline_or_eof()?;
+                    return Ok(Stmt {
+                        kind: StmtKind::Assign { target, expr: rhs },
+                        span: Span::new(start.file, start.start as usize, end.end as usize),
+                    });
                 }
                 let end = expr.span;
                 self.expect_newline_or_eof()?;
@@ -575,25 +585,28 @@ impl Parser {
             | TokenKind::Gt | TokenKind::GtEq => Some((5, 6)),
             TokenKind::Plus | TokenKind::Minus => Some((7, 8)),
             TokenKind::Star | TokenKind::Slash | TokenKind::At => Some((9, 10)),
+            // `**` — highest precedence, right-associative (r_bp < l_bp).
+            TokenKind::StarStar => Some((12, 11)),
             _ => None,
         }
     }
 
     fn token_to_binop(kind: &TokenKind) -> Option<BinOp> {
         match kind {
-            TokenKind::Plus  => Some(BinOp::Add),
-            TokenKind::Minus => Some(BinOp::Sub),
-            TokenKind::Star  => Some(BinOp::Mul),
-            TokenKind::Slash => Some(BinOp::Div),
-            TokenKind::At    => Some(BinOp::Matmul),
-            TokenKind::EqEq  => Some(BinOp::Eq),
-            TokenKind::NotEq => Some(BinOp::NotEq),
-            TokenKind::Lt    => Some(BinOp::Lt),
-            TokenKind::LtEq  => Some(BinOp::LtEq),
-            TokenKind::Gt    => Some(BinOp::Gt),
-            TokenKind::GtEq  => Some(BinOp::GtEq),
-            TokenKind::And   => Some(BinOp::And),
-            TokenKind::Or    => Some(BinOp::Or),
+            TokenKind::Plus     => Some(BinOp::Add),
+            TokenKind::Minus    => Some(BinOp::Sub),
+            TokenKind::Star     => Some(BinOp::Mul),
+            TokenKind::StarStar => Some(BinOp::Pow),
+            TokenKind::Slash    => Some(BinOp::Div),
+            TokenKind::At       => Some(BinOp::Matmul),
+            TokenKind::EqEq     => Some(BinOp::Eq),
+            TokenKind::NotEq    => Some(BinOp::NotEq),
+            TokenKind::Lt       => Some(BinOp::Lt),
+            TokenKind::LtEq     => Some(BinOp::LtEq),
+            TokenKind::Gt       => Some(BinOp::Gt),
+            TokenKind::GtEq     => Some(BinOp::GtEq),
+            TokenKind::And      => Some(BinOp::And),
+            TokenKind::Or       => Some(BinOp::Or),
             _ => None,
         }
     }

@@ -1431,3 +1431,103 @@ fn main():
     run_src(src).expect("zero_grad + re-wrap should compile and run");
     assert_eq!(live_tensor_count(), 0, "no mock-tensor leaks from zero_grad + Variable re-wrap");
 }
+
+// ── M20: ** operator + lvalue assignment ─────────────────────────────────────
+
+#[test]
+fn test_pow_operator_compiles_and_runs() {
+    let src = r#"
+fn main():
+    let base = 2.0
+    let exp = 10.0
+    let r = base ** exp
+    print(r)
+"#;
+    run_src(src).expect("** operator on f32 should compile and run");
+    assert_eq!(live_tensor_count(), 0, "scalars don't allocate tensors");
+}
+
+#[test]
+fn test_pow_operator_i64_exponent() {
+    let src = r#"
+fn main():
+    let t = 3
+    let r = 2.0 ** t
+    print(r)
+"#;
+    run_src(src).expect("** with i64 exponent should compile and run");
+}
+
+#[test]
+fn test_pow_right_assoc() {
+    let src = r#"
+fn main():
+    let r = 2.0 ** 3.0 ** 2.0
+    print(r)
+"#;
+    run_src(src).expect("right-associative ** should compile and run");
+}
+
+#[test]
+fn test_index_assign_no_leak() {
+    let src = r#"
+fn main():
+    let t1 = Tensor.gpu<f32>([1.0])
+    let t2 = Tensor.gpu<f32>([2.0])
+    let mut arr = [t1, t2]
+    let t3 = Tensor.gpu<f32>([99.0])
+    arr[0] = t3
+    print(arr[0])
+"#;
+    run_src(src).expect("index assign should compile and run");
+    assert_eq!(live_tensor_count(), 0, "no leaks after index assign");
+}
+
+#[test]
+fn test_index_assign_variable_index_no_leak() {
+    let src = r#"
+fn main():
+    let t0 = Tensor.gpu<f32>([0.0])
+    let t1 = Tensor.gpu<f32>([1.0])
+    let mut arr = [t0, t1]
+    let i = 0
+    let new_t = Tensor.gpu<f32>([42.0])
+    arr[i] = new_t
+    print(arr[i])
+"#;
+    run_src(src).expect("index assign with variable index should compile and run");
+    assert_eq!(live_tensor_count(), 0, "no leaks after index assign with variable index");
+}
+
+#[test]
+fn test_field_assign_scalar_no_leak() {
+    let src = r#"
+struct Point:
+    x: f32
+    y: f32
+
+fn main():
+    let mut p = Point(x=1.0, y=2.0)
+    p.y = 99.0
+    print(p.y)
+"#;
+    run_src(src).expect("field assign on scalar field should compile and run");
+}
+
+#[test]
+fn test_mut_param_index_assign_no_leak() {
+    let src = r#"
+fn fill(mut arr: Array<Tensor<f32>,2>, val: Tensor<f32>):
+    arr[0] = val
+
+fn main():
+    let t0 = Tensor.gpu<f32>([0.0])
+    let t1 = Tensor.gpu<f32>([1.0])
+    let mut arr = [t0, t1]
+    let new_t = Tensor.gpu<f32>([55.0])
+    fill(arr, new_t)
+    print(arr[0])
+"#;
+    run_src(src).expect("mut param index assign should compile and run");
+    assert_eq!(live_tensor_count(), 0, "no leaks after mut param index assign");
+}

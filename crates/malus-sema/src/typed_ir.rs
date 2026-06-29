@@ -16,6 +16,8 @@ pub struct TypedProgram {
 pub struct TypedParam {
     pub name: String,
     pub ty: ResolvedTy,
+    /// True for `mut` parameters — interior mutation allowed, bare rebind rejected.
+    pub is_mut: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -43,14 +45,39 @@ pub struct TypedKernel {
     pub span: Span,
 }
 
+// ── Assign targets ───────────────────────────────────────────────────────────
+
+/// The left-hand side of an lvalue assignment (`a[i]=e` or `s.f=e` or `x=e`).
+/// Single-level only; nested lvalues (`a.b[i]`) are rejected in sema (M20 scope).
+#[derive(Debug, Clone)]
+pub enum TypedAssignTarget {
+    /// `name = e` — bare variable rebind. Requires `let mut` local.
+    Ident(String),
+    /// `base[index] = e` — indexed array element assignment.
+    /// Requires the base binding to be mutable (`let mut` or `mut` param).
+    Index {
+        base: String,
+        index: Box<TypedExpr>,
+        elem_ty: ResolvedTy,
+    },
+    /// `base.field = e` — struct field assignment.
+    /// Requires the base binding to be mutable (`let mut` or `mut` param).
+    /// Assigning to a `Variable` field is rejected (post-V3, ADR-0016).
+    Field {
+        base: String,
+        slot_idx: usize,
+        field_ty: ResolvedTy,
+    },
+}
+
 // ── Statements ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub enum TypedStmt {
     Let { name: String, expr: TypedExpr },
-    /// Reassignment of a `let mut` binding. The old value is dropped by CTMM
-    /// before this stmt executes; this stmt performs a pure rebind.
-    Assign { name: String, expr: TypedExpr },
+    /// Lvalue assignment. CTMM drops the old element/field value before this
+    /// stmt executes. Codegen stores the new value to the computed address.
+    Assign { target: TypedAssignTarget, expr: TypedExpr },
     Return { expr: TypedExpr },
     Expr(TypedExpr),
     /// CTMM: free this binding's tensor allocation.

@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use malus_syntax::parse;
-use crate::{check, SemaError, TypedStmt};
+use crate::{check, SemaError, TypedAssignTarget, TypedStmt};
 
 fn check_src(src: &str) -> Result<crate::TypedProgram, Vec<SemaError>> {
     let program = parse(malus_syntax::FileId(0), src).expect("parse failed");
@@ -387,7 +387,9 @@ fn main():
 "#;
     let typed = check_src(src).expect("let mut + reassignment should type-check");
     let main = typed.fns.iter().find(|f| f.name == "main").unwrap();
-    let has_assign = main.body.iter().any(|s| matches!(s, TypedStmt::Assign { name, .. } if name == "acc"));
+    let has_assign = main.body.iter().any(|s| matches!(
+        s, TypedStmt::Assign { target: TypedAssignTarget::Ident(name), .. } if name == "acc"
+    ));
     assert!(has_assign, "TypedStmt::Assign for acc should be present");
 }
 
@@ -439,7 +441,7 @@ fn main():
             if matches!(stmt, TypedStmt::Drop { name } if name == "acc") {
                 saw_drop = true;
             }
-            if matches!(stmt, TypedStmt::Assign { name, .. } if name == "acc") {
+            if matches!(stmt, TypedStmt::Assign { target: TypedAssignTarget::Ident(name), .. } if name == "acc") {
                 if saw_drop { saw_assign = true; }
             }
         }
@@ -721,7 +723,7 @@ fn main():
         let mut found = false;
         for stmt in for_body {
             if matches!(stmt, TypedStmt::Drop { name } if name == "acc") { saw_drop = true; }
-            if matches!(stmt, TypedStmt::Assign { name, .. } if name == "acc") && saw_drop { found = true; }
+            if matches!(stmt, TypedStmt::Assign { target: TypedAssignTarget::Ident(name), .. } if name == "acc") && saw_drop { found = true; }
         }
         found
     };
@@ -956,7 +958,7 @@ fn main():
         let mut found = false;
         for stmt in for_body {
             if matches!(stmt, TypedStmt::DropStruct { name, .. } if name == "p") { saw_drop = true; }
-            if matches!(stmt, TypedStmt::Assign { name, .. } if name == "p") && saw_drop { found = true; }
+            if matches!(stmt, TypedStmt::Assign { target: TypedAssignTarget::Ident(name), .. } if name == "p") && saw_drop { found = true; }
         }
         found
     };
@@ -1111,4 +1113,183 @@ fn main():
             print("empty")
 "#;
     check_src(src).expect("struct payload escape should be allowed in M13");
+}
+
+// ── M20: Lvalue assignment + ** operator ──────────────────────────────────────
+
+#[test]
+fn test_pow_operator_f32_f32() {
+    let src = r#"
+fn main():
+    let x = 2.0
+    let y = x ** 3.0
+    print(y)
+"#;
+    check_src(src).expect("f32 ** f32 should type-check");
+}
+
+#[test]
+fn test_pow_operator_f32_i64() {
+    let src = r#"
+fn main():
+    let t = 2
+    let y = 0.9 ** t
+    print(y)
+"#;
+    check_src(src).expect("f32 ** i64 should type-check");
+}
+
+#[test]
+fn test_pow_operator_right_assoc() {
+    let src = r#"
+fn main():
+    let y = 2.0 ** 3.0 ** 2.0
+    print(y)
+"#;
+    check_src(src).expect("** right-associativity should parse and type-check");
+}
+
+#[test]
+fn test_pow_operator_non_scalar_rejected() {
+    let src = r#"
+fn main():
+    let a = Tensor.gpu<f32>([1.0])
+    let b = a ** 2.0
+    print(b)
+"#;
+    let errors = check_src(src).expect_err("** on tensor should be rejected");
+    assert!(
+        errors.iter().any(|e| matches!(e, SemaError::PowOperatorScalarOnly { .. })),
+        "expected PowOperatorScalarOnly, got: {:?}", errors
+    );
+}
+
+#[test]
+fn test_index_assign_let_mut() {
+    let src = r#"
+fn main():
+    let mut arr = [Tensor.gpu<f32>([1.0]), Tensor.gpu<f32>([2.0])]
+    let t = Tensor.gpu<f32>([99.0])
+    arr[0] = t
+    print(arr[0])
+"#;
+    check_src(src).expect("index assign on let mut array should type-check");
+}
+
+#[test]
+fn test_index_assign_immutable_rejected() {
+    let src = r#"
+fn main():
+    let arr = [Tensor.gpu<f32>([1.0]), Tensor.gpu<f32>([2.0])]
+    let t = Tensor.gpu<f32>([99.0])
+    arr[0] = t
+"#;
+    let errors = check_src(src).expect_err("index assign on immutable array should be rejected");
+    assert!(
+        errors.iter().any(|e| matches!(e, SemaError::AssignToImmutable { .. })),
+        "expected AssignToImmutable, got: {:?}", errors
+    );
+}
+
+#[test]
+fn test_field_assign_let_mut() {
+    let src = r#"
+struct Point:
+    x: f32
+    y: f32
+
+fn main():
+    let mut p = Point(x=1.0, y=2.0)
+    p.y = 99.0
+    print(p.y)
+"#;
+    check_src(src).expect("field assign on let mut struct should type-check");
+}
+
+#[test]
+fn test_field_assign_immutable_rejected() {
+    let src = r#"
+struct Point:
+    x: f32
+    y: f32
+
+fn main():
+    let p = Point(x=1.0, y=2.0)
+    p.y = 99.0
+"#;
+    let errors = check_src(src).expect_err("field assign on immutable struct should be rejected");
+    assert!(
+        errors.iter().any(|e| matches!(e, SemaError::AssignToImmutable { .. })),
+        "expected AssignToImmutable, got: {:?}", errors
+    );
+}
+
+#[test]
+fn test_mut_param_interior_mutation_ok() {
+    let src = r#"
+fn fill(mut arr: Array<Tensor<f32>,2>, t: Tensor<f32>):
+    arr[0] = t
+
+fn main():
+    let mut arr = [Tensor.gpu<f32>([1.0]), Tensor.gpu<f32>([2.0])]
+    let t = Tensor.gpu<f32>([99.0])
+    fill(arr, t)
+    print(arr[0])
+"#;
+    check_src(src).expect("mut param interior mutation should type-check");
+}
+
+#[test]
+fn test_mut_param_bare_rebind_rejected() {
+    let src = r#"
+fn replace(mut arr: Array<Tensor<f32>,2>):
+    let t = Tensor.gpu<f32>([1.0])
+    let new_arr = [t, t]
+    arr = new_arr
+
+fn main():
+    let mut arr = [Tensor.gpu<f32>([1.0]), Tensor.gpu<f32>([2.0])]
+    replace(arr)
+"#;
+    let errors = check_src(src).expect_err("bare rebind of mut param should be rejected");
+    assert!(
+        errors.iter().any(|e| matches!(e, SemaError::MutParamBareRebind { .. })),
+        "expected MutParamBareRebind, got: {:?}", errors
+    );
+}
+
+#[test]
+fn test_variable_field_assign_rejected() {
+    let src = r#"
+struct Model:
+    w: Variable<f32>
+
+fn main():
+    let t = Tensor.gpu<f32>([1.0])
+    let v = variable(t)
+    let mut m = Model(w=v)
+    let t2 = Tensor.gpu<f32>([2.0])
+    let v2 = variable(t2)
+    m.w = v2
+"#;
+    let errors = check_src(src).expect_err("assigning to Variable field should be rejected");
+    assert!(
+        errors.iter().any(|e| matches!(e, SemaError::AssignVariableField { .. })),
+        "expected AssignVariableField, got: {:?}", errors
+    );
+}
+
+#[test]
+fn test_nested_lvalue_rejected() {
+    let src = r#"
+fn main():
+    let mut arr = [Tensor.gpu<f32>([1.0]), Tensor.gpu<f32>([2.0])]
+    let t = Tensor.gpu<f32>([99.0])
+    arr[0][0] = t
+"#;
+    let errors = check_src(src).expect_err("nested lvalue should be rejected");
+    assert!(
+        errors.iter().any(|e| matches!(e, SemaError::NestedLvalue { .. })),
+        "expected NestedLvalue, got: {:?}", errors
+    );
 }

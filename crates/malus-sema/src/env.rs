@@ -30,6 +30,9 @@ pub struct EnumDef {
 pub struct ParamSig {
     pub name: String,
     pub ty: ResolvedTy,
+    /// True if the parameter was declared `mut`: interior mutation (`p[i]=e`,
+    /// `p.f=e`) is permitted; bare rebind (`p = e`) is still rejected.
+    pub is_mut: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -67,8 +70,11 @@ pub enum Callee<'a> {
 pub struct Env {
     /// Local variable bindings: name → (type, optional placement).
     bindings: Vec<HashMap<String, (ResolvedTy, Option<Placement>)>>,
-    /// Names bound with `let mut` — checked at Assign sites.
+    /// Names bound with `let mut` or as `mut` params — checked at Assign sites.
     mutable_names: HashSet<String>,
+    /// Names that are specifically `mut` parameters (subset of `mutable_names`).
+    /// These allow interior mutation (`p[i]=e`) but reject bare rebind (`p=e`).
+    mut_param_names: HashSet<String>,
     pub functions: HashMap<String, FnSig>,
     pub kernels: HashMap<String, KernelSig>,
     pub builtins: HashMap<String, BuiltinSig>,
@@ -88,6 +94,7 @@ impl Env {
         Env {
             bindings: vec![HashMap::new()],
             mutable_names: HashSet::new(),
+            mut_param_names: HashSet::new(),
             functions: HashMap::new(),
             kernels: HashMap::new(),
             builtins,
@@ -118,8 +125,20 @@ impl Env {
         self.bind(name, ty, placement);
     }
 
+    /// Bind a `mut` parameter: interior mutation permitted, bare rebind rejected.
+    pub fn bind_mut_param(&mut self, name: String, ty: ResolvedTy, placement: Option<Placement>) {
+        self.mutable_names.insert(name.clone());
+        self.mut_param_names.insert(name.clone());
+        self.bind(name, ty, placement);
+    }
+
     pub fn is_mutable(&self, name: &str) -> bool {
         self.mutable_names.contains(name)
+    }
+
+    /// True iff `name` was bound as a `mut` parameter (not a `let mut` local).
+    pub fn is_mut_param(&self, name: &str) -> bool {
+        self.mut_param_names.contains(name)
     }
 
     pub fn lookup_binding(&self, name: &str) -> Option<&(ResolvedTy, Option<Placement>)> {

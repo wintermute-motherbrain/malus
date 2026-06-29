@@ -16,11 +16,11 @@ struct AdamW:
     eps: f32
     wd: f32
 
-fn adamw_step(opt: AdamW, params: Array<Variable<f32>, 4>,
-              ms: Array<Tensor<f32>, 4>, vs: Array<Tensor<f32>, 4>,
-              t: i32):
-    let bc1 = 1.0 - opt.beta1 ^ t
-    let bc2 = 1.0 - opt.beta2 ^ t
+fn adamw_step(opt: AdamW, mut params: Array<Variable<f32>, 4>,
+              mut ms: Array<Tensor<f32>, 4>, mut vs: Array<Tensor<f32>, 4>,
+              t: i64):
+    let bc1 = 1.0 - opt.beta1 ** t
+    let bc2 = 1.0 - opt.beta2 ** t
     for i in range(4):
         let g  = params[i].grad + opt.wd * params[i].data
         ms[i]  = opt.beta1 * ms[i] + (1.0 - opt.beta1) * g
@@ -32,16 +32,15 @@ fn adamw_step(opt: AdamW, params: Array<Variable<f32>, 4>,
 fn main():
     let x      = ones(8, 4)
     let target = ones(8, 1)
-    let mut w  = variable(randn(4, 1))
-    let mut b  = variable(zeros(1, 1))
 
-    let mut params = [w, b, variable(zeros(1,1)), variable(zeros(1,1))]
-    let mut ms = [zeros(4,1), zeros(1,1), zeros(1,1), zeros(1,1)]
-    let mut vs = [zeros(4,1), zeros(1,1), zeros(1,1), zeros(1,1)]
+    let mut params = [variable(randn(4, 1)), variable(zeros(1, 1)),
+                      variable(zeros(1, 1)), variable(zeros(1, 1))]
+    let mut ms = [zeros(4, 1), zeros(1, 1), zeros(1, 1), zeros(1, 1)]
+    let mut vs = [zeros(4, 1), zeros(1, 1), zeros(1, 1), zeros(1, 1)]
 
     let opt = AdamW(lr=0.01, beta1=0.9, beta2=0.999, eps=1e-8, wd=0.01)
     for t in range(1, 201):
-        let pred = variable(x) @ params[0] + variable(ones(8,1)) @ params[1]
+        let pred = variable(x) @ params[0] + variable(ones(8, 1)) @ params[1]
         let loss = sum((pred - variable(target)) * (pred - variable(target)))
         zero_grad(params[0], params[1])
         backward(loss)
@@ -80,11 +79,17 @@ Only single-level lvalues in M20: `a[i]` and `s.f`. No chained `a.b[i].c`.
 
 Same pipeline as indexed assignment above — only the codegen offset calculation differs (field offset is fixed and determined at sema time from the struct definition).
 
-### 3. AdamW as Stdlib
+### 3. `**` Power Operator
 
-AdamW is implemented **in malus source** (not in Rust), using the lvalue assignment features above. A canonical `examples/stdlib/adamw.ml` defines the `AdamW` struct and `adamw_step` fn as shown in the done-when. Users import it.
+`f32 ** {f32 | i32 | i64} → f32`. Right-associative, highest binary precedence. Uses `**` (Python parity) rather than spec's `^` (which reads as XOR). Lowered to `malus_powf(f32, f32) -> f32` shim (wraps `f32::powf`). See ADR-0025.
 
-The `^` operator for scalar `beta^t` (integer power of a float) requires a small sema/codegen addition: `ScalarBinOp::Pow` lowered to a `libm::powf` call registered as a JIT symbol, or unrolled for small integer exponents.
+### 4. `mut` Parameters
+
+`fn f(mut a: Array<T,N>)` permits interior mutation (`a[i]=e`) but rejects bare rebind (`a=new_val`). See ADR-0025.
+
+### 5. AdamW as Self-Contained Example
+
+`examples/adamw.ml` — `struct AdamW` + `fn adamw_step` + `fn main` in one file. Self-contained; does not import from another module (cross-module structs are a tracked post-V3 follow-up — see `docs/milestones/cross-module-types.md`).
 
 ## Out of Scope
 

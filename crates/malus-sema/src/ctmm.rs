@@ -181,14 +181,17 @@ fn hoist_gpu_subexprs(body: &mut Vec<TypedStmt>) {
                 result.extend(hoisted);
                 result.push(TypedStmt::Let { name, expr });
             }
-            TypedStmt::Assign { name, expr } => {
+            TypedStmt::Assign { target, expr } => {
                 let mut hoisted = Vec::new();
                 let expr = hoist_gpu_in_expr(expr, &mut hoisted, &mut counter);
-                // D6 guard: if the RHS is still GPU-producing and yields a tensor,
-                // hoist it into a temp so the old binding can be safely dropped before
-                // the Assign writes the new value. This prevents use-after-free when
-                // the RHS references the Assign target (e.g. `acc = acc + delta`).
-                let expr = if is_gpu_producing(&expr) && expr.ty.is_tensor() {
+                // D6 guard: if the RHS is still GPU-producing and yields a tensor or
+                // variable, hoist it into a temp so the old slot can be safely released
+                // before the Assign writes the new value. For Index/Field targets this
+                // is always needed (element release happens in codegen after RHS is fully
+                // evaluated). For Ident targets the existing self-reference guard applies.
+                let needs_hoist = is_gpu_producing(&expr)
+                    && (expr.ty.is_tensor() || expr.ty.is_variable());
+                let expr = if needs_hoist {
                     let tmp_name = format!("__malus_tmp_{}", counter);
                     counter += 1;
                     let ty = expr.ty.clone();
@@ -205,7 +208,7 @@ fn hoist_gpu_subexprs(body: &mut Vec<TypedStmt>) {
                     expr
                 };
                 result.extend(hoisted);
-                result.push(TypedStmt::Assign { name, expr });
+                result.push(TypedStmt::Assign { target, expr });
             }
             TypedStmt::Return { expr } => {
                 let mut hoisted = Vec::new();
@@ -431,15 +434,24 @@ fn hoist_gpu_producing_returns(body: &mut Vec<TypedStmt>) {
 /// Must run after `hoist_gpu_subexprs` (D6 guard ensures the RHS no longer
 /// references the target, making the early Drop safe).
 fn insert_assign_drops(body: &mut Vec<TypedStmt>, escaping: &HashSet<String>) {
+    use crate::typed_ir::TypedAssignTarget;
     let mut i = 0;
     while i < body.len() {
         match &body[i] {
-            TypedStmt::Assign { name, expr } if !escaping.contains(name) => {
+            // Ident target: drop the old binding value (same as before).
+            TypedStmt::Assign { target: TypedAssignTarget::Ident(name), expr }
+                if !escaping.contains(name) =>
+            {
                 if let Some(drop_stmt) = make_drop_stmt_for_ty(name, &expr.ty) {
                     body.insert(i, drop_stmt);
                     i += 1;
                 }
             }
+            // Index/Field targets: no whole-binding drop here.
+            // The codegen handles the old-element-release inline (load old slot →
+            // tensor_release/tensor_free → store new), after the RHS has been fully
+            // evaluated into a temp by `hoist_gpu_subexprs`.
+            TypedStmt::Assign { target: TypedAssignTarget::Index { .. } | TypedAssignTarget::Field { .. }, .. } => {}
             _ => {}
         }
         // Recurse into inner bodies so outer-scope `let mut` bindings reassigned
@@ -1133,8 +1145,10 @@ fn insert_variable_arc_retains(body: &mut Vec<TypedStmt>) {
     while i < body.len() {
         let retain_names: Vec<String> = match &body[i] {
             TypedStmt::Let { expr, .. }
-            | TypedStmt::Assign { expr, .. }
             | TypedStmt::LetTuple { expr, .. } => {
+                variable_arc_retains_for_expr(expr)
+            }
+            TypedStmt::Assign { expr, .. } => {
                 variable_arc_retains_for_expr(expr)
             }
             TypedStmt::Expr(expr) | TypedStmt::Return { expr } => {
@@ -1180,6 +1194,15 @@ fn variable_arc_retains_for_expr(expr: &TypedExpr) -> Vec<String> {
             .filter(|a| a.ty.is_variable())
             .filter_map(|a| {
                 if let TypedExprKind::Ident(n) = &a.kind { Some(n.clone()) } else { None }
+            })
+            .collect(),
+        // Array literal: retain Variable ident elements so the slot is a genuine
+        // co-owner alongside any binding that still references the same handle.
+        TypedExprKind::ArrayLiteral { elements } => elements
+            .iter()
+            .filter(|e| e.ty.is_variable())
+            .filter_map(|e| {
+                if let TypedExprKind::Ident(n) = &e.kind { Some(n.clone()) } else { None }
             })
             .collect(),
         _ => vec![],

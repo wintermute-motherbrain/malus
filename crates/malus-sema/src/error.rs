@@ -66,6 +66,15 @@ pub enum SemaError {
     UnknownAxisArg { callee: String, name: String, span: Span },
     /// softmax/layernorm require a named `axis=N` argument.
     MissingAxisArg { callee: String, span: Span },
+    // ── M20: lvalue assignment ───────────────────────────────────────────────
+    /// Assign target is not a single-level lvalue (e.g. `a.b[i]`).
+    NestedLvalue { span: Span },
+    /// `mut` param used as a bare rebind target (`p = e`); interior-only allowed.
+    MutParamBareRebind { name: String, span: Span },
+    /// Tried to assign to a `Variable` struct field (post-V3, ADR-0016).
+    AssignVariableField { field: String, span: Span },
+    /// `**` used with non-scalar operands (scalar-only in M20).
+    PowOperatorScalarOnly { span: Span },
 }
 
 impl SemaError {
@@ -109,7 +118,11 @@ impl SemaError {
             | UnknownReductionArg { span, .. }
             | MissingReductionAxis { span, .. }
             | UnknownAxisArg { span, .. }
-            | MissingAxisArg { span, .. } => Some(*span),
+            | MissingAxisArg { span, .. }
+            | NestedLvalue { span }
+            | MutParamBareRebind { span, .. }
+            | AssignVariableField { span, .. }
+            | PowOperatorScalarOnly { span } => Some(*span),
             DuplicateDefinition { second, .. } | DuplicateTypeDefinition { second, .. } => Some(*second),
             MainNotFound => None,
         }
@@ -166,6 +179,10 @@ impl SemaError {
             MissingReductionAxis { .. } => "axis= is required",
             UnknownAxisArg { .. } => "unknown keyword argument",
             MissingAxisArg { .. } => "axis= is required",
+            NestedLvalue { .. } => "nested lvalue not supported in M20",
+            MutParamBareRebind { .. } => "mut param may only be mutated in place",
+            AssignVariableField { .. } => "cannot assign to a Variable struct field",
+            PowOperatorScalarOnly { .. } => "** requires scalar operands",
             MainNotFound => "",
         }
     }
@@ -274,6 +291,14 @@ impl fmt::Display for SemaError {
                 write!(f, "'{}': unknown keyword argument '{}' — only `axis` is accepted", callee, name),
             SemaError::MissingAxisArg { callee, .. } =>
                 write!(f, "'{}' requires a named `axis=N` argument", callee),
+            SemaError::NestedLvalue { .. } =>
+                write!(f, "nested lvalue targets (`a.b[i]`, `a[i].f`) are not supported in M20"),
+            SemaError::MutParamBareRebind { name, .. } =>
+                write!(f, "cannot rebind `mut` parameter '{}' — use `a[i]=e` or `s.f=e` for in-place mutation", name),
+            SemaError::AssignVariableField { field, .. } =>
+                write!(f, "cannot assign to Variable field '{}': Variable struct fields are post-V3 (see ADR-0016)", field),
+            SemaError::PowOperatorScalarOnly { .. } =>
+                write!(f, "`**` requires scalar (f32) operands; tensor power is not supported in M20"),
         }
     }
 }

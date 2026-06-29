@@ -80,7 +80,7 @@ fn print_stmt(out: &mut String, stmt: &Stmt, depth: usize) {
             writeln!(out, "{indent}let mut {name} = {}", print_expr(expr)).unwrap();
         }
         StmtKind::Assign { target, expr } => {
-            writeln!(out, "{indent}{target} = {}", print_expr(expr)).unwrap();
+            writeln!(out, "{indent}{} = {}", print_expr(target), print_expr(expr)).unwrap();
         }
         StmtKind::Return { expr } => {
             writeln!(out, "{indent}return {}", print_expr(expr)).unwrap();
@@ -225,6 +225,7 @@ fn binop_prec(op: &BinOp) -> u8 {
         BinOp::Add | BinOp::Sub   => 7,
         BinOp::Mul | BinOp::Div
         | BinOp::Matmul            => 9,
+        BinOp::Pow                 => 12,
     }
 }
 
@@ -233,6 +234,7 @@ fn print_binop(op: &BinOp) -> &'static str {
         BinOp::Add    => "+",
         BinOp::Sub    => "-",
         BinOp::Mul    => "*",
+        BinOp::Pow    => "**",
         BinOp::Div    => "/",
         BinOp::Matmul => "@",
         BinOp::Eq     => "==",

@@ -216,9 +216,17 @@ _Avoid_: attention mask (overloaded), upper-triangular mask (imprecise)
 ### Optimization
 
 **AdamW**:
-The Adam optimizer with decoupled weight decay, implemented in malus source as a stdlib construct (`examples/stdlib/adamw.ml`). Uses per-parameter moment buffers (`m`, `v`) updated via lvalue assignment. Added in M20.
+The Adam optimizer with decoupled weight decay, implemented in malus source (`examples/adamw.ml`). Uses per-parameter moment buffers (`m`, `v`) updated via lvalue assignment on `mut` array parameters. Added in M20.
 _Avoid_: Adam, SGD with weight decay (different algorithms)
 
 **Lvalue assignment**:
-An assignment whose target is an indexed element (`a[i] = e`) or a struct field (`s.field = e`) rather than a bare name. Added in M20. CTMM drops the old element/field value before binding the new one.
+An assignment whose target is an indexed element (`a[i] = e`) or a struct field (`s.field = e`) rather than a bare name. Added in M20. Requires the base binding to be mutable (`let mut` local or `mut` parameter). CTMM drops the old element/field value before binding the new one (release is emitted inline at codegen time; Index/Field targets do not receive a separate CTMM drop stmt). `Variable` struct fields may not be assigned (post-V3, ADR-0016).
 _Avoid_: in-place update, indexed assignment (fine informally)
+
+**`mut` parameter**:
+A function parameter declared with a `mut` prefix (`fn f(mut a: Array<T, N>)`). Permits interior mutation of the aggregate (`a[i] = e`, `a.f = e`) but rejects bare rebinding (`a = new_val`). The callee receives a borrowed heap pointer — mutations are visible to the caller through the shared allocation. The callee does not free the aggregate box (it is a borrow, not a move). Added in M20; amends ADR-0014. Distinct from `let mut` (which permits both rebind and interior mutation).
+_Avoid_: mutable parameter, pass-by-reference, in-out parameter
+
+**power operator (`**`)**:
+A binary scalar operator for exponentiation: `f32 ** {f32 | i32 | i64} → f32`. Right-associative, highest binary precedence. Non-integer exponents are supported because the exponent may be a runtime loop counter. Lowered to `malus_powf(f32, f32) -> f32` (wraps `f32::powf`). Added in M20 using `**` (Python parity) rather than `^` (would read as XOR to Python users). See ADR-0025.
+_Avoid_: `^` (reserved/XOR), caret operator, exponentiation

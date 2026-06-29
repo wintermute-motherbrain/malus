@@ -36,6 +36,7 @@ pub enum Ty {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum BinOp {
     Add, Sub, Mul, Div, Matmul,
+    Pow,
     Eq, NotEq, Lt, LtEq, Gt, GtEq,
     And, Or,
 }
@@ -52,7 +53,7 @@ pub fn elementwise_builtin_name(op: &BinOp) -> Option<&'static str> {
         BinOp::Sub => Some("malus_sub"),
         BinOp::Mul => Some("malus_mul"),
         BinOp::Div => Some("malus_div"),
-        BinOp::Matmul | BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::LtEq
+        BinOp::Matmul | BinOp::Pow | BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::LtEq
         | BinOp::Gt | BinOp::GtEq | BinOp::And | BinOp::Or => None,
     }
 }
@@ -66,7 +67,7 @@ pub fn scalar_broadcast_builtin_name(op: &BinOp, scalar_on_right: bool) -> Optio
         BinOp::Sub => if scalar_on_right { Some("malus_sub_scalar") } else { Some("malus_rsub_scalar") },
         BinOp::Mul => Some("malus_mul_scalar"),
         BinOp::Div => if scalar_on_right { Some("malus_div_scalar") } else { Some("malus_rdiv_scalar") },
-        _ => None,
+        BinOp::Pow | _ => None,
     }
 }
 
@@ -156,7 +157,10 @@ pub struct Stmt {
 pub enum StmtKind {
     Let { name: String, expr: Expr },
     LetMut { name: String, expr: Expr },
-    Assign { target: String, expr: Expr },
+    /// `target = expr` — lvalue assignment.
+    /// `target` may be an `Ident`, `Index`, or `FieldAccess` expression.
+    /// Validated and restricted in sema (single-level only; base must be mutable).
+    Assign { target: Expr, expr: Expr },
     Return { expr: Expr },
     Expr(Expr),
     /// `if condition: body [else: body]`
@@ -207,6 +211,9 @@ pub enum StmtKind {
 pub struct Param {
     pub name: String,
     pub ty: Ty,
+    /// `mut` parameter: callee may mutate aggregate elements/fields in place
+    /// (interior mutation only — bare rebind `p = e` is still a sema error).
+    pub is_mut: bool,
     pub span: Span,
 }
 

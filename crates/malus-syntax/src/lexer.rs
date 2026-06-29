@@ -139,7 +139,16 @@ impl<'src> Lexer<'src> {
                         self.emit(TokenKind::Minus, s);
                     }
                 }
-                b'*' => { let s = self.pos; self.pos += 1; self.emit(TokenKind::Star, s); }
+                b'*' => {
+                    let s = self.pos;
+                    if self.peek_ahead(1) == Some(b'*') {
+                        self.pos += 2;
+                        self.emit(TokenKind::StarStar, s);
+                    } else {
+                        self.pos += 1;
+                        self.emit(TokenKind::Star, s);
+                    }
+                }
                 b'/' => { let s = self.pos; self.pos += 1; self.emit(TokenKind::Slash, s); }
                 b'@' => { let s = self.pos; self.pos += 1; self.emit(TokenKind::At, s); }
                 b'=' => {

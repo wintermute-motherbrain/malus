@@ -177,6 +177,11 @@ extern "C" fn print_f32(v: f32)  { print!("{v}"); }
 extern "C" fn print_i64(v: i64)  { print!("{v}"); }
 extern "C" fn print_bool(v: i8)  { print!("{}", if v != 0 { "true" } else { "false" }); }
 
+// ── Scalar math shims ─────────────────────────────────────────────────────────
+
+/// f32 power — shim for `**` operator; exponent already cast to f32 by codegen.
+extern "C" fn malus_powf(base: f32, exp: f32) -> f32 { base.powf(exp) }
+
 // ── dtype_tag — ScalarTy enum discriminant order ──────────────────────────────
 
 // M14: OpTag discriminants — must stay in sync with malus_runtime::tape::OpTag.
@@ -370,6 +375,8 @@ struct Codegen<'m> {
     rt_tensor_embedding:           FuncId,
     rt_tensor_randn:               FuncId,
     rt_tape_record_embedding:      FuncId,
+    // M20: scalar power operator (**).
+    rt_powf:                       FuncId,
 }
 
 impl<'m> Codegen<'m> {
@@ -500,12 +507,46 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                 Ok(false)
             }
 
-            TypedStmt::Assign { name, expr } => {
-                let val = self.lower_expr(expr)?;
-                let var = self.var_map.get(name)
-                    .copied()
-                    .ok_or_else(|| CodegenError::UnsupportedExpr(format!("assign to unknown variable: {name}")))?;
-                self.builder.def_var(var, val);
+            TypedStmt::Assign { target, expr } => {
+                use malus_sema::TypedAssignTarget;
+                match target {
+                    TypedAssignTarget::Ident(name) => {
+                        // Ident: CTMM already inserted a drop-before-assign for the old binding.
+                        // Just rebind the Cranelift variable.
+                        let val = self.lower_expr(expr)?;
+                        let var = self.var_map.get(name.as_str())
+                            .copied()
+                            .ok_or_else(|| CodegenError::UnsupportedExpr(
+                                format!("assign to unknown variable: {name}")))?;
+                        self.builder.def_var(var, val);
+                    }
+                    TypedAssignTarget::Index { base, index, elem_ty } => {
+                        // Array element assign: arr_ptr + idx*8 (no ARC header).
+                        // Evaluate RHS before releasing old slot (CTMM may have hoisted it).
+                        let arr_ptr = self.use_var(base)?;
+                        let idx_val = self.lower_expr(index)?;
+                        let eight = self.builder.ins().iconst(I64, 8);
+                        let byte_off = self.builder.ins().imul(idx_val, eight);
+                        let slot_addr = self.builder.ins().iadd(arr_ptr, byte_off);
+                        let new_val = self.lower_expr(expr)?;
+                        // Release old slot element (reuse emit_drop_field: slot_addr + offset 0).
+                        self.emit_drop_field(slot_addr, 0, elem_ty)?;
+                        self.builder.ins().store(
+                            cranelift_codegen::ir::MemFlags::trusted(), new_val, slot_addr, 0,
+                        );
+                    }
+                    TypedAssignTarget::Field { base, slot_idx, field_ty } => {
+                        // Struct field assign: ptr + 8 + slot_idx*8 (8-byte ARC header).
+                        let struct_ptr = self.use_var(base)?;
+                        let offset = 8 + (*slot_idx as i32) * 8;
+                        let new_val = self.lower_expr(expr)?;
+                        // Release old field value (emit_drop_field handles Tensor/Variable/Struct/Enum).
+                        self.emit_drop_field(struct_ptr, offset, field_ty)?;
+                        self.builder.ins().store(
+                            cranelift_codegen::ir::MemFlags::trusted(), new_val, struct_ptr, offset,
+                        );
+                    }
+                }
                 Ok(false)
             }
 
@@ -793,7 +834,7 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                 let elem_ty = elem_ty.clone();
                 let len = *len;
                 // If the element type owns heap resources, release each element.
-                if elem_ty.is_tensor() || elem_ty.is_struct() || elem_ty.is_enum() || elem_ty.is_array() {
+                if elem_ty.is_tensor() || elem_ty.is_variable() || elem_ty.is_struct() || elem_ty.is_enum() || elem_ty.is_array() {
                     self.emit_counted_drop_loop(ptr, &elem_ty, len)?;
                 }
                 self.call_heap_free(ptr);
@@ -1771,6 +1812,18 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                 let cmp = if float { self.builder.ins().fcmp(FloatCC::GreaterThanOrEqual, l, r) } else { self.builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, l, r) };
                 Ok(self.builder.ins().bmask(I8, cmp))
             }
+            BinOp::Pow => {
+                // f32 ** {f32|i32|i64} → f32.  LHS is always f32; cast RHS to f32 if needed.
+                let r_ty = self.builder.func.dfg.value_type(r);
+                let r_f32 = if r_ty == F32 {
+                    r
+                } else {
+                    self.builder.ins().fcvt_from_sint(F32, r)
+                };
+                let powf_ref = self.import_func(self.codegen.rt_powf);
+                let call = self.builder.ins().call(powf_ref, &[l, r_f32]);
+                Ok(self.builder.inst_results(call).to_vec()[0])
+            }
             BinOp::Matmul => Err(CodegenError::UnsupportedExpr("Matmul requires tensor operands".into())),
             BinOp::And | BinOp::Or => Err(CodegenError::UnsupportedExpr("And/Or on scalars not supported".into())),
         }
@@ -2476,6 +2529,8 @@ pub fn compile_and_run(
     jit_builder.symbol("tensor_embedding",          symbols.tensor_embedding          as *const u8);
     jit_builder.symbol("tensor_randn",              symbols.tensor_randn              as *const u8);
     jit_builder.symbol("tape_record_embedding",     symbols.tape_record_embedding     as *const u8);
+    // M20 scalar power operator.
+    jit_builder.symbol("malus_powf",               malus_powf                        as *const u8);
 
     let mut module = JITModule::new(jit_builder);
     let ptr = module.target_config().pointer_type();
@@ -2818,6 +2873,17 @@ pub fn compile_and_run(
     let rt_tape_record_embedding = module.declare_function("tape_record_embedding", Linkage::Import, &sig_tape_binop)
         .map_err(|e| CodegenError::JitError(e.to_string()))?;
 
+    // M20: malus_powf(base: f32, exp: f32) -> f32
+    let sig_powf = {
+        let mut s = Signature::new(call_conv);
+        s.params.push(AbiParam::new(F32));
+        s.params.push(AbiParam::new(F32));
+        s.returns.push(AbiParam::new(F32));
+        s
+    };
+    let rt_powf = module.declare_function("malus_powf", Linkage::Import, &sig_powf)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
+
     // First pass: declare all user fn signatures.
     let mut func_ids: HashMap<String, FuncId> = HashMap::new();
     for typed_fn in &program.fns {
@@ -2892,6 +2958,7 @@ pub fn compile_and_run(
         rt_tensor_embedding,
         rt_tensor_randn,
         rt_tape_record_embedding,
+        rt_powf,
     };
 
     // Second pass: compile each fn body.

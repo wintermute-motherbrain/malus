@@ -10,8 +10,8 @@ use crate::env::{Callee, Env, EnumDef, FnSig, KernelSig, KernelParamSig, ParamSi
 use crate::error::SemaError;
 use crate::ty::{is_float_scalar, scalar_ty_name, ResolvedTy};
 use crate::typed_ir::{
-    TypedExpr, TypedExprKind, TypedFn, TypedKernel, TypedKernelParam, TypedMatchArm, TypedParam,
-    TypedProgram, TypedStmt,
+    TypedAssignTarget, TypedExpr, TypedExprKind, TypedFn, TypedKernel, TypedKernelParam,
+    TypedMatchArm, TypedParam, TypedProgram, TypedStmt,
 };
 
 // ── Nominal maps (thread through resolve_ty without borrow conflicts) ─────────
@@ -216,7 +216,7 @@ pub fn check(
 
     for item in &program.items {
         match &item.kind {
-            ItemKind::Fn { name, params, return_ty: _, body } => {
+            ItemKind::Fn { name, params: _, return_ty: _, body } => {
                 let sig = match env.functions.get(name) {
                     Some(s) => s.clone(),
                     None => continue, // had a signature error above
@@ -224,7 +224,11 @@ pub fn check(
 
                 env.push_scope();
                 for p in &sig.params {
-                    env.bind(p.name.clone(), p.ty.clone(), None);
+                    if p.is_mut {
+                        env.bind_mut_param(p.name.clone(), p.ty.clone(), None);
+                    } else {
+                        env.bind(p.name.clone(), p.ty.clone(), None);
+                    }
                 }
 
                 let mut body_errors: Vec<SemaError> = Vec::new();
@@ -241,8 +245,8 @@ pub fn check(
 
                 errors.extend(body_errors);
 
-                let typed_params = sig.params.iter().zip(params.iter()).map(|(s, _)| {
-                    TypedParam { name: s.name.clone(), ty: s.ty.clone() }
+                let typed_params = sig.params.iter().map(|s| {
+                    TypedParam { name: s.name.clone(), ty: s.ty.clone(), is_mut: s.is_mut }
                 }).collect();
 
                 typed_fns.push(TypedFn {
@@ -401,35 +405,8 @@ fn check_body(
                 }
             }
             malus_syntax::ast::StmtKind::Assign { target, expr } => {
-                let target_ty = match ctx.env.lookup_binding(target) {
-                    Some((ty, _)) => ty.clone(),
-                    None => {
-                        ctx.errors.push(SemaError::UnknownIdent {
-                            name: target.clone(),
-                            span: stmt.span,
-                        });
-                        return typed;
-                    }
-                };
-                if !ctx.env.is_mutable(target) {
-                    ctx.errors.push(SemaError::AssignToImmutable {
-                        name: target.clone(),
-                        span: stmt.span,
-                    });
-                    return typed;
-                }
-                match check_expr(expr, Some(&target_ty), ctx) {
-                    Some(texpr) => {
-                        if texpr.ty != target_ty {
-                            ctx.errors.push(SemaError::TypeMismatch {
-                                expected: target_ty,
-                                found: texpr.ty.clone(),
-                                span: expr.span,
-                            });
-                            return typed;
-                        }
-                        typed.push(TypedStmt::Assign { name: target.clone(), expr: texpr });
-                    }
+                match check_lvalue(target, expr, stmt.span, ctx) {
+                    Some(stmt) => typed.push(stmt),
                     None => return typed,
                 }
             }
@@ -712,6 +689,27 @@ fn check_binop(
     span: Span,
     ctx: &mut BodyCtx<'_>,
 ) -> Option<TypedExpr> {
+    // `**` is scalar-only: f32 ** {f32|i32|i64} → f32.
+    // Check this before the general Variable/Tensor path.
+    if *op == BinOp::Pow {
+        let tlhs = check_expr(lhs, Some(&ResolvedTy::Scalar(ScalarTy::F32)), ctx)?;
+        let trhs = check_expr(rhs, None, ctx)?;
+        let lhs_ok = matches!(&tlhs.ty, ResolvedTy::Scalar(ScalarTy::F32));
+        let rhs_ok = matches!(&trhs.ty,
+            ResolvedTy::Scalar(ScalarTy::F32) | ResolvedTy::Scalar(ScalarTy::I32)
+            | ResolvedTy::Scalar(ScalarTy::I64));
+        if !lhs_ok || !rhs_ok {
+            ctx.errors.push(SemaError::PowOperatorScalarOnly { span });
+            return None;
+        }
+        return Some(typed_expr(
+            TypedExprKind::BinOp { op: BinOp::Pow, lhs: Box::new(tlhs), rhs: Box::new(trhs) },
+            ResolvedTy::Scalar(ScalarTy::F32),
+            None,
+            span,
+        ));
+    }
+
     let tlhs = check_expr(lhs, None, ctx)?;
     let trhs = check_expr(rhs, None, ctx)?;
 
@@ -1902,6 +1900,192 @@ pub fn resolve_ty(
     }
 }
 
+/// Validate and lower an lvalue assignment.
+///
+/// Valid targets (single-level only):
+///   - `Ident(name)` — bare variable rebind; requires `let mut` local (not `mut` param).
+///   - `Index { base: Ident(name), .. }` — indexed element; base must be mutable.
+///   - `FieldAccess { base: Ident(name), field }` — struct field; base must be mutable;
+///     field must not be `Variable` (post-V3, ADR-0016).
+/// Nested targets (`a[i].f`, `a.b[j]`) are rejected with `NestedLvalue`.
+fn check_lvalue(
+    target: &malus_syntax::ast::Expr,
+    rhs: &malus_syntax::ast::Expr,
+    stmt_span: Span,
+    ctx: &mut BodyCtx<'_>,
+) -> Option<TypedStmt> {
+    use malus_syntax::ast::ExprKind;
+
+    match &target.kind {
+        ExprKind::Ident(name) => {
+            // Bare rebind. Requires the binding to be mutable.
+            // `mut` params are mutable for interior mutation only — reject bare rebind.
+            let (target_ty, is_param) = match ctx.env.lookup_binding(name) {
+                Some((ty, _)) => (ty.clone(), false),
+                None => {
+                    ctx.errors.push(SemaError::UnknownIdent { name: name.clone(), span: stmt_span });
+                    return None;
+                }
+            };
+            // Detect mut param: it's in mutable_names but was registered without LetMut.
+            // The only way to be mutable without being a `let mut` local is to be a `mut` param.
+            // We detect this by checking the AST params of the current fn, but we don't have
+            // that context here. Instead, track mut-param names in the env with a separate set.
+            let _ = is_param;
+            if !ctx.env.is_mutable(name) {
+                ctx.errors.push(SemaError::AssignToImmutable { name: name.clone(), span: stmt_span });
+                return None;
+            }
+            // Reject `mut` param bare rebind: a mut param is interior-only.
+            if ctx.env.is_mut_param(name) {
+                ctx.errors.push(SemaError::MutParamBareRebind { name: name.clone(), span: stmt_span });
+                return None;
+            }
+            let texpr = check_expr(rhs, Some(&target_ty), ctx)?;
+            if texpr.ty != target_ty {
+                ctx.errors.push(SemaError::TypeMismatch {
+                    expected: target_ty,
+                    found: texpr.ty.clone(),
+                    span: rhs.span,
+                });
+                return None;
+            }
+            Some(TypedStmt::Assign {
+                target: TypedAssignTarget::Ident(name.clone()),
+                expr: texpr,
+            })
+        }
+
+        ExprKind::Index { base, indices } => {
+            // Indexed element assignment: `base[i] = rhs`
+            // Base must be an Ident (no nested lvalues in M20).
+            let base_name = match &base.kind {
+                ExprKind::Ident(n) => n.clone(),
+                _ => {
+                    ctx.errors.push(SemaError::NestedLvalue { span: target.span });
+                    return None;
+                }
+            };
+            // Base must be mutable.
+            let base_ty = match ctx.env.lookup_binding(&base_name) {
+                Some((ty, _)) => ty.clone(),
+                None => {
+                    ctx.errors.push(SemaError::UnknownIdent { name: base_name.clone(), span: target.span });
+                    return None;
+                }
+            };
+            if !ctx.env.is_mutable(&base_name) {
+                ctx.errors.push(SemaError::AssignToImmutable { name: base_name.clone(), span: stmt_span });
+                return None;
+            }
+            // Base must be an array.
+            let elem_ty = match &base_ty {
+                ResolvedTy::Array { elem, .. } => *elem.clone(),
+                other => {
+                    ctx.errors.push(SemaError::TypeMismatch {
+                        expected: ResolvedTy::Array { elem: Box::new(ResolvedTy::Unit), len: 0 },
+                        found: other.clone(),
+                        span: target.span,
+                    });
+                    return None;
+                }
+            };
+            // Type-check indices (expect a single integer index).
+            if indices.is_empty() {
+                ctx.errors.push(SemaError::UnknownIdent { name: "[]".into(), span: target.span });
+                return None;
+            }
+            let tidx = check_expr(&indices[0], Some(&ResolvedTy::Scalar(ScalarTy::I64)), ctx)?;
+            // Type-check the RHS against the element type.
+            let texpr = check_expr(rhs, Some(&elem_ty), ctx)?;
+            if texpr.ty != elem_ty {
+                ctx.errors.push(SemaError::TypeMismatch {
+                    expected: elem_ty.clone(),
+                    found: texpr.ty.clone(),
+                    span: rhs.span,
+                });
+                return None;
+            }
+            Some(TypedStmt::Assign {
+                target: TypedAssignTarget::Index { base: base_name, index: Box::new(tidx), elem_ty },
+                expr: texpr,
+            })
+        }
+
+        ExprKind::FieldAccess { base, field } => {
+            // Field assignment: `base.field = rhs`
+            // Base must be an Ident (no nested lvalues in M20).
+            let base_name = match &base.kind {
+                ExprKind::Ident(n) => n.clone(),
+                _ => {
+                    ctx.errors.push(SemaError::NestedLvalue { span: target.span });
+                    return None;
+                }
+            };
+            let base_ty = match ctx.env.lookup_binding(&base_name) {
+                Some((ty, _)) => ty.clone(),
+                None => {
+                    ctx.errors.push(SemaError::UnknownIdent { name: base_name.clone(), span: target.span });
+                    return None;
+                }
+            };
+            if !ctx.env.is_mutable(&base_name) {
+                ctx.errors.push(SemaError::AssignToImmutable { name: base_name.clone(), span: stmt_span });
+                return None;
+            }
+            // Base must be a struct.
+            let fields = match &base_ty {
+                ResolvedTy::Struct { fields, .. } => fields.clone(),
+                other => {
+                    ctx.errors.push(SemaError::TypeMismatch {
+                        expected: ResolvedTy::Struct { name: "<struct>".into(), fields: vec![] },
+                        found: other.clone(),
+                        span: target.span,
+                    });
+                    return None;
+                }
+            };
+            let (slot_idx, field_ty) = match fields.iter().enumerate()
+                .find(|(_, (n, _))| n == field)
+            {
+                Some((i, (_, ty))) => (i, ty.clone()),
+                None => {
+                    let sname = match &base_ty { ResolvedTy::Struct { name, .. } => name.clone(), _ => "<struct>".into() };
+                    ctx.errors.push(SemaError::UnknownField {
+                        struct_name: sname,
+                        field: field.clone(),
+                        span: target.span,
+                    });
+                    return None;
+                }
+            };
+            // Reject Variable fields (post-V3, ADR-0016).
+            if field_ty.is_variable() {
+                ctx.errors.push(SemaError::AssignVariableField { field: field.clone(), span: target.span });
+                return None;
+            }
+            let texpr = check_expr(rhs, Some(&field_ty), ctx)?;
+            if texpr.ty != field_ty {
+                ctx.errors.push(SemaError::TypeMismatch {
+                    expected: field_ty.clone(),
+                    found: texpr.ty.clone(),
+                    span: rhs.span,
+                });
+                return None;
+            }
+            Some(TypedStmt::Assign {
+                target: TypedAssignTarget::Field { base: base_name, slot_idx, field_ty },
+                expr: texpr,
+            })
+        }
+
+        _ => {
+            ctx.errors.push(SemaError::NestedLvalue { span: target.span });
+            None
+        }
+    }
+}
+
 fn resolve_params(
     params: &[malus_syntax::ast::Param],
     nominals: &NominalMaps<'_>,
@@ -1910,7 +2094,7 @@ fn resolve_params(
     let mut out = Vec::new();
     for p in params {
         let ty = resolve_ty(&p.ty, p.span, nominals, errors)?;
-        out.push(ParamSig { name: p.name.clone(), ty });
+        out.push(ParamSig { name: p.name.clone(), ty, is_mut: p.is_mut });
     }
     Some(out)
 }
