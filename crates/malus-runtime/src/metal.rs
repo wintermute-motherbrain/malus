@@ -215,12 +215,28 @@ pub extern "C" fn tensor_print(handle: i64) {
     let tb = unsafe { &*(handle as *const TensorBuffer) };
     let ptr = tb.buffer.contents() as *const f32;
     let slice = unsafe { std::slice::from_raw_parts(ptr, tb.len) };
-    print!("[");
-    for (i, v) in slice.iter().enumerate() {
-        if i > 0 {
-            print!(", ");
+    print_nd(slice, &tb.shape, 0);
+}
+
+fn print_nd(data: &[f32], shape: &[usize], offset: usize) {
+    if shape.is_empty() {
+        print!("{}", data[offset]);
+        return;
+    }
+    if shape.len() == 1 {
+        print!("[");
+        for i in 0..shape[0] {
+            if i > 0 { print!(", "); }
+            print!("{}", data[offset + i]);
         }
-        print!("{v}");
+        print!("]");
+        return;
+    }
+    let stride: usize = shape[1..].iter().product();
+    print!("[");
+    for i in 0..shape[0] {
+        if i > 0 { print!(", "); }
+        print_nd(data, &shape[1..], offset + i * stride);
     }
     print!("]");
 }
