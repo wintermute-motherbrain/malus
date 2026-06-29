@@ -332,8 +332,37 @@ pub extern "C" fn tensor_matmul(handle_a: i64, handle_b: i64) -> i64 {
             let out_shape = [batch, m, n];
             tensor_alloc_gpu(0, out_shape.as_ptr(), 3, out_data.as_ptr())
         }
+        (3, 2) => {
+            // Broadcast a 2-D weight over the batch dim: (B, M, K) @ (K, N) → (B, M, N)
+            let (batch, m, k) = (a.shape[0], a.shape[1], a.shape[2]);
+            let (k2, n) = (b.shape[0], b.shape[1]);
+            if k != k2 {
+                panic!(
+                    "malus: matmul shape mismatch: [{batch}x{m}x{k}] @ [{k2}x{n}] — inner dims {k} != {k2}\n  \
+                     left shape:  {:?}\n  right shape: {:?}",
+                    a.shape, b.shape
+                );
+            }
+            let a_data = unsafe { std::slice::from_raw_parts(a.buffer.contents() as *const f32, a.len) };
+            let b_data = unsafe { std::slice::from_raw_parts(b.buffer.contents() as *const f32, b.len) };
+            let out_len = batch * m * n;
+            let mut out_data = vec![0.0f32; out_len];
+            for bx in 0..batch {
+                let a_off = bx * m * k;
+                let c_off = bx * m * n;
+                for i in 0..m {
+                    for j in 0..n {
+                        for kk in 0..k {
+                            out_data[c_off + i * n + j] += a_data[a_off + i * k + kk] * b_data[kk * n + j];
+                        }
+                    }
+                }
+            }
+            let out_shape = [batch, m, n];
+            tensor_alloc_gpu(0, out_shape.as_ptr(), 3, out_data.as_ptr())
+        }
         _ => panic!(
-            "malus: tensor_matmul requires both inputs to be 2-D or both 3-D\n  \
+            "malus: tensor_matmul requires both inputs to be 2-D, both 3-D, or (3-D, 2-D)\n  \
              left shape:  {:?}\n  right shape: {:?}",
             a.shape, b.shape
         ),
@@ -746,6 +775,176 @@ pub extern "C" fn tensor_reshape(handle: i64, dims_ptr: *const usize, ndims: usi
         );
     }
     reshape_to(handle, &new_shape)
+}
+
+// ── M18: Transformer stdlib ───────────────────────────────────────────────────
+
+/// Numerically stable softmax over one axis.  Called by tensor_softmax_axis
+/// and tensor_cross_entropy (which shares this helper).
+pub(crate) fn softmax_axis_cpu(in_data: &[f32], in_shape: &[usize], axis: usize) -> Vec<f32> {
+    let axis_size = in_shape[axis];
+    let outer: usize = in_shape[..axis].iter().product::<usize>().max(1);
+    let inner: usize = in_shape[axis + 1..].iter().product::<usize>().max(1);
+    let mut out = vec![0.0f32; in_data.len()];
+    for o in 0..outer {
+        for i in 0..inner {
+            // Find max for numerical stability.
+            let mut max_val = f32::NEG_INFINITY;
+            for a in 0..axis_size {
+                let v = in_data[o * axis_size * inner + a * inner + i];
+                if v > max_val { max_val = v; }
+            }
+            // Compute exp(x - max) and sum.
+            let mut sum = 0.0f32;
+            for a in 0..axis_size {
+                let e = (in_data[o * axis_size * inner + a * inner + i] - max_val).exp();
+                out[o * axis_size * inner + a * inner + i] = e;
+                sum += e;
+            }
+            // Normalize.
+            for a in 0..axis_size {
+                out[o * axis_size * inner + a * inner + i] /= sum;
+            }
+        }
+    }
+    out
+}
+
+#[no_mangle]
+pub extern "C" fn tensor_softmax_axis(h: i64, axis: i64) -> i64 {
+    gpu_barrier();
+    let tb = unsafe { &*(h as *const TensorBuffer) };
+    let axis_u = normalize_axis(axis as i32, tb.shape.len());
+    let in_data = unsafe { std::slice::from_raw_parts(tb.buffer.contents() as *const f32, tb.len) };
+    let out_data = softmax_axis_cpu(in_data, &tb.shape, axis_u);
+    tensor_alloc_gpu(0, tb.shape.as_ptr(), tb.shape.len(), out_data.as_ptr())
+}
+
+/// Forward layernorm.  When `var_out` is non-null, writes the population
+/// variance tensor (keepdim=1 at axis) to `*var_out` for use by the VJP
+/// recorder.  Caller transfers ownership of the written handle to the tape.
+#[no_mangle]
+pub extern "C" fn tensor_layernorm_axis(h: i64, axis: i64, var_out: *mut i64) -> i64 {
+    gpu_barrier();
+    let tb = unsafe { &*(h as *const TensorBuffer) };
+    let axis_u = normalize_axis(axis as i32, tb.shape.len());
+    let axis_size = tb.shape[axis_u];
+    let outer: usize = tb.shape[..axis_u].iter().product::<usize>().max(1);
+    let inner: usize = tb.shape[axis_u + 1..].iter().product::<usize>().max(1);
+    let in_data = unsafe { std::slice::from_raw_parts(tb.buffer.contents() as *const f32, tb.len) };
+
+    let need_var = !var_out.is_null();
+    let mut var_data = if need_var { vec![0.0f32; outer * inner] } else { vec![] };
+    let mut norm_data = vec![0.0f32; tb.len];
+
+    for o in 0..outer {
+        for i in 0..inner {
+            let mut mu = 0.0f32;
+            for a in 0..axis_size {
+                mu += in_data[o * axis_size * inner + a * inner + i];
+            }
+            mu /= axis_size as f32;
+            let mut va = 0.0f32;
+            for a in 0..axis_size {
+                let diff = in_data[o * axis_size * inner + a * inner + i] - mu;
+                va += diff * diff;
+            }
+            va /= axis_size as f32;
+            let sigma = (va + 1e-5f32).sqrt();
+            if need_var { var_data[o * inner + i] = va; }
+            for a in 0..axis_size {
+                let x_val = in_data[o * axis_size * inner + a * inner + i];
+                norm_data[o * axis_size * inner + a * inner + i] = (x_val - mu) / sigma;
+            }
+        }
+    }
+
+    if need_var {
+        // var shape has keepdim=1 at axis for easy broadcasting in the VJP.
+        let mut var_shape = tb.shape.clone();
+        var_shape[axis_u] = 1;
+        let var_h = tensor_alloc_gpu(0, var_shape.as_ptr(), var_shape.len(), var_data.as_ptr());
+        unsafe { *var_out = var_h; }
+    }
+
+    tensor_alloc_gpu(0, tb.shape.as_ptr(), tb.shape.len(), norm_data.as_ptr())
+}
+
+#[no_mangle]
+pub extern "C" fn tensor_gelu(h: i64) -> i64 {
+    gpu_barrier();
+    let tb = unsafe { &*(h as *const TensorBuffer) };
+    let in_data = unsafe { std::slice::from_raw_parts(tb.buffer.contents() as *const f32, tb.len) };
+    const C0: f32 = 0.7978845608;
+    const C1: f32 = 0.044715;
+    let out_data: Vec<f32> = in_data.iter().map(|&x| {
+        let inner = C0 * (x + C1 * x * x * x);
+        0.5 * x * (1.0 + inner.tanh())
+    }).collect();
+    tensor_alloc_gpu(0, tb.shape.as_ptr(), tb.shape.len(), out_data.as_ptr())
+}
+
+/// Forward cross-entropy.  Computes softmax(logits) over the class axis (1),
+/// then -log(softmax[i, target[i]]) averaged over N.
+/// When `softmax_out` is non-null, writes the softmax tensor handle to
+/// `*softmax_out` for use by the VJP recorder.  Caller transfers ownership.
+#[no_mangle]
+pub extern "C" fn tensor_cross_entropy(logits: i64, targets: i64, softmax_out: *mut i64) -> i64 {
+    gpu_barrier();
+    let logits_tb = unsafe { &*(logits as *const TensorBuffer) };
+    let targets_tb = unsafe { &*(targets as *const TensorBuffer) };
+    if logits_tb.shape.len() != 2 {
+        panic!("malus: cross_entropy logits must be rank-2 [N, C], got shape {:?}", logits_tb.shape);
+    }
+    if targets_tb.shape.len() != 1 {
+        panic!("malus: cross_entropy targets must be rank-1 [N], got shape {:?}", targets_tb.shape);
+    }
+    let n = logits_tb.shape[0];
+    let c = logits_tb.shape[1];
+    if targets_tb.shape[0] != n {
+        panic!("malus: cross_entropy logits N={} but targets has {} elements", n, targets_tb.shape[0]);
+    }
+    let logits_data = unsafe {
+        std::slice::from_raw_parts(logits_tb.buffer.contents() as *const f32, logits_tb.len)
+    };
+    let targets_data = unsafe {
+        std::slice::from_raw_parts(targets_tb.buffer.contents() as *const f32, targets_tb.len)
+    };
+
+    let sm_data = softmax_axis_cpu(logits_data, &logits_tb.shape, 1);
+
+    let mut loss = 0.0f32;
+    for i in 0..n {
+        let t = targets_data[i] as usize;
+        if t >= c {
+            panic!("malus: cross_entropy target index {} out of range for C={}", t, c);
+        }
+        loss -= sm_data[i * c + t].ln();
+    }
+    loss /= n as f32;
+
+    if !softmax_out.is_null() {
+        let sm_shape = logits_tb.shape.clone();
+        let sm_h = tensor_alloc_gpu(0, sm_shape.as_ptr(), sm_shape.len(), sm_data.as_ptr());
+        unsafe { *softmax_out = sm_h; }
+    }
+
+    let loss_shape = [1usize];
+    tensor_alloc_gpu(0, loss_shape.as_ptr(), 1, [loss].as_ptr())
+}
+
+/// Returns a [T, T] causal mask: 0.0 on and below the diagonal, -1e9 above.
+#[no_mangle]
+pub extern "C" fn tensor_causal_mask(t_size: i64) -> i64 {
+    let t = t_size as usize;
+    let mut data = vec![0.0f32; t * t];
+    for i in 0..t {
+        for j in 0..t {
+            if j > i { data[i * t + j] = -1e9; }
+        }
+    }
+    let shape = [t, t];
+    tensor_alloc_gpu(0, shape.as_ptr(), 2, data.as_ptr())
 }
 
 // ── VJP helpers (pub(crate) for tape.rs) ─────────────────────────────────────

@@ -22,6 +22,10 @@ pub enum BuiltinKind {
     /// permute(t, p0..pn).  Normalized to positional [tensor, d0..dn] in check_call.
     /// Variable propagation: if arg0 is Variable the return type is Variable.
     TensorThenShapeArgs,
+    /// Axis-only: one tensor/variable positional arg + required named `axis=i32`.
+    /// No keepdim.  Normalized to positional [tensor, axis] in check_call.
+    /// Variable propagation: if arg0 is Variable the return type is Variable.
+    AxisOnly,
 }
 
 #[derive(Debug, Clone)]
@@ -100,6 +104,40 @@ pub fn register_builtins() -> HashMap<String, BuiltinSig> {
             return_placement: Some(Placement::Gpu),
         });
     }
+
+    // M18 transformer stdlib
+    // softmax(t, axis=N) — normalized exponentials over axis; same shape as input.
+    // layernorm(t, axis=N) — (x−μ)/σ over axis; no affine; same shape as input.
+    for name in &["softmax", "layernorm"] {
+        m.insert(name.to_string(), BuiltinSig {
+            kind: BuiltinKind::AxisOnly,
+            return_ty: tensor_f32.clone(),
+            return_placement: Some(Placement::Gpu),
+        });
+    }
+
+    // gelu(t) — elementwise tanh-approx GELU; like relu/sigmoid, Variable propagates.
+    m.insert("gelu".to_string(), BuiltinSig {
+        kind: BuiltinKind::Fixed(vec![tensor_f32.clone()]),
+        return_ty: tensor_f32.clone(),
+        return_placement: Some(Placement::Gpu),
+    });
+
+    // cross_entropy(logits: Variable<f32>, targets: Tensor<f32>) -> Variable<f32>
+    // Always returns Variable (always recorded on tape).
+    let var_f32 = ResolvedTy::Variable { dtype: ScalarTy::F32 };
+    m.insert("cross_entropy".to_string(), BuiltinSig {
+        kind: BuiltinKind::Fixed(vec![var_f32.clone(), tensor_f32.clone()]),
+        return_ty: var_f32,
+        return_placement: Some(Placement::Gpu),
+    });
+
+    // causal_mask(T: i64) -> Tensor<f32>  — [T, T] mask; non-differentiable.
+    m.insert("causal_mask".to_string(), BuiltinSig {
+        kind: BuiltinKind::Fixed(vec![ResolvedTy::Scalar(ScalarTy::I64)]),
+        return_ty: tensor_f32.clone(),
+        return_placement: Some(Placement::Gpu),
+    });
 
     // variable(t) -> Variable<f32> — wrap a Tensor in an RC Variable.
     m.insert("variable".to_string(), BuiltinSig {

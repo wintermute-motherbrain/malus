@@ -1087,6 +1087,10 @@ fn check_call(
             if let BuiltinKind::TensorThenShapeArgs = &sig.kind {
                 return check_shape_op_call(&callee_name, args, span, ctx);
             }
+            // AxisOnly builtins (softmax/layernorm) accept named arg axis= (required).
+            if let BuiltinKind::AxisOnly = &sig.kind {
+                return check_axis_only_call(&callee_name, args, span, ctx);
+            }
             let is_print_call = callee_name == "print" || callee_name == "println";
             let typed_args: Vec<TypedExpr> = match &sig.kind {
                 BuiltinKind::Variadic => {
@@ -1147,6 +1151,7 @@ fn check_call(
                 }
                 BuiltinKind::Reduction => unreachable!("Reduction handled above"),
                 BuiltinKind::TensorThenShapeArgs => unreachable!("TensorThenShapeArgs handled above"),
+                BuiltinKind::AxisOnly => unreachable!("AxisOnly handled above"),
             };
             // Validate format string arg count for print/println.
             if is_print_call {
@@ -1387,6 +1392,97 @@ fn check_reduction_call(
         TypedExprKind::Call {
             callee: callee.to_string(),
             args: vec![checked_tensor, checked_axis, checked_keepdim],
+        },
+        return_ty,
+        Some(Placement::Gpu),
+        span,
+    ))
+}
+
+// ── M18: AxisOnly builtins (softmax, layernorm) ──────────────────────────────
+// One positional tensor/variable arg + required named `axis=N`.
+// Normalizes to positional [tensor, axis].  Variable propagates to Variable output.
+
+fn check_axis_only_call(
+    callee: &str,
+    raw_args: &[CallArg],
+    span: Span,
+    ctx: &mut BodyCtx<'_>,
+) -> Option<TypedExpr> {
+    let tensor_f32 = ResolvedTy::Tensor { dtype: ScalarTy::F32 };
+
+    let mut tensor_raw: Option<&malus_syntax::ast::Expr> = None;
+    let mut axis_raw: Option<&malus_syntax::ast::Expr> = None;
+
+    for ca in raw_args {
+        match ca.name.as_deref() {
+            None => {
+                if tensor_raw.is_some() {
+                    let positional_count = raw_args.iter().filter(|a| a.name.is_none()).count();
+                    ctx.errors.push(SemaError::ArgCountMismatch {
+                        callee: callee.to_string(),
+                        expected: 1,
+                        found: positional_count,
+                        span,
+                    });
+                    return None;
+                }
+                tensor_raw = Some(&ca.value);
+            }
+            Some("axis") => axis_raw = Some(&ca.value),
+            Some(bad) => {
+                ctx.errors.push(SemaError::UnknownAxisArg {
+                    callee: callee.to_string(),
+                    name: bad.to_string(),
+                    span: ca.value.span,
+                });
+                return None;
+            }
+        }
+    }
+
+    let tensor_raw = match tensor_raw {
+        Some(e) => e,
+        None => {
+            ctx.errors.push(SemaError::ArgCountMismatch {
+                callee: callee.to_string(),
+                expected: 1,
+                found: 0,
+                span,
+            });
+            return None;
+        }
+    };
+
+    let axis_raw = match axis_raw {
+        Some(e) => e,
+        None => {
+            ctx.errors.push(SemaError::MissingAxisArg {
+                callee: callee.to_string(),
+                span,
+            });
+            return None;
+        }
+    };
+
+    let checked_tensor = check_expr(tensor_raw, Some(&tensor_f32), ctx)?;
+    let is_variable = checked_tensor.ty.is_variable();
+    let checked_axis = check_expr(axis_raw, Some(&ResolvedTy::Scalar(ScalarTy::I32)), ctx)?;
+
+    let return_ty = if is_variable {
+        if let ResolvedTy::Variable { dtype } = &checked_tensor.ty {
+            ResolvedTy::Variable { dtype: dtype.clone() }
+        } else {
+            tensor_f32
+        }
+    } else {
+        tensor_f32
+    };
+
+    Some(typed_expr(
+        TypedExprKind::Call {
+            callee: callee.to_string(),
+            args: vec![checked_tensor, checked_axis],
         },
         return_ty,
         Some(Placement::Gpu),

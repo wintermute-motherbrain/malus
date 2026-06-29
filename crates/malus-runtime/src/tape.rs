@@ -4,8 +4,8 @@ use std::collections::{HashMap, HashSet};
 use crate::metal::{
     broadcast_to_shape, gpu_barrier, invert_perm, normalize_perm, permute_by_perm,
     reshape_to, sum_to_shape, tensor_alloc_gpu, tensor_alloc_ones_gpu,
-    tensor_alloc_zeros_gpu, tensor_matmul, tensor_reduce_mean_axis, tensor_retain,
-    tensor_release, unsqueeze_at, TensorBuffer,
+    tensor_alloc_zeros_gpu, tensor_matmul, tensor_reduce_mean_axis, tensor_reduce_sum_axis,
+    tensor_retain, tensor_release, unsqueeze_at, TensorBuffer,
 };
 
 // ── OpTag ─────────────────────────────────────────────────────────────────────
@@ -38,6 +38,11 @@ pub enum OpTag {
     ReduceVarAxis    = 18,
     // M17 shapes + batched matmul
     Reshape          = 19,
+    // M18 transformer stdlib
+    Softmax          = 20,
+    Layernorm        = 21,
+    Gelu             = 22,
+    CrossEntropy     = 23,
 }
 
 impl OpTag {
@@ -63,6 +68,10 @@ impl OpTag {
             17 => OpTag::ReduceMaxAxis,
             18 => OpTag::ReduceVarAxis,
             19 => OpTag::Reshape,
+            20 => OpTag::Softmax,
+            21 => OpTag::Layernorm,
+            22 => OpTag::Gelu,
+            23 => OpTag::CrossEntropy,
             _  => panic!("malus: unknown op tag {tag}"),
         }
     }
@@ -175,6 +184,60 @@ pub extern "C" fn tape_record_perm(
     });
 }
 
+/// Record a layernorm op.  `var_h` is the population-variance tensor allocated
+/// by tensor_layernorm_axis with keepdim=1 at the reduced axis; the caller
+/// transfers ownership (refcount=1 from alloc, no extra retain needed).
+/// Retains x and out.  Releases var_h when recording is paused.
+#[no_mangle]
+pub extern "C" fn tape_record_layernorm(op_tag: i32, x: i64, out: i64, var_h: i64, axis: i64) {
+    if !RECORDING.with(|r| r.get()) {
+        tensor_release(var_h);
+        return;
+    }
+    tensor_retain(x);
+    tensor_retain(out);
+    // var_h: ownership transferred from caller (refcount=1 from alloc); no retain.
+    let op = OpTag::from_tag(op_tag);
+    NODES.with(|n| {
+        n.borrow_mut().push(TapeNode {
+            op,
+            saved: vec![x, var_h],
+            output: out,
+            meta: vec![axis],
+        });
+    });
+}
+
+/// Record a cross-entropy op.  `softmax_h` is the softmax output allocated by
+/// tensor_cross_entropy; caller transfers ownership.  Retains logits, out, and
+/// targets.  Releases softmax_h when recording is paused.
+#[no_mangle]
+pub extern "C" fn tape_record_cross_entropy(
+    op_tag: i32,
+    logits: i64,
+    out: i64,
+    softmax_h: i64,
+    targets: i64,
+) {
+    if !RECORDING.with(|r| r.get()) {
+        tensor_release(softmax_h);
+        return;
+    }
+    tensor_retain(logits);
+    tensor_retain(out);
+    // softmax_h: ownership transferred from caller; no retain.
+    tensor_retain(targets);
+    let op = OpTag::from_tag(op_tag);
+    NODES.with(|n| {
+        n.borrow_mut().push(TapeNode {
+            op,
+            saved: vec![logits, softmax_h, targets],
+            output: out,
+            meta: vec![],
+        });
+    });
+}
+
 /// Mark handle as a leaf.  Always executes regardless of RECORDING flag so
 /// that variable() inside a no_grad body still registers its leaf for the
 /// next training step.
@@ -278,11 +341,10 @@ pub extern "C" fn backward(loss: i64) {
 
         match node.op {
             OpTag::Matmul => {
-                // C = A @ B  →  dA = dC @ Bᵀ,  dB = Aᵀ @ dC
-                // Branches on rank: 2-D uses [1,0] perm; 3-D uses [0,2,1] (last-two swap).
                 let (a, b) = (node.saved[0], node.saved[1]);
-                let rank = tb(a).shape.len();
-                if rank == 2 {
+                let (rank_a, rank_b) = (tb(a).shape.len(), tb(b).shape.len());
+                if rank_a == 2 && rank_b == 2 {
+                    // C (M,N) = A (M,K) @ B (K,N)
                     let bt = permute_by_perm(b, &[1, 0]);
                     let da = tensor_matmul(dout, bt);
                     tensor_release(bt);
@@ -291,14 +353,28 @@ pub extern "C" fn backward(loss: i64) {
                     tensor_release(at);
                     accumulate_grad(&mut grads, a, da);
                     accumulate_grad(&mut grads, b, db);
-                } else {
-                    // 3-D batched: transpose last two dims of each operand.
+                } else if rank_a == 3 && rank_b == 3 {
+                    // C (B,M,N) = A (B,M,K) @ B (B,K,N)
                     let bt = permute_by_perm(b, &[0, 2, 1]);
                     let da = tensor_matmul(dout, bt);
                     tensor_release(bt);
                     let at = permute_by_perm(a, &[0, 2, 1]);
                     let db = tensor_matmul(at, dout);
                     tensor_release(at);
+                    accumulate_grad(&mut grads, a, da);
+                    accumulate_grad(&mut grads, b, db);
+                } else {
+                    // C (B,M,N) = A (B,M,K) @ B (K,N)
+                    // dA (B,M,K) = dC (B,M,N) @ Bᵀ (N,K)   [3D @ 2D]
+                    // dB (K,N)   = sum_b( Aᵀ[b] @ dC[b] ) = reduce_sum(Aᵀ (B,K,M) @ dC (B,M,N), axis=0)
+                    let bt = permute_by_perm(b, &[1, 0]);
+                    let da = tensor_matmul(dout, bt);     // (B,M,N) @ (N,K) → (B,M,K) via (3,2)
+                    tensor_release(bt);
+                    let at = permute_by_perm(a, &[0, 2, 1]);   // (B,K,M)
+                    let db_3d = tensor_matmul(at, dout);       // (B,K,M) @ (B,M,N) → (B,K,N)
+                    tensor_release(at);
+                    let db = tensor_reduce_sum_axis(db_3d, 0, 0); // sum batch → (K,N)
+                    tensor_release(db_3d);
                     accumulate_grad(&mut grads, a, da);
                     accumulate_grad(&mut grads, b, db);
                 }
@@ -543,6 +619,95 @@ pub extern "C" fn backward(loss: i64) {
                 tensor_release(dout_bc);
                 tensor_release(scaled);
                 accumulate_grad(&mut grads, x, dx);
+            }
+            OpTag::Softmax => {
+                // s = softmax(x, axis)  →  dx = s ⊙ (dout − sum(dout⊙s, axis, keepdim=1))
+                let x = node.saved[0];
+                let s = node.output;
+                let axis = node.meta[0];
+                let x_shape = tb(x).shape.clone();
+                let dout_s = elem_mul(dout, s);
+                let sum_ds = tensor_reduce_sum_axis(dout_s, axis, 1);
+                tensor_release(dout_s);
+                let sum_bc = broadcast_to_shape(sum_ds, &x_shape);
+                tensor_release(sum_ds);
+                let diff = elem_sub(dout, sum_bc);
+                tensor_release(sum_bc);
+                let dx = elem_mul(s, diff);
+                tensor_release(diff);
+                accumulate_grad(&mut grads, x, dx);
+            }
+            OpTag::Layernorm => {
+                // y = (x − μ) / σ,  σ = sqrt(var + 1e-5)
+                // dx = (1/σ) · (dy − mean(dy, axis, k) − y ⊙ mean(dy⊙y, axis, k))
+                let x = node.saved[0];
+                let var_h = node.saved[1];
+                let y = node.output;
+                let axis = node.meta[0];
+                let x_shape = tb(x).shape.clone();
+                // 1/σ (keepdim shape matching var_h)
+                let inv_sigma_h = elem_apply(var_h, |v| 1.0 / (v + 1e-5_f32).sqrt());
+                let inv_sigma_bc = broadcast_to_shape(inv_sigma_h, &x_shape);
+                tensor_release(inv_sigma_h);
+                // mean(dy, axis, keepdim=1) broadcast
+                let dy_mean_h = tensor_reduce_mean_axis(dout, axis, 1);
+                let dy_mean_bc = broadcast_to_shape(dy_mean_h, &x_shape);
+                tensor_release(dy_mean_h);
+                // mean(dy ⊙ y, axis, keepdim=1) broadcast
+                let dy_y = elem_mul(dout, y);
+                let dy_y_mean_h = tensor_reduce_mean_axis(dy_y, axis, 1);
+                tensor_release(dy_y);
+                let dy_y_mean_bc = broadcast_to_shape(dy_y_mean_h, &x_shape);
+                tensor_release(dy_y_mean_h);
+                // y ⊙ mean(dy⊙y)
+                let y_term = elem_mul(y, dy_y_mean_bc);
+                tensor_release(dy_y_mean_bc);
+                // dy − mean(dy) − y⊙mean(dy⊙y)
+                let tmp = elem_sub(dout, dy_mean_bc);
+                tensor_release(dy_mean_bc);
+                let numer = elem_sub(tmp, y_term);
+                tensor_release(tmp);
+                tensor_release(y_term);
+                let dx = elem_mul(numer, inv_sigma_bc);
+                tensor_release(numer);
+                tensor_release(inv_sigma_bc);
+                accumulate_grad(&mut grads, x, dx);
+            }
+            OpTag::Gelu => {
+                // y = 0.5·x·(1 + tanh(g)),  g = c0·(x + c1·x³)
+                // dy/dx = 0.5·(1+t) + 0.5·x·(1−t²)·g',  t = tanh(g),  g' = c0·(1 + 3·c1·x²)
+                let x = node.saved[0];
+                const C0: f32 = 0.7978845608;
+                const C1: f32 = 0.044715;
+                let gelu_deriv = elem_apply(x, |xi| {
+                    let g  = C0 * (xi + C1 * xi * xi * xi);
+                    let t  = g.tanh();
+                    let gp = C0 * (1.0 + 3.0 * C1 * xi * xi);
+                    0.5 * (1.0 + t) + 0.5 * xi * (1.0 - t * t) * gp
+                });
+                let dx = elem_mul(dout, gelu_deriv);
+                tensor_release(gelu_deriv);
+                accumulate_grad(&mut grads, x, dx);
+            }
+            OpTag::CrossEntropy => {
+                // L = −mean(log(s[i, t[i]])),  s = softmax(logits, axis=1)
+                // d_logits[i,j] = dout[0]/N · (s[i,j] − 1{j == t[i]})
+                let logits  = node.saved[0];
+                let sm_h    = node.saved[1];
+                let targets = node.saved[2];
+                let n = tb(logits).shape[0];
+                let c = tb(logits).shape[1];
+                let scale = read(dout)[0] / n as f32;
+                let mut grad_data = read(sm_h);
+                let t_data = read(targets);
+                for i in 0..n {
+                    let t = t_data[i] as usize;
+                    grad_data[i * c + t] -= 1.0;
+                }
+                for v in grad_data.iter_mut() { *v *= scale; }
+                let logits_shape = tb(logits).shape.clone();
+                let dx = tensor_alloc_gpu(0, logits_shape.as_ptr(), logits_shape.len(), grad_data.as_ptr());
+                accumulate_grad(&mut grads, logits, dx);
             }
         }
     }

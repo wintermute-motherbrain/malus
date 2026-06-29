@@ -183,6 +183,28 @@ _Avoid_: List, dynamic array, vector
 A mutable binding declared with `let mut x = expr`. Can be reassigned with `x = new_val`. CTMM treats reassignment as: drop the old value (if tensor, emit `tensor_free` or `tensor_release`), then bind the new value. Prevents the shadowing-in-loops problem where `let x = x + delta` inside a loop scopes the new `x` to the loop body.
 _Avoid_: Mutable variable (fine as informal description; just not a technical term)
 
+### Transformer stdlib (M18)
+
+**softmax** (M18):
+Numerically stable softmax over a named required `axis=N` dimension. `softmax(t, axis=2)` returns a tensor of the same shape with exponentials normalized over axis 2. Differentiable; VJP: `dx = s ⊙ (dout − sum(dout⊙s, axis, keepdim))` where `s` is the forward output. Subset divergence from PyTorch: same contract (`torch.softmax(t, dim=N)`).
+_Avoid_: normalized exponential, log-softmax (different op)
+
+**layernorm** (M18):
+Layer normalization over a named required `axis=N` dimension: `y = (x − μ) / sqrt(var(x, axis) + 1e-5)`. No learnable affine parameters (γ/β) in M18 — users compose their own `y * gamma + beta` after the call using `Variable` arithmetic. Differentiable. PyTorch subset: `torch.layer_norm` additionally accepts `weight`/`bias` tensors; the malus single-axis form is additive.
+_Avoid_: batch norm (different algorithm), RMS norm (different normalization)
+
+**gelu** (M18):
+Gaussian Error Linear Unit activation, tanh approximation: `0.5 * x * (1 + tanh(c0 * (x + c1 * x^3)))`, `c0=0.7978845608`, `c1=0.044715`. Differentiable. PyTorch subset divergence: PyTorch's default `gelu` uses the exact `erf` formulation; the tanh-approx (PyTorch's `gelu(approximate='tanh')`) is the malus default. Additive post-V3.
+_Avoid_: ReLU, SiLU (different activations)
+
+**cross_entropy** (M18):
+Cross-entropy loss: `cross_entropy(logits: Variable<f32> [N,C], targets: Tensor<f32> [N]) -> Variable<f32> [1]`. Applies softmax internally (numerically stable) and computes `-mean(log(s[i, targets[i]]))`. Targets are a float placeholder in M18 (read as `targets[i] as usize`); M19 tightens the type to `Tensor<i32>` additively per ADR-0022. Differentiable; VJP: `d_logits[i,j] = dout/N * (s[i,j] − 1{j == targets[i]})`.
+_Avoid_: NLL loss (expects log-probabilities, not logits), softmax cross-entropy (redundant; the softmax is fused inside)
+
+**causal_mask** (M18):
+`causal_mask(T: i64) -> Tensor<f32>`. Returns a `[T, T]` additive mask: `0.0` on and below the main diagonal, `-1e9` strictly above. Added to attention logits before softmax so future positions receive ~0 attention weight. Non-differentiable (no tape entry). PyTorch equivalent: `torch.triu(torch.full((T,T),-1e9), diagonal=1)`.
+_Avoid_: attention mask (overloaded), upper-triangular mask (imprecise)
+
 ### Optimization
 
 **AdamW**:

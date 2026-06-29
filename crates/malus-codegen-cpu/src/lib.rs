@@ -129,6 +129,14 @@ pub struct RuntimeSymbols {
     pub tensor_reshape:            extern "C" fn(i64, *const usize, usize) -> i64,
     pub tensor_permute:            extern "C" fn(i64, *const usize, usize) -> i64,
     pub tape_record_perm:          extern "C" fn(i32, i64, i64, *const usize, usize),
+    // M18 transformer stdlib.
+    pub tensor_softmax_axis:       extern "C" fn(i64, i64) -> i64,
+    pub tensor_layernorm_axis:     extern "C" fn(i64, i64, *mut i64) -> i64,
+    pub tensor_gelu:               extern "C" fn(i64) -> i64,
+    pub tensor_cross_entropy:      extern "C" fn(i64, i64, *mut i64) -> i64,
+    pub tensor_causal_mask:        extern "C" fn(i64) -> i64,
+    pub tape_record_layernorm:     extern "C" fn(i32, i64, i64, i64, i64),
+    pub tape_record_cross_entropy: extern "C" fn(i32, i64, i64, i64, i64),
 }
 
 // ── Error ─────────────────────────────────────────────────────────────────────
@@ -189,6 +197,10 @@ const OPTAG_REDUCE_MEAN_AXIS: i32 = 16;
 const OPTAG_REDUCE_MAX_AXIS:  i32 = 17;
 const OPTAG_REDUCE_VAR_AXIS:  i32 = 18;
 const OPTAG_RESHAPE:          i32 = 19;
+const OPTAG_SOFTMAX:          i32 = 20;
+const OPTAG_LAYERNORM:        i32 = 21;
+const OPTAG_GELU:             i32 = 22;
+const OPTAG_CROSS_ENTROPY:    i32 = 23;
 
 fn binop_to_optag(op: &BinOp) -> Option<i32> {
     match op {
@@ -210,6 +222,7 @@ fn unary_builtin_to_optag(name: &str) -> Option<i32> {
         "log"       => Some(OPTAG_LOG),
         "sqrt"      => Some(OPTAG_SQRT),
         "abs"       => Some(OPTAG_ABS),
+        "gelu"      => Some(OPTAG_GELU),
         "sum"       => Some(OPTAG_SUM),
         "transpose" => Some(OPTAG_TRANSPOSE),
         _ => None,
@@ -340,6 +353,14 @@ struct Codegen<'m> {
     rt_tensor_reshape:          FuncId,
     rt_tensor_permute:          FuncId,
     rt_tape_record_perm:        FuncId,
+    // M18: transformer stdlib.
+    rt_tensor_softmax_axis:        FuncId,
+    rt_tensor_layernorm_axis:      FuncId,
+    rt_tensor_gelu:                FuncId,
+    rt_tensor_cross_entropy:       FuncId,
+    rt_tensor_causal_mask:         FuncId,
+    rt_tape_record_layernorm:      FuncId,
+    rt_tape_record_cross_entropy:  FuncId,
 }
 
 impl<'m> Codegen<'m> {
@@ -1407,6 +1428,24 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                         _      => unreachable!(),
                     };
                     self.lower_axis_reduction(op_tag, expr.ty.is_variable(), args)
+                } else if callee == "softmax" {
+                    self.lower_softmax(expr.ty.is_variable(), args)
+                } else if callee == "layernorm" {
+                    self.lower_layernorm(expr.ty.is_variable(), args)
+                } else if callee == "gelu" {
+                    // Unary eager-CPU builtin (like relu/sigmoid but not a GPU kernel).
+                    let x = self.lower_expr(&args[0])?;
+                    let func_ref = self.import_func(self.codegen.rt_tensor_gelu);
+                    let call = self.builder.ins().call(func_ref, &[x]);
+                    let out  = self.builder.inst_results(call).to_vec()[0];
+                    if expr.ty.is_variable() {
+                        self.call_tape_record_unary(OPTAG_GELU, x, out);
+                    }
+                    Ok(out)
+                } else if callee == "cross_entropy" {
+                    self.lower_cross_entropy(args)
+                } else if callee == "causal_mask" {
+                    self.lower_causal_mask(args)
                 } else if callee == "variable" {
                     // variable(t) — wrap Tensor in Variable: retain + tape_register_leaf.
                     let handle = self.lower_expr(&args[0])?;
@@ -2146,6 +2185,119 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
         self.builder.ins().call(func_ref, &[tag_val, x, out, dims_ptr, ndims]);
     }
 
+    // M18 helpers.
+
+    fn call_tape_record_layernorm(
+        &mut self,
+        op_tag: i32,
+        x:     cranelift_codegen::ir::Value,
+        out:   cranelift_codegen::ir::Value,
+        var_h: cranelift_codegen::ir::Value,
+        axis:  cranelift_codegen::ir::Value,
+    ) {
+        let tag_val = self.builder.ins().iconst(I32, op_tag as i64);
+        let func_ref = self.import_func(self.codegen.rt_tape_record_layernorm);
+        // sig: (I32, I64, I64, I64, I64)
+        self.builder.ins().call(func_ref, &[tag_val, x, out, var_h, axis]);
+    }
+
+    fn call_tape_record_cross_entropy(
+        &mut self,
+        op_tag:  i32,
+        logits:  cranelift_codegen::ir::Value,
+        out:     cranelift_codegen::ir::Value,
+        sm_h:    cranelift_codegen::ir::Value,
+        targets: cranelift_codegen::ir::Value,
+    ) {
+        let tag_val = self.builder.ins().iconst(I32, op_tag as i64);
+        let func_ref = self.import_func(self.codegen.rt_tape_record_cross_entropy);
+        // sig: (I32, I64, I64, I64, I64)
+        self.builder.ins().call(func_ref, &[tag_val, logits, out, sm_h, targets]);
+    }
+
+    /// softmax(t, axis=N) — axis-only builtin.
+    /// is_variable: whether result is Variable (Variable propagates from arg0).
+    fn lower_softmax(
+        &mut self,
+        is_variable: bool,
+        args: &[malus_sema::TypedExpr],
+    ) -> Result<cranelift_codegen::ir::Value, CodegenError> {
+        let x    = self.lower_expr(&args[0])?;
+        // axis_expr lowers to I64 (malus integer literals are always I64).
+        let axis = self.lower_expr(&args[1])?;
+        let func_ref = self.import_func(self.codegen.rt_tensor_softmax_axis);
+        let call = self.builder.ins().call(func_ref, &[x, axis]);
+        let out  = self.builder.inst_results(call).to_vec()[0];
+        if is_variable {
+            // Reuse tape_record_reduce: saved=[x], output=out, meta=[axis,0].
+            let keepdim_zero = self.builder.ins().iconst(I64, 0);
+            self.call_tape_record_reduce(OPTAG_SOFTMAX, x, out, axis, keepdim_zero);
+        }
+        Ok(out)
+    }
+
+    /// layernorm(t, axis=N) — axis-only builtin.
+    fn lower_layernorm(
+        &mut self,
+        is_variable: bool,
+        args: &[malus_sema::TypedExpr],
+    ) -> Result<cranelift_codegen::ir::Value, CodegenError> {
+        let x      = self.lower_expr(&args[0])?;
+        let axis   = self.lower_expr(&args[1])?;
+        let ptr_ty = self.codegen.ptr_type();
+        if is_variable {
+            // Allocate 8-byte stack slot to receive the var tensor handle back.
+            let slot = self.builder.create_sized_stack_slot(
+                cranelift_codegen::ir::StackSlotData::new(
+                    cranelift_codegen::ir::StackSlotKind::ExplicitSlot, 8, 3));
+            let var_ptr = self.builder.ins().stack_addr(ptr_ty, slot, 0);
+            let func_ref = self.import_func(self.codegen.rt_tensor_layernorm_axis);
+            let call  = self.builder.ins().call(func_ref, &[x, axis, var_ptr]);
+            let out   = self.builder.inst_results(call).to_vec()[0];
+            let var_h = self.builder.ins().stack_load(I64, slot, 0);
+            self.call_tape_record_layernorm(OPTAG_LAYERNORM, x, out, var_h, axis);
+            Ok(out)
+        } else {
+            // Pass null var_out — runtime skips the var allocation.
+            let null = self.builder.ins().iconst(ptr_ty, 0);
+            let func_ref = self.import_func(self.codegen.rt_tensor_layernorm_axis);
+            let call = self.builder.ins().call(func_ref, &[x, axis, null]);
+            Ok(self.builder.inst_results(call).to_vec()[0])
+        }
+    }
+
+    /// cross_entropy(logits: Variable<f32>, targets: Tensor<f32>) -> Variable<f32>
+    fn lower_cross_entropy(
+        &mut self,
+        args: &[malus_sema::TypedExpr],
+    ) -> Result<cranelift_codegen::ir::Value, CodegenError> {
+        let logits  = self.lower_expr(&args[0])?;
+        let targets = self.lower_expr(&args[1])?;
+        let ptr_ty  = self.codegen.ptr_type();
+        // Allocate 8-byte slot to receive the softmax handle.
+        let slot = self.builder.create_sized_stack_slot(
+            cranelift_codegen::ir::StackSlotData::new(
+                cranelift_codegen::ir::StackSlotKind::ExplicitSlot, 8, 3));
+        let sm_ptr  = self.builder.ins().stack_addr(ptr_ty, slot, 0);
+        let func_ref = self.import_func(self.codegen.rt_tensor_cross_entropy);
+        let call    = self.builder.ins().call(func_ref, &[logits, targets, sm_ptr]);
+        let out     = self.builder.inst_results(call).to_vec()[0];
+        let sm_h    = self.builder.ins().stack_load(I64, slot, 0);
+        self.call_tape_record_cross_entropy(OPTAG_CROSS_ENTROPY, logits, out, sm_h, targets);
+        Ok(out)
+    }
+
+    /// causal_mask(T: i64) -> Tensor<f32>
+    fn lower_causal_mask(
+        &mut self,
+        args: &[malus_sema::TypedExpr],
+    ) -> Result<cranelift_codegen::ir::Value, CodegenError> {
+        let t = self.lower_expr(&args[0])?;
+        let func_ref = self.import_func(self.codegen.rt_tensor_causal_mask);
+        let call = self.builder.ins().call(func_ref, &[t]);
+        Ok(self.builder.inst_results(call).to_vec()[0])
+    }
+
     /// Lower reshape(t, d0..dn), transpose(t[, i, j]), or permute(t, p0..pn).
     /// args[0] = tensor/variable; args[1..] = dim args (may be empty for no-arg transpose).
     fn lower_shape_op(
@@ -2276,6 +2428,14 @@ pub fn compile_and_run(
     jit_builder.symbol("tensor_reshape",         symbols.tensor_reshape         as *const u8);
     jit_builder.symbol("tensor_permute",         symbols.tensor_permute         as *const u8);
     jit_builder.symbol("tape_record_perm",       symbols.tape_record_perm       as *const u8);
+    // M18 transformer stdlib.
+    jit_builder.symbol("tensor_softmax_axis",       symbols.tensor_softmax_axis       as *const u8);
+    jit_builder.symbol("tensor_layernorm_axis",     symbols.tensor_layernorm_axis     as *const u8);
+    jit_builder.symbol("tensor_gelu",               symbols.tensor_gelu               as *const u8);
+    jit_builder.symbol("tensor_cross_entropy",      symbols.tensor_cross_entropy      as *const u8);
+    jit_builder.symbol("tensor_causal_mask",        symbols.tensor_causal_mask        as *const u8);
+    jit_builder.symbol("tape_record_layernorm",     symbols.tape_record_layernorm     as *const u8);
+    jit_builder.symbol("tape_record_cross_entropy", symbols.tape_record_cross_entropy as *const u8);
 
     let mut module = JITModule::new(jit_builder);
     let ptr = module.target_config().pointer_type();
@@ -2548,6 +2708,66 @@ pub fn compile_and_run(
     let rt_tape_record_perm = module.declare_function("tape_record_perm", Linkage::Import, &sig_tape_record_perm)
         .map_err(|e| CodegenError::JitError(e.to_string()))?;
 
+    // M18: tensor_softmax_axis(h: i64, axis: i64) -> i64
+    let sig_axis_op = {
+        let mut s = Signature::new(call_conv);
+        s.params.push(AbiParam::new(I64)); // h
+        s.params.push(AbiParam::new(I64)); // axis
+        s.returns.push(AbiParam::new(I64));
+        s
+    };
+    let rt_tensor_softmax_axis = module.declare_function("tensor_softmax_axis", Linkage::Import, &sig_axis_op)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
+    // M18: tensor_layernorm_axis(h: i64, axis: i64, var_out: *mut i64) -> i64
+    let sig_layernorm = {
+        let mut s = Signature::new(call_conv);
+        s.params.push(AbiParam::new(I64)); // h
+        s.params.push(AbiParam::new(I64)); // axis
+        s.params.push(AbiParam::new(ptr)); // var_out (*mut i64)
+        s.returns.push(AbiParam::new(I64));
+        s
+    };
+    let rt_tensor_layernorm_axis = module.declare_function("tensor_layernorm_axis", Linkage::Import, &sig_layernorm)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
+    // M18: tensor_gelu(h: i64) -> i64
+    let sig_unary_cpu = {
+        let mut s = Signature::new(call_conv);
+        s.params.push(AbiParam::new(I64));
+        s.returns.push(AbiParam::new(I64));
+        s
+    };
+    let rt_tensor_gelu = module.declare_function("tensor_gelu", Linkage::Import, &sig_unary_cpu)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
+    // M18: tensor_cross_entropy(logits: i64, targets: i64, softmax_out: *mut i64) -> i64
+    let sig_cross_entropy = {
+        let mut s = Signature::new(call_conv);
+        s.params.push(AbiParam::new(I64)); // logits
+        s.params.push(AbiParam::new(I64)); // targets
+        s.params.push(AbiParam::new(ptr)); // softmax_out (*mut i64)
+        s.returns.push(AbiParam::new(I64));
+        s
+    };
+    let rt_tensor_cross_entropy = module.declare_function("tensor_cross_entropy", Linkage::Import, &sig_cross_entropy)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
+    // M18: tensor_causal_mask(t_size: i64) -> i64
+    let rt_tensor_causal_mask = module.declare_function("tensor_causal_mask", Linkage::Import, &sig_unary_cpu)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
+    // M18: tape_record_layernorm(op: i32, x: i64, out: i64, var_h: i64, axis: i64)
+    //      tape_record_cross_entropy(op: i32, logits: i64, out: i64, sm_h: i64, targets: i64)
+    let sig_tape_saved_axis = {
+        let mut s = Signature::new(call_conv);
+        s.params.push(AbiParam::new(I32)); // op_tag
+        s.params.push(AbiParam::new(I64)); // x / logits
+        s.params.push(AbiParam::new(I64)); // out
+        s.params.push(AbiParam::new(I64)); // var_h / sm_h
+        s.params.push(AbiParam::new(I64)); // axis / targets
+        s
+    };
+    let rt_tape_record_layernorm = module.declare_function("tape_record_layernorm", Linkage::Import, &sig_tape_saved_axis)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
+    let rt_tape_record_cross_entropy = module.declare_function("tape_record_cross_entropy", Linkage::Import, &sig_tape_saved_axis)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
+
     // First pass: declare all user fn signatures.
     let mut func_ids: HashMap<String, FuncId> = HashMap::new();
     for typed_fn in &program.fns {
@@ -2612,6 +2832,13 @@ pub fn compile_and_run(
         rt_tensor_reshape,
         rt_tensor_permute,
         rt_tape_record_perm,
+        rt_tensor_softmax_axis,
+        rt_tensor_layernorm_axis,
+        rt_tensor_gelu,
+        rt_tensor_cross_entropy,
+        rt_tensor_causal_mask,
+        rt_tape_record_layernorm,
+        rt_tape_record_cross_entropy,
     };
 
     // Second pass: compile each fn body.

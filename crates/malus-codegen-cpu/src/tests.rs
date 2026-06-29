@@ -239,6 +239,75 @@ extern "C" fn mock_tape_record_perm(
     _op: i32, _x: i64, _out: i64, _dims_ptr: *const usize, _ndims: usize,
 ) {}
 
+// M18 mocks.
+extern "C" fn mock_tensor_softmax_axis(h: i64, _axis: i64) -> i64 {
+    let data = with_store(|s| s.get_data(h));
+    let exp_data: Vec<f32> = data.iter().map(|x| x.exp()).collect();
+    let sum: f32 = exp_data.iter().sum();
+    let sm: Vec<f32> = exp_data.iter().map(|x| x / sum).collect();
+    let n = sm.len();
+    with_store(|s| s.insert(sm, vec![n]))
+}
+extern "C" fn mock_tensor_layernorm_axis(h: i64, _axis: i64, var_out: *mut i64) -> i64 {
+    let data = with_store(|s| s.get_data(h));
+    let n = data.len() as f32;
+    let mean: f32 = data.iter().sum::<f32>() / n;
+    let var: f32 = data.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / n;
+    let sigma = (var + 1e-5).sqrt();
+    let norm: Vec<f32> = data.iter().map(|x| (x - mean) / sigma).collect();
+    let len = norm.len();
+    if !var_out.is_null() {
+        let v = with_store(|s| s.insert(vec![var], vec![1]));
+        unsafe { *var_out = v; }
+    }
+    with_store(|s| s.insert(norm, vec![len]))
+}
+extern "C" fn mock_tensor_gelu(h: i64) -> i64 {
+    const C0: f32 = 0.7978845608;
+    const C1: f32 = 0.044715;
+    let data = with_store(|s| s.get_data(h));
+    let out: Vec<f32> = data.iter().map(|&x| {
+        let g = C0 * (x + C1 * x * x * x);
+        0.5 * x * (1.0 + g.tanh())
+    }).collect();
+    let n = out.len();
+    with_store(|s| s.insert(out, vec![n]))
+}
+extern "C" fn mock_tensor_cross_entropy(logits: i64, targets: i64, softmax_out: *mut i64) -> i64 {
+    let log_data = with_store(|s| s.get_data(logits));
+    let tgt_data = with_store(|s| s.get_data(targets));
+    let n = tgt_data.len();
+    let c = log_data.len() / n;
+    let mut sm = Vec::with_capacity(n * c);
+    for i in 0..n {
+        let row = &log_data[i*c..(i+1)*c];
+        let max: f32 = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let exps: Vec<f32> = row.iter().map(|x| (x - max).exp()).collect();
+        let s: f32 = exps.iter().sum();
+        sm.extend(exps.iter().map(|x| x / s));
+    }
+    if !softmax_out.is_null() {
+        let sh = with_store(|s| s.insert(sm.clone(), vec![n, c]));
+        unsafe { *softmax_out = sh; }
+    }
+    let loss: f32 = (0..n).map(|i| -sm[i*c + tgt_data[i] as usize].ln()).sum::<f32>() / n as f32;
+    with_store(|s| s.insert(vec![loss], vec![1]))
+}
+extern "C" fn mock_tensor_causal_mask(t_size: i64) -> i64 {
+    let t = t_size as usize;
+    let data: Vec<f32> = (0..t*t).map(|i| {
+        let (r, c) = (i / t, i % t);
+        if c > r { -1e9 } else { 0.0 }
+    }).collect();
+    with_store(|s| s.insert(data, vec![t, t]))
+}
+extern "C" fn mock_tape_record_layernorm(
+    _op: i32, _x: i64, _out: i64, _var_h: i64, _axis: i64,
+) {}
+extern "C" fn mock_tape_record_cross_entropy(
+    _op: i32, _logits: i64, _out: i64, _sm_h: i64, _targets: i64,
+) {}
+
 fn mock_symbols() -> RuntimeSymbols {
     RuntimeSymbols {
         tensor_alloc_gpu:       mock_tensor_alloc_gpu,
@@ -275,6 +344,14 @@ fn mock_symbols() -> RuntimeSymbols {
         tensor_reshape:         mock_tensor_reshape,
         tensor_permute:         mock_tensor_permute,
         tape_record_perm:       mock_tape_record_perm,
+        // M18 mocks.
+        tensor_softmax_axis:       mock_tensor_softmax_axis,
+        tensor_layernorm_axis:     mock_tensor_layernorm_axis,
+        tensor_gelu:               mock_tensor_gelu,
+        tensor_cross_entropy:      mock_tensor_cross_entropy,
+        tensor_causal_mask:        mock_tensor_causal_mask,
+        tape_record_layernorm:     mock_tape_record_layernorm,
+        tape_record_cross_entropy: mock_tape_record_cross_entropy,
     }
 }
 

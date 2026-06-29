@@ -61,6 +61,11 @@ pub enum SemaError {
     UnknownReductionArg { name: String, span: Span },
     /// `mean`, `max`, or `var` require an `axis=N` argument.
     MissingReductionAxis { callee: String, span: Span },
+    // ── M18: transformer stdlib ──────────────────────────────────────────────
+    /// Unknown keyword argument passed to an AxisOnly builtin (softmax, layernorm).
+    UnknownAxisArg { callee: String, name: String, span: Span },
+    /// softmax/layernorm require a named `axis=N` argument.
+    MissingAxisArg { callee: String, span: Span },
 }
 
 impl SemaError {
@@ -102,7 +107,9 @@ impl SemaError {
             | TupleTooShort { span }
             | EarlyExitInNoGrad { span }
             | UnknownReductionArg { span, .. }
-            | MissingReductionAxis { span, .. } => Some(*span),
+            | MissingReductionAxis { span, .. }
+            | UnknownAxisArg { span, .. }
+            | MissingAxisArg { span, .. } => Some(*span),
             DuplicateDefinition { second, .. } | DuplicateTypeDefinition { second, .. } => Some(*second),
             MainNotFound => None,
         }
@@ -157,6 +164,8 @@ impl SemaError {
             EarlyExitInNoGrad { .. } => "early exit inside no_grad block",
             UnknownReductionArg { .. } => "unknown keyword argument",
             MissingReductionAxis { .. } => "axis= is required",
+            UnknownAxisArg { .. } => "unknown keyword argument",
+            MissingAxisArg { .. } => "axis= is required",
             MainNotFound => "",
         }
     }
@@ -261,6 +270,10 @@ impl fmt::Display for SemaError {
                 write!(f, "unknown keyword argument '{}' — only `axis` and `keepdim` are accepted", name),
             SemaError::MissingReductionAxis { callee, .. } =>
                 write!(f, "'{}' requires an `axis=N` argument", callee),
+            SemaError::UnknownAxisArg { callee, name, .. } =>
+                write!(f, "'{}': unknown keyword argument '{}' — only `axis` is accepted", callee, name),
+            SemaError::MissingAxisArg { callee, .. } =>
+                write!(f, "'{}' requires a named `axis=N` argument", callee),
         }
     }
 }

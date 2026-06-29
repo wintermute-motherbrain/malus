@@ -44,6 +44,14 @@ fn real_symbols() -> RuntimeSymbols {
         tensor_reshape:         malus_runtime::tensor_reshape,
         tensor_permute:         malus_runtime::tensor_permute,
         tape_record_perm:       malus_runtime::tape_record_perm,
+        // M18 transformer stdlib.
+        tensor_softmax_axis:       malus_runtime::tensor_softmax_axis,
+        tensor_layernorm_axis:     malus_runtime::tensor_layernorm_axis,
+        tensor_gelu:               malus_runtime::tensor_gelu,
+        tensor_cross_entropy:      malus_runtime::tensor_cross_entropy,
+        tensor_causal_mask:        malus_runtime::tensor_causal_mask,
+        tape_record_layernorm:     malus_runtime::tape_record_layernorm,
+        tape_record_cross_entropy: malus_runtime::tape_record_cross_entropy,
     }
 }
 

@@ -13,6 +13,9 @@ pub use metal::{
     tensor_broadcast_add, tensor_broadcast_sub, tensor_broadcast_mul, tensor_broadcast_div,
     tensor_reduce_sum_axis, tensor_reduce_mean_axis, tensor_reduce_max_axis, tensor_reduce_var_axis,
     tensor_reshape, tensor_permute,
+    // M18 transformer stdlib
+    tensor_softmax_axis, tensor_layernorm_axis, tensor_gelu,
+    tensor_cross_entropy, tensor_causal_mask,
     kernel_dispatch, gpu_barrier, Dtype, TensorBuffer,
 };
 
@@ -22,6 +25,8 @@ mod tape;
 #[cfg(target_os = "macos")]
 pub use tape::{
     tape_record_binop, tape_record_unary, tape_record_reduce, tape_record_perm,
+    // M18 transformer stdlib recorders
+    tape_record_layernorm, tape_record_cross_entropy,
     tape_register_leaf,
     tape_pause, tape_resume, tape_get_grad, tape_clear,
     backward, tape_zero_grad, OpTag, tape_reset,

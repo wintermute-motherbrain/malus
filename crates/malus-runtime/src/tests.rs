@@ -413,6 +413,10 @@ fn test_optag_from_tag_drift() {
     assert_eq!(OpTag::from_tag(17), OpTag::ReduceMaxAxis);
     assert_eq!(OpTag::from_tag(18), OpTag::ReduceVarAxis);
     assert_eq!(OpTag::from_tag(19), OpTag::Reshape);
+    assert_eq!(OpTag::from_tag(20), OpTag::Softmax);
+    assert_eq!(OpTag::from_tag(21), OpTag::Layernorm);
+    assert_eq!(OpTag::from_tag(22), OpTag::Gelu);
+    assert_eq!(OpTag::from_tag(23), OpTag::CrossEntropy);
 }
 
 #[test]
