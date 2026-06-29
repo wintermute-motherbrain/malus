@@ -8,7 +8,7 @@ fn main():
     backward(loss)
 
     println("b.grad:")
-    tensor_print(b.grad)
+    println(b.grad)
     println("m.grad:")
-    tensor_print(m.grad)
+    println(m.grad)
     println("broadcasting + axis reductions: OK")

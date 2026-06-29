@@ -12,7 +12,7 @@ fn main():
     backward(loss)
 
     println("w.grad:")
-    tensor_print(w.grad)
+    println(w.grad)
 
     with no_grad:
         let dummy = w * w

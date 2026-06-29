@@ -17,4 +17,4 @@ fn main():
             escaped = pt
         Empty:
             escaped = make_point(0.0)
-    tensor_print(zeros(1))
+    println(zeros(1))

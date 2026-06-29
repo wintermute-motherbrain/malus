@@ -8,5 +8,5 @@ fn main():
     let a = variable(ones(2, 2))
     let b = identity(a)
     let c = variable(zeros(3, 3))
-    tensor_print(b.data)
-    tensor_print(c.data)
+    println(b.data)
+    println(c.data)
