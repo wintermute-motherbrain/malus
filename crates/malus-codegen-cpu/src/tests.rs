@@ -307,6 +307,9 @@ extern "C" fn mock_tape_record_layernorm(
 extern "C" fn mock_tape_record_cross_entropy(
     _op: i32, _logits: i64, _out: i64, _sm_h: i64, _targets: i64,
 ) {}
+extern "C" fn mock_tensor_embedding(_weight: i64, _indices: i64) -> i64 { 0 }
+extern "C" fn mock_tensor_randn(_shape_ptr: *const usize, _ndims: usize) -> i64 { 0 }
+extern "C" fn mock_tape_record_embedding(_op: i32, _weight: i64, _indices: i64, _out: i64) {}
 
 fn mock_symbols() -> RuntimeSymbols {
     RuntimeSymbols {
@@ -352,6 +355,10 @@ fn mock_symbols() -> RuntimeSymbols {
         tensor_causal_mask:        mock_tensor_causal_mask,
         tape_record_layernorm:     mock_tape_record_layernorm,
         tape_record_cross_entropy: mock_tape_record_cross_entropy,
+        // M19 mocks.
+        tensor_embedding:          mock_tensor_embedding,
+        tensor_randn:              mock_tensor_randn,
+        tape_record_embedding:     mock_tape_record_embedding,
     }
 }
 

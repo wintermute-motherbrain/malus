@@ -151,6 +151,10 @@ fn run_script(path: &str) {
             tensor_causal_mask:        malus_runtime::tensor_causal_mask,
             tape_record_layernorm:     malus_runtime::tape_record_layernorm,
             tape_record_cross_entropy: malus_runtime::tape_record_cross_entropy,
+            // M19 embeddings + randn.
+            tensor_embedding:          malus_runtime::tensor_embedding,
+            tensor_randn:              malus_runtime::tensor_randn,
+            tape_record_embedding:     malus_runtime::tape_record_embedding,
         };
         if let Err(e) = malus_codegen_cpu::compile_and_run(&typed, &symbols, &kernel_ids) {
             eprintln!("error: {e}");

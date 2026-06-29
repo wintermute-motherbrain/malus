@@ -94,7 +94,7 @@ A `tensor_matmul` call where both operands are 3-D with identical leading batch 
 _Avoid_: batched matrix multiply (fine informally), bmm
 
 **Index tensor**:
-A `Tensor<i32>` or `Tensor<i64>` used as an index into another tensor (e.g. for embedding lookup). Not differentiable — integer tensors are never `Variable`. Added in M19 as a narrow dtype carve-out; full non-f32 float compute generality is post-V3.
+A `Tensor<i32>` or `Tensor<i64>` used as an index into another tensor (e.g. for embedding lookup). Not differentiable — integer tensors are never `Variable`. Added in M19 as a narrow dtype carve-out; full non-f32 float compute generality is post-V3. Both i32 and i64 are accepted by `embedding` and `cross_entropy`; i32 is the M19 done-when dtype.
 _Avoid_: integer tensor (fine informally, but "index tensor" conveys the use)
 
 ### Kernel mechanics
@@ -197,9 +197,17 @@ _Avoid_: batch norm (different algorithm), RMS norm (different normalization)
 Gaussian Error Linear Unit activation, tanh approximation: `0.5 * x * (1 + tanh(c0 * (x + c1 * x^3)))`, `c0=0.7978845608`, `c1=0.044715`. Differentiable. PyTorch subset divergence: PyTorch's default `gelu` uses the exact `erf` formulation; the tanh-approx (PyTorch's `gelu(approximate='tanh')`) is the malus default. Additive post-V3.
 _Avoid_: ReLU, SiLU (different activations)
 
-**cross_entropy** (M18):
-Cross-entropy loss: `cross_entropy(logits: Variable<f32> [N,C], targets: Tensor<f32> [N]) -> Variable<f32> [1]`. Applies softmax internally (numerically stable) and computes `-mean(log(s[i, targets[i]]))`. Targets are a float placeholder in M18 (read as `targets[i] as usize`); M19 tightens the type to `Tensor<i32>` additively per ADR-0022. Differentiable; VJP: `d_logits[i,j] = dout/N * (s[i,j] − 1{j == targets[i]})`.
+**cross_entropy** (M18; tightened M19):
+Cross-entropy loss: `cross_entropy(logits: Variable<f32> [N,C], targets: Tensor<i32|i64> [N]) -> Variable<f32> [1]`. Applies softmax internally (numerically stable) and computes `-mean(log(s[i, targets[i]]))`. M19 tightened targets from f32 placeholder to integer index tensor (`Tensor<i32>` or `Tensor<i64>`). Differentiable; VJP: `d_logits[i,j] = dout/N * (s[i,j] − 1{j == targets[i]})`.
 _Avoid_: NLL loss (expects log-probabilities, not logits), softmax cross-entropy (redundant; the softmax is fused inside)
+
+**embedding** (M19):
+Differentiable token/vocabulary lookup. `embedding(weight: Variable<f32> [V,D], indices: Tensor<i32|i64> [T]) -> Variable<f32> [T,D]`. Copies row `indices[t]` of `weight` into `out[t]`. VJP: scatter-add — for each position `t`, `dweight[indices[t]] += dout[t]`; indices receive no gradient (integer, non-differentiable). Analogous to `torch.nn.Embedding.forward`. Name `gather` is reserved — `torch.gather(input, dim, index)` has a different contract (general gather over any axis, not row lookup).
+_Avoid_: gather (reserved, different PyTorch contract), lookup table
+
+**randn** (M19):
+`randn(d0, d1, ...) -> Tensor<f32>`. Returns a tensor of the given shape filled with independent standard-normal samples. CPU-side implementation using Philox4x32-10 counter-based RNG + Box-Muller transform. Non-differentiable (returns plain `Tensor`, not `Variable`; wrap with `variable(randn(...))` to make it a leaf). No user-settable seed in M19; the stream is determined by a thread-local call counter (incremented per `randn` call). See ADR-0024.
+_Avoid_: random normal (fine informally), random init
 
 **causal_mask** (M18):
 `causal_mask(T: i64) -> Tensor<f32>`. Returns a `[T, T]` additive mask: `0.0` on and below the main diagonal, `-1e9` strictly above. Added to attention logits before softmax so future positions receive ~0 attention weight. Non-differentiable (no tape entry). PyTorch equivalent: `torch.triu(torch.full((T,T),-1e9), diagonal=1)`.

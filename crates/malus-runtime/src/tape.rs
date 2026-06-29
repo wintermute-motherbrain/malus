@@ -5,7 +5,7 @@ use crate::metal::{
     broadcast_to_shape, gpu_barrier, invert_perm, normalize_perm, permute_by_perm,
     reshape_to, sum_to_shape, tensor_alloc_gpu, tensor_alloc_ones_gpu,
     tensor_alloc_zeros_gpu, tensor_matmul, tensor_reduce_mean_axis, tensor_reduce_sum_axis,
-    tensor_retain, tensor_release, unsqueeze_at, TensorBuffer,
+    tensor_retain, tensor_release, tensor_scatter_add, unsqueeze_at, TensorBuffer,
 };
 
 // ── OpTag ─────────────────────────────────────────────────────────────────────
@@ -43,6 +43,8 @@ pub enum OpTag {
     Layernorm        = 21,
     Gelu             = 22,
     CrossEntropy     = 23,
+    // M19 embeddings
+    Embedding        = 24,
 }
 
 impl OpTag {
@@ -72,6 +74,7 @@ impl OpTag {
             21 => OpTag::Layernorm,
             22 => OpTag::Gelu,
             23 => OpTag::CrossEntropy,
+            24 => OpTag::Embedding,
             _  => panic!("malus: unknown op tag {tag}"),
         }
     }
@@ -235,6 +238,23 @@ pub extern "C" fn tape_record_cross_entropy(
             output: out,
             meta: vec![],
         });
+    });
+}
+
+/// Record an embedding op.  Retains weight, indices, and out.  Indices are
+/// non-differentiable but must be retained so backward can read them.
+/// No-op when paused.
+#[no_mangle]
+pub extern "C" fn tape_record_embedding(op_tag: i32, weight: i64, indices: i64, out: i64) {
+    if !RECORDING.with(|r| r.get()) {
+        return;
+    }
+    tensor_retain(weight);
+    tensor_retain(indices);
+    tensor_retain(out);
+    let op = OpTag::from_tag(op_tag);
+    NODES.with(|n| {
+        n.borrow_mut().push(TapeNode { op, saved: vec![weight, indices], output: out, meta: vec![] });
     });
 }
 
@@ -699,15 +719,24 @@ pub extern "C" fn backward(loss: i64) {
                 let c = tb(logits).shape[1];
                 let scale = read(dout)[0] / n as f32;
                 let mut grad_data = read(sm_h);
-                let t_data = read(targets);
+                let tgt_buf = tb(targets).buffer.contents() as *const u8;
+                let tgt_dtype = tb(targets).dtype;
                 for i in 0..n {
-                    let t = t_data[i] as usize;
+                    let t = read_int_index_tape(tgt_buf, i, tgt_dtype);
                     grad_data[i * c + t] -= 1.0;
                 }
                 for v in grad_data.iter_mut() { *v *= scale; }
                 let logits_shape = tb(logits).shape.clone();
                 let dx = tensor_alloc_gpu(0, logits_shape.as_ptr(), logits_shape.len(), grad_data.as_ptr());
                 accumulate_grad(&mut grads, logits, dx);
+            }
+            OpTag::Embedding => {
+                // dweight[indices[t]] += dout[t, :] for t in 0..T (scatter-add)
+                let weight  = node.saved[0];
+                let indices = node.saved[1];
+                let vocab_size = tb(weight).shape[0] as i64;
+                let dweight = tensor_scatter_add(dout, indices, vocab_size);
+                accumulate_grad(&mut grads, weight, dweight);
             }
         }
     }
@@ -815,6 +844,18 @@ pub(crate) fn registry_lens() -> (usize, usize) {
         LEAVES.with(|l| l.borrow().len()),
         LEAF_GRAD.with(|lg| lg.borrow().len()),
     )
+}
+
+// ── Integer index reader (for embedding/cross_entropy backward) ───────────────
+
+use crate::metal::Dtype;
+
+fn read_int_index_tape(buf: *const u8, i: usize, dtype: Dtype) -> usize {
+    match dtype {
+        Dtype::I32 => unsafe { *(buf.add(i * 4) as *const i32) as usize }
+        Dtype::I64 => unsafe { *(buf.add(i * 8) as *const i64) as usize }
+        _ => panic!("malus: integer index tensor must be Tensor<i32> or Tensor<i64>, got {:?}", dtype),
+    }
 }
 
 // ── Private CPU math helpers ──────────────────────────────────────────────────

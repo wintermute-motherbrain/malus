@@ -4,7 +4,7 @@
 
 malus is a compiled ML DSL for Apple Silicon. Python-like syntax, dual compilation pipeline: `fn` bodies → Cranelift JIT (CPU), `kernel` bodies → Metal Shading Language (GPU). The CTMM memory model inserts static `free`/barrier calls at compile time, falling back to reference counting only when lifetimes are structurally ambiguous.
 
-## Current state: **M18 done — softmax, layernorm, gelu, cross_entropy, causal_mask, all differentiable; M19 (embeddings + index tensors) next**
+## Current state: **M19 done — `embedding`, `randn` (Philox4x32-10), i32/i64 index tensors, integer cross_entropy targets; M20 (lvalue assignment + AdamW) next**
 
 | Milestone | Status | Crate |
 |---|---|---|
@@ -30,7 +30,7 @@ malus is a compiled ML DSL for Apple Silicon. Python-like syntax, dual compilati
 | M16 — Broadcasting + Axis Reductions (NumPy broadcast, `sum`/`mean`/`max`/`var` over axis, differentiable) | ✅ done | `malus-syntax`, `malus-sema`, `malus-codegen-cpu`, `malus-runtime` |
 | M17 — Shapes + Batched Matmul (`reshape`, `transpose`/`permute`, 3-D/batched matmul) | ✅ done | `malus-syntax`, `malus-sema`, `malus-codegen-cpu`, `malus-runtime` |
 | M18 — Transformer Stdlib (`softmax`, `layernorm`, `gelu`, `cross_entropy`, causal mask) | ✅ done | `malus-sema`, `malus-codegen-cpu`, `malus-runtime` |
-| M19 — Embeddings + Index Tensors (i32/i64 tensors, `gather`, `randn`/Philox) | 🔲 planned | all crates |
+| M19 — Embeddings + Index Tensors (i32/i64 tensors, `embedding`, `randn`/Philox) | ✅ done | all crates |
 | M20 — Lvalue Assignment + AdamW (`a[i]=e`, `s.f=e`, stdlib AdamW) | 🔲 planned | `malus-syntax`, `malus-sema`, `malus-codegen-cpu` |
 | M21 — MPS Migration (`matmul` + reductions → MPS, pending tensors) | 🔲 planned | `malus-runtime` |
 | M22 — Data I/O + nanoGPT Capstone (`read_file`, char tokenization, transformer) | 🔲 planned | all crates |
@@ -70,6 +70,9 @@ These decisions were made during V3 planning. Do not re-litigate them without us
 | Batched matmul scope | Both-3-D identical-batch + 3-D⊗2-D broadcast (M17/M18) | 3-D⊗2-D (`(B,M,K) @ (K,N) → (B,M,N)`) added in M18 to support `x @ weight` where x is [B,T,C]. 2-D⊗3-D broadcast deferred as additive. |
 | API parity principle | API surface tracks PyTorch's actual contracts (M17) | New names must match their PyTorch counterpart contract; deferral is additive, never breaking. See ADR-0022. |
 | File I/O scope | Minimal `read_file` + 3 string primitives | Capstone needs real data; I/O scope strictly fenced. See ADR-0018. |
+| `gather` vs `embedding` | Ship `embedding` only; reserve `gather` (M19) | `torch.gather(input, dim, index)` is a different contract (general axis gather). Naming row-lookup `gather` would violate ADR-0022. |
+| randn RNG | Philox4x32-10 + Box-Muller, CPU-side, no user seed (M19) | Counter-based; GPU-portable; reproducible per call index. See ADR-0024. |
+| cross_entropy target dtype | Integer (`Tensor<i32|i64>`) (M19) | Retires f32 placeholder; aligns with index tensor carve-out. |
 
 ## V1 Design Decisions
 
@@ -163,7 +166,7 @@ The `i64` handle is a raw pointer to a heap-allocated `TensorBuffer { buffer: me
 
 `tensor_matmul`, `tensor_transpose`, and `tensor_sum` are eager CPU ops that call `gpu_barrier()` internally before reading buffers. Their results are ready tensors (not pending). See ADR-0012.
 
-**dtype_tag** uses `ScalarTy` enum discriminant order: F32=0, F16=1, Bf16=2, I8=3, I16=4, I32=5, I64=6, U8=7, U16=8, U32=9, U64=10. `malus-runtime` defines an independent `Dtype` enum with `from_tag(i32)`/`to_tag() -> i32`; a drift-detection test asserts all 11 mappings. **V1 supports f32 only** — non-f32 panics per ADR-0006.
+**dtype_tag** uses `ScalarTy` enum discriminant order: F32=0, F16=1, Bf16=2, I8=3, I16=4, I32=5, I64=6, U8=7, U16=8, U32=9, U64=10. `malus-runtime` defines an independent `Dtype` enum with `from_tag(i32)`/`to_tag() -> i32`; a drift-detection test asserts all 11 mappings. **M19+: i32 (tag 5) and i64 (tag 6) are supported for index tensors** (`embedding`, `cross_entropy` targets). All other non-f32 dtypes still panic per ADR-0006.
 
 **Device/queue:** lazy `OnceLock<MetalContext { device, command_queue, current_command_buffer, pipelines }>`; first Metal fn call triggers `Device::system_default()` (panics if absent). `runtime_init` must be called before any `kernel_dispatch` to compile MSL kernels.
 
@@ -182,8 +185,8 @@ The `i64` handle is a raw pointer to a heap-allocated `TensorBuffer { buffer: me
 | NumPy-style broadcasting | ✅ M16 | Done |
 | Axis reductions (`mean`, `var`, `max` with keepdim) | ✅ M16 | Done |
 | `reshape`/`transpose`/`permute`, batched/3-D matmul | ✅ M17 | Done; `view` reserved for strided non-contiguous post-V3 |
-| Transformer stdlib (softmax, layernorm, GELU, cross-entropy) | ✅ M18 | Done; `gelu` uses tanh approx; `layernorm` has no affine (additive post-V3); targets are f32 placeholder (M19 tightens to i32) |
-| Index tensors, `gather`/embedding, `randn` | M19 | Only f32 tensors today |
+| Transformer stdlib (softmax, layernorm, GELU, cross-entropy) | ✅ M18 | Done; `gelu` uses tanh approx; `layernorm` has no affine (additive post-V3) |
+| Index tensors, `embedding`, `randn` (Philox4x32-10) | ✅ M19 | Done; `gather` reserved (different PyTorch contract); user seed post-V3 |
 | Lvalue assignment (`a[i]=e`, `s.f=e`) | M20 | `Assign.target` is a bare name only |
 | matmul/transpose/sum are CPU loops, not MPS | M21 (ADR-0017 amends ADR-0012) | Correct but slow for transformer scale |
 | File I/O / data loading | M22 (ADR-0018) | No `read_file` yet |

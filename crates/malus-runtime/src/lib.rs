@@ -16,6 +16,8 @@ pub use metal::{
     // M18 transformer stdlib
     tensor_softmax_axis, tensor_layernorm_axis, tensor_gelu,
     tensor_cross_entropy, tensor_causal_mask,
+    // M19 embeddings + randn
+    tensor_embedding, tensor_randn,
     kernel_dispatch, gpu_barrier, Dtype, TensorBuffer,
 };
 
@@ -27,6 +29,8 @@ pub use tape::{
     tape_record_binop, tape_record_unary, tape_record_reduce, tape_record_perm,
     // M18 transformer stdlib recorders
     tape_record_layernorm, tape_record_cross_entropy,
+    // M19 embedding recorder
+    tape_record_embedding,
     tape_register_leaf,
     tape_pause, tape_resume, tape_get_grad, tape_clear,
     backward, tape_zero_grad, OpTag, tape_reset,

@@ -137,6 +137,10 @@ pub struct RuntimeSymbols {
     pub tensor_causal_mask:        extern "C" fn(i64) -> i64,
     pub tape_record_layernorm:     extern "C" fn(i32, i64, i64, i64, i64),
     pub tape_record_cross_entropy: extern "C" fn(i32, i64, i64, i64, i64),
+    // M19 embeddings + randn.
+    pub tensor_embedding:          extern "C" fn(i64, i64) -> i64,
+    pub tensor_randn:              extern "C" fn(*const usize, usize) -> i64,
+    pub tape_record_embedding:     extern "C" fn(i32, i64, i64, i64),
 }
 
 // ── Error ─────────────────────────────────────────────────────────────────────
@@ -201,6 +205,7 @@ const OPTAG_SOFTMAX:          i32 = 20;
 const OPTAG_LAYERNORM:        i32 = 21;
 const OPTAG_GELU:             i32 = 22;
 const OPTAG_CROSS_ENTROPY:    i32 = 23;
+const OPTAG_EMBEDDING:        i32 = 24;
 
 fn binop_to_optag(op: &BinOp) -> Option<i32> {
     match op {
@@ -361,6 +366,10 @@ struct Codegen<'m> {
     rt_tensor_causal_mask:         FuncId,
     rt_tape_record_layernorm:      FuncId,
     rt_tape_record_cross_entropy:  FuncId,
+    // M19: embeddings + randn.
+    rt_tensor_embedding:           FuncId,
+    rt_tensor_randn:               FuncId,
+    rt_tape_record_embedding:      FuncId,
 }
 
 impl<'m> Codegen<'m> {
@@ -1403,7 +1412,7 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                         let arg_refs: Vec<&TypedExpr> = args.iter().collect();
                         self.lower_kernel_dispatch(callee, &arg_refs)
                     }
-                } else if callee == "zeros" || callee == "ones" {
+                } else if callee == "zeros" || callee == "ones" || callee == "randn" {
                     self.lower_zeros_ones(callee, args)
                 } else if callee == "reshape" || callee == "transpose" || callee == "permute" {
                     self.lower_shape_op(callee, args, expr.ty.is_variable())
@@ -1442,6 +1451,8 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                         self.call_tape_record_unary(OPTAG_GELU, x, out);
                     }
                     Ok(out)
+                } else if callee == "embedding" {
+                    self.lower_embedding(args)
                 } else if callee == "cross_entropy" {
                     self.lower_cross_entropy(args)
                 } else if callee == "causal_mask" {
@@ -1508,24 +1519,30 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
 
             TypedExprKind::TensorLiteral { dtype, elements, shape, .. } => {
                 let len = elements.len() as u32;
-                // Stack slot for f32 elements (len * 4 bytes, 4-byte aligned).
+                // Determine element size: i64 = 8 bytes, everything else (f32, i32) = 4 bytes.
+                let elem_size: u32 = match dtype { ScalarTy::I64 => 8, _ => 4 };
+                let align: u8      = if elem_size == 8 { 3 } else { 2 };
                 let data_slot = self.builder.create_sized_stack_slot(
                     cranelift_codegen::ir::StackSlotData::new(
                         cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
-                        (len * 4).max(4),
-                        2,
+                        (len * elem_size).max(elem_size),
+                        align,
                     )
                 );
                 for (i, elem) in elements.iter().enumerate() {
                     let val = self.lower_expr(elem)?;
-                    // Widen integer literals to f32 for the data buffer.
-                    let f32_val = match &elem.ty {
-                        ResolvedTy::Scalar(s) if !is_float_scalar(s) => {
-                            self.builder.ins().fcvt_from_sint(F32, val)
-                        }
-                        _ => val,
+                    // For integer tensor dtypes, store native int values (no f32 conversion).
+                    // For float dtypes, convert any integer literals to f32.
+                    let stored = match dtype {
+                        ScalarTy::I32 | ScalarTy::I64 => val,
+                        _ => match &elem.ty {
+                            ResolvedTy::Scalar(s) if !is_float_scalar(s) => {
+                                self.builder.ins().fcvt_from_sint(F32, val)
+                            }
+                            _ => val,
+                        },
                     };
-                    self.builder.ins().stack_store(f32_val, data_slot, (i as i32) * 4);
+                    self.builder.ins().stack_store(stored, data_slot, (i as i32) * (elem_size as i32));
                 }
 
                 // Shape slot: ndims usizes (each 8 bytes, 8-byte aligned).
@@ -1927,8 +1944,11 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
         let ndims_val = self.builder.ins().iconst(self.codegen.ptr_type(), n as i64);
         let func_ref = if name == "zeros" {
             self.import_func(self.codegen.rt_tensor_alloc_zeros_gpu)
-        } else {
+        } else if name == "ones" {
             self.import_func(self.codegen.rt_tensor_alloc_ones_gpu)
+        } else {
+            // randn — same ABI as zeros/ones
+            self.import_func(self.codegen.rt_tensor_randn)
         };
         let call = self.builder.ins().call(func_ref, &[shape_ptr, ndims_val]);
         Ok(self.builder.inst_results(call).to_vec()[0])
@@ -2266,7 +2286,23 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
         }
     }
 
-    /// cross_entropy(logits: Variable<f32>, targets: Tensor<f32>) -> Variable<f32>
+    /// embedding(weight: Variable<f32>, indices: Tensor<i32|i64>) -> Variable<f32>
+    fn lower_embedding(
+        &mut self,
+        args: &[malus_sema::TypedExpr],
+    ) -> Result<cranelift_codegen::ir::Value, CodegenError> {
+        let weight  = self.lower_expr(&args[0])?;
+        let indices = self.lower_expr(&args[1])?;
+        let func_ref = self.import_func(self.codegen.rt_tensor_embedding);
+        let call = self.builder.ins().call(func_ref, &[weight, indices]);
+        let out  = self.builder.inst_results(call).to_vec()[0];
+        let tag  = self.builder.ins().iconst(I32, OPTAG_EMBEDDING as i64);
+        let rec  = self.import_func(self.codegen.rt_tape_record_embedding);
+        self.builder.ins().call(rec, &[tag, weight, indices, out]);
+        Ok(out)
+    }
+
+    /// cross_entropy(logits: Variable<f32>, targets: Tensor<i32|i64>) -> Variable<f32>
     fn lower_cross_entropy(
         &mut self,
         args: &[malus_sema::TypedExpr],
@@ -2436,6 +2472,10 @@ pub fn compile_and_run(
     jit_builder.symbol("tensor_causal_mask",        symbols.tensor_causal_mask        as *const u8);
     jit_builder.symbol("tape_record_layernorm",     symbols.tape_record_layernorm     as *const u8);
     jit_builder.symbol("tape_record_cross_entropy", symbols.tape_record_cross_entropy as *const u8);
+    // M19 embeddings + randn.
+    jit_builder.symbol("tensor_embedding",          symbols.tensor_embedding          as *const u8);
+    jit_builder.symbol("tensor_randn",              symbols.tensor_randn              as *const u8);
+    jit_builder.symbol("tape_record_embedding",     symbols.tape_record_embedding     as *const u8);
 
     let mut module = JITModule::new(jit_builder);
     let ptr = module.target_config().pointer_type();
@@ -2768,6 +2808,16 @@ pub fn compile_and_run(
     let rt_tape_record_cross_entropy = module.declare_function("tape_record_cross_entropy", Linkage::Import, &sig_tape_saved_axis)
         .map_err(|e| CodegenError::JitError(e.to_string()))?;
 
+    // M19: tensor_embedding(weight: i64, indices: i64) -> i64  (same shape as sig_binop_tensor)
+    let rt_tensor_embedding = module.declare_function("tensor_embedding", Linkage::Import, &sig_binop_tensor)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
+    // M19: tensor_randn(shape_ptr, ndims) -> i64  (same shape as sig_alloc_shape)
+    let rt_tensor_randn = module.declare_function("tensor_randn", Linkage::Import, &sig_alloc_shape)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
+    // M19: tape_record_embedding(op: i32, weight: i64, indices: i64, out: i64)  (same as sig_tape_binop)
+    let rt_tape_record_embedding = module.declare_function("tape_record_embedding", Linkage::Import, &sig_tape_binop)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
+
     // First pass: declare all user fn signatures.
     let mut func_ids: HashMap<String, FuncId> = HashMap::new();
     for typed_fn in &program.fns {
@@ -2839,6 +2889,9 @@ pub fn compile_and_run(
         rt_tensor_causal_mask,
         rt_tape_record_layernorm,
         rt_tape_record_cross_entropy,
+        rt_tensor_embedding,
+        rt_tensor_randn,
+        rt_tape_record_embedding,
     };
 
     // Second pass: compile each fn body.

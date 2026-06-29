@@ -52,6 +52,10 @@ fn real_symbols() -> RuntimeSymbols {
         tensor_causal_mask:        malus_runtime::tensor_causal_mask,
         tape_record_layernorm:     malus_runtime::tape_record_layernorm,
         tape_record_cross_entropy: malus_runtime::tape_record_cross_entropy,
+        // M19 embeddings + randn.
+        tensor_embedding:          malus_runtime::tensor_embedding,
+        tensor_randn:              malus_runtime::tensor_randn,
+        tape_record_embedding:     malus_runtime::tape_record_embedding,
     }
 }
 

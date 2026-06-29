@@ -66,6 +66,13 @@ pub fn register_builtins() -> HashMap<String, BuiltinSig> {
         return_placement: Some(Placement::Gpu),
     });
 
+    // randn(d0, d1, ...) -> Tensor<f32> on GPU; Philox4x32-10 + Box-Muller; non-differentiable.
+    m.insert("randn".to_string(), BuiltinSig {
+        kind: BuiltinKind::ShapeArgs,
+        return_ty: ResolvedTy::Tensor { dtype: ScalarTy::F32 },
+        return_placement: Some(Placement::Gpu),
+    });
+
     // Unary math builtins — dispatched as built-in GPU kernels (one tensor in, same-shape tensor out).
     // return_placement: Some(Gpu) is load-bearing: CTMM marks results pending so barriers are
     // inserted before any CPU read (e.g. tensor_print after exp(x)).
@@ -123,11 +130,22 @@ pub fn register_builtins() -> HashMap<String, BuiltinSig> {
         return_placement: Some(Placement::Gpu),
     });
 
-    // cross_entropy(logits: Variable<f32>, targets: Tensor<f32>) -> Variable<f32>
+    // cross_entropy(logits: Variable<f32>, targets: Tensor<i32|i64>) -> Variable<f32>
+    // targets accept both i32 and i64; the hint guides to i32 (M19 done-when dtype).
     // Always returns Variable (always recorded on tape).
-    let var_f32 = ResolvedTy::Variable { dtype: ScalarTy::F32 };
+    let var_f32   = ResolvedTy::Variable { dtype: ScalarTy::F32 };
+    let tensor_i32 = ResolvedTy::Tensor { dtype: ScalarTy::I32 };
     m.insert("cross_entropy".to_string(), BuiltinSig {
-        kind: BuiltinKind::Fixed(vec![var_f32.clone(), tensor_f32.clone()]),
+        kind: BuiltinKind::Fixed(vec![var_f32.clone(), tensor_i32.clone()]),
+        return_ty: var_f32.clone(),
+        return_placement: Some(Placement::Gpu),
+    });
+
+    // embedding(weight: Variable<f32>, indices: Tensor<i32|i64>) -> Variable<f32>
+    // weight is [V, D]; indices is [T]; output is [T, D].
+    // Both i32 and i64 are valid index dtypes; hint guides to i32.
+    m.insert("embedding".to_string(), BuiltinSig {
+        kind: BuiltinKind::Fixed(vec![var_f32.clone(), tensor_i32]),
         return_ty: var_f32,
         return_placement: Some(Placement::Gpu),
     });

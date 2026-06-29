@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
@@ -117,8 +118,9 @@ pub extern "C" fn tensor_alloc_gpu(
     data: *const f32,
 ) -> i64 {
     let dt = Dtype::from_tag(dtype);
-    if dt != Dtype::F32 {
-        panic!("malus: non-f32 dtypes not yet implemented (got dtype {:?}, tag {})", dt, dtype);
+    match dt {
+        Dtype::F32 | Dtype::I32 | Dtype::I64 => {}
+        _ => panic!("malus: unsupported dtype {:?} (tag {}); supported: f32, i32, i64", dt, dtype),
     }
     let shape = unsafe { std::slice::from_raw_parts(shape_ptr, ndims).to_vec() };
     let n: usize = shape.iter().product();
@@ -213,9 +215,26 @@ pub extern "C" fn tensor_print(handle: i64) {
         return;
     }
     let tb = unsafe { &*(handle as *const TensorBuffer) };
-    let ptr = tb.buffer.contents() as *const f32;
-    let slice = unsafe { std::slice::from_raw_parts(ptr, tb.len) };
-    print_nd(slice, &tb.shape, 0);
+    match tb.dtype {
+        Dtype::I32 => {
+            let slice = unsafe {
+                std::slice::from_raw_parts(tb.buffer.contents() as *const i32, tb.len)
+            };
+            print_nd_i32(slice, &tb.shape, 0);
+        }
+        Dtype::I64 => {
+            let slice = unsafe {
+                std::slice::from_raw_parts(tb.buffer.contents() as *const i64, tb.len)
+            };
+            print_nd_i64(slice, &tb.shape, 0);
+        }
+        _ => {
+            let slice = unsafe {
+                std::slice::from_raw_parts(tb.buffer.contents() as *const f32, tb.len)
+            };
+            print_nd(slice, &tb.shape, 0);
+        }
+    }
 }
 
 fn print_nd(data: &[f32], shape: &[usize], offset: usize) {
@@ -237,6 +256,44 @@ fn print_nd(data: &[f32], shape: &[usize], offset: usize) {
     for i in 0..shape[0] {
         if i > 0 { print!(", "); }
         print_nd(data, &shape[1..], offset + i * stride);
+    }
+    print!("]");
+}
+
+fn print_nd_i32(data: &[i32], shape: &[usize], offset: usize) {
+    if shape.len() == 1 {
+        print!("[");
+        for i in 0..shape[0] {
+            if i > 0 { print!(", "); }
+            print!("{}", data[offset + i]);
+        }
+        print!("]");
+        return;
+    }
+    let stride: usize = shape[1..].iter().product();
+    print!("[");
+    for i in 0..shape[0] {
+        if i > 0 { print!(", "); }
+        print_nd_i32(data, &shape[1..], offset + i * stride);
+    }
+    print!("]");
+}
+
+fn print_nd_i64(data: &[i64], shape: &[usize], offset: usize) {
+    if shape.len() == 1 {
+        print!("[");
+        for i in 0..shape[0] {
+            if i > 0 { print!(", "); }
+            print!("{}", data[offset + i]);
+        }
+        print!("]");
+        return;
+    }
+    let stride: usize = shape[1..].iter().product();
+    print!("[");
+    for i in 0..shape[0] {
+        if i > 0 { print!(", "); }
+        print_nd_i64(data, &shape[1..], offset + i * stride);
     }
     print!("]");
 }
@@ -907,15 +964,13 @@ pub extern "C" fn tensor_cross_entropy(logits: i64, targets: i64, softmax_out: *
     let logits_data = unsafe {
         std::slice::from_raw_parts(logits_tb.buffer.contents() as *const f32, logits_tb.len)
     };
-    let targets_data = unsafe {
-        std::slice::from_raw_parts(targets_tb.buffer.contents() as *const f32, targets_tb.len)
-    };
 
     let sm_data = softmax_axis_cpu(logits_data, &logits_tb.shape, 1);
 
+    let idx_buf = targets_tb.buffer.contents() as *const u8;
     let mut loss = 0.0f32;
     for i in 0..n {
-        let t = targets_data[i] as usize;
+        let t = read_int_index(idx_buf, i, targets_tb.dtype);
         if t >= c {
             panic!("malus: cross_entropy target index {} out of range for C={}", t, c);
         }
@@ -945,6 +1000,127 @@ pub extern "C" fn tensor_causal_mask(t_size: i64) -> i64 {
     }
     let shape = [t, t];
     tensor_alloc_gpu(0, shape.as_ptr(), 2, data.as_ptr())
+}
+
+// ── M19: index-tensor helpers ─────────────────────────────────────────────────
+
+/// Read element `i` of an integer (i32 or i64) buffer as `usize`.
+/// Panics if dtype is not an integer index type.
+fn read_int_index(buf: *const u8, i: usize, dtype: Dtype) -> usize {
+    match dtype {
+        Dtype::I32 => unsafe { *(buf.add(i * 4) as *const i32) as usize }
+        Dtype::I64 => unsafe { *(buf.add(i * 8) as *const i64) as usize }
+        _ => panic!("malus: integer index tensor must be Tensor<i32> or Tensor<i64>, got {:?}", dtype),
+    }
+}
+
+/// Embedding lookup: out[t] = weight[indices[t]], shape [T, D].
+/// weight must be [V, D], indices must be [T] of dtype i32 or i64.
+#[no_mangle]
+pub extern "C" fn tensor_embedding(weight: i64, indices: i64) -> i64 {
+    gpu_barrier();
+    let w = unsafe { &*(weight as *const TensorBuffer) };
+    let idx = unsafe { &*(indices as *const TensorBuffer) };
+    if w.shape.len() != 2 {
+        panic!("malus: embedding weight must be rank-2 [V, D], got shape {:?}", w.shape);
+    }
+    if idx.shape.len() != 1 {
+        panic!("malus: embedding indices must be rank-1 [T], got shape {:?}", idx.shape);
+    }
+    let vocab_size  = w.shape[0];
+    let embed_dim   = w.shape[1];
+    let seq_len     = idx.shape[0];
+    let weight_data = unsafe {
+        std::slice::from_raw_parts(w.buffer.contents() as *const f32, w.len)
+    };
+    let idx_buf = idx.buffer.contents() as *const u8;
+    let mut out = vec![0.0f32; seq_len * embed_dim];
+    for t in 0..seq_len {
+        let row = read_int_index(idx_buf, t, idx.dtype);
+        if row >= vocab_size {
+            panic!("malus: embedding index {} out of range [0, {})", row, vocab_size);
+        }
+        out[t * embed_dim..(t + 1) * embed_dim]
+            .copy_from_slice(&weight_data[row * embed_dim..(row + 1) * embed_dim]);
+    }
+    let out_shape = [seq_len, embed_dim];
+    tensor_alloc_gpu(0, out_shape.as_ptr(), 2, out.as_ptr())
+}
+
+/// Scatter-add: dweight[indices[t]] += dout[t, :] for t in 0..T.
+/// dout is [T, D], indices is [T] (i32/i64), vocab_size is V.
+/// Returns a [V, D] tensor.
+pub(crate) fn tensor_scatter_add(dout: i64, indices: i64, vocab_size: i64) -> i64 {
+    let dout_tb = unsafe { &*(dout as *const TensorBuffer) };
+    let idx_tb  = unsafe { &*(indices as *const TensorBuffer) };
+    let seq_len   = dout_tb.shape[0];
+    let embed_dim = dout_tb.shape[1];
+    let v         = vocab_size as usize;
+    let dout_data = unsafe {
+        std::slice::from_raw_parts(dout_tb.buffer.contents() as *const f32, dout_tb.len)
+    };
+    let idx_buf = idx_tb.buffer.contents() as *const u8;
+    let mut dw = vec![0.0f32; v * embed_dim];
+    for t in 0..seq_len {
+        let row = read_int_index(idx_buf, t, idx_tb.dtype);
+        for d in 0..embed_dim {
+            dw[row * embed_dim + d] += dout_data[t * embed_dim + d];
+        }
+    }
+    let shape = [v, embed_dim];
+    tensor_alloc_gpu(0, shape.as_ptr(), 2, dw.as_ptr())
+}
+
+// ── M19: Philox4x32-10 counter-based RNG ─────────────────────────────────────
+
+const PHILOX_M4X32_0: u32 = 0xD2511F53;
+const PHILOX_M4X32_1: u32 = 0xCD9E8D57;
+const PHILOX_W32_0:   u32 = 0x9E3779B9;
+const PHILOX_W32_1:   u32 = 0xBB67AE85;
+
+fn mulhilo32(a: u32, b: u32) -> (u32, u32) {
+    let p = (a as u64).wrapping_mul(b as u64);
+    ((p >> 32) as u32, p as u32)
+}
+
+fn philox4x32_10(mut c: [u32; 4], mut k: [u32; 2]) -> [u32; 4] {
+    for _ in 0..10 {
+        let (h0, l0) = mulhilo32(c[0], PHILOX_M4X32_0);
+        let (h1, l1) = mulhilo32(c[2], PHILOX_M4X32_1);
+        c = [h1 ^ c[1] ^ k[0], l1, h0 ^ c[3] ^ k[1], l0];
+        k[0] = k[0].wrapping_add(PHILOX_W32_0);
+        k[1] = k[1].wrapping_add(PHILOX_W32_1);
+    }
+    c
+}
+
+thread_local! {
+    static RANDN_CALL_COUNTER: Cell<u64> = const { Cell::new(0) };
+}
+
+/// randn(d0, d1, ...) — standard-normal tensor, CPU-generated, GPU-placed.
+/// Algorithm: Philox4x32-10 keyed by a per-call thread-local counter, then
+/// Box-Muller transform. Fixed default seed (counter starts at 0 per thread).
+#[no_mangle]
+pub extern "C" fn tensor_randn(shape_ptr: *const usize, ndims: usize) -> i64 {
+    let shape = unsafe { std::slice::from_raw_parts(shape_ptr, ndims).to_vec() };
+    let n: usize = shape.iter().product();
+    let call_idx = RANDN_CALL_COUNTER.with(|c| { let v = c.get(); c.set(v + 1); v });
+    let key = [call_idx as u32, (call_idx >> 32) as u32];
+    let mut data = vec![0.0f32; n];
+    let n_pairs = (n + 1) / 2;
+    for k in 0..n_pairs {
+        let ctr = [k as u32, (k >> 32) as u32, 0u32, 0u32];
+        let r = philox4x32_10(ctr, key);
+        let u1 = (r[0] as f64 + 0.5) / 4_294_967_296.0;
+        let u2 = (r[1] as f64 + 0.5) / 4_294_967_296.0;
+        let mag = (-2.0 * u1.ln()).sqrt();
+        let z0  = (mag * (2.0 * std::f64::consts::PI * u2).cos()) as f32;
+        let z1  = (mag * (2.0 * std::f64::consts::PI * u2).sin()) as f32;
+        data[2 * k] = z0;
+        if 2 * k + 1 < n { data[2 * k + 1] = z1; }
+    }
+    tensor_alloc_gpu(0, shape.as_ptr(), ndims, data.as_ptr())
 }
 
 // ── VJP helpers (pub(crate) for tape.rs) ─────────────────────────────────────

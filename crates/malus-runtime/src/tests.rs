@@ -12,6 +12,7 @@ use crate::{
     tape_record_binop, tape_record_unary, tape_record_reduce, tape_record_perm, tape_register_leaf,
     tape_pause, tape_resume, tape_get_grad, tape_clear,
     backward, tape_zero_grad, OpTag, tape_reset,
+    tensor_embedding, tape_record_embedding, tensor_randn,
 };
 
 #[test]
@@ -417,6 +418,7 @@ fn test_optag_from_tag_drift() {
     assert_eq!(OpTag::from_tag(21), OpTag::Layernorm);
     assert_eq!(OpTag::from_tag(22), OpTag::Gelu);
     assert_eq!(OpTag::from_tag(23), OpTag::CrossEntropy);
+    assert_eq!(OpTag::from_tag(24), OpTag::Embedding);
 }
 
 #[test]
@@ -1287,4 +1289,166 @@ fn test_batched_matmul_vjp() {
     tensor_release(q);
     tensor_release(k);
     tape_reset();
+}
+
+// ── M19: embeddings + randn ────────────────────────────────────────────────────
+
+fn alloc_i32(data: &[i32]) -> i64 {
+    let shape = [data.len()];
+    tensor_alloc_gpu(5, shape.as_ptr(), 1, data.as_ptr() as *const f32)
+}
+
+fn alloc_i64(data: &[i64]) -> i64 {
+    let shape = [data.len()];
+    tensor_alloc_gpu(6, shape.as_ptr(), 1, data.as_ptr() as *const f32)
+}
+
+#[test]
+fn test_embedding_forward_i32() {
+    // weight [4, 3] = rows 0..3; indices [1, 0, 2]
+    // out[0] = weight[1] = [3,4,5]; out[1] = weight[0] = [0,1,2]; out[2] = weight[2] = [6,7,8]
+    let wdata: Vec<f32> = (0..12).map(|i| i as f32).collect();
+    let w = alloc_2d(&wdata, 4, 3);
+    let idx = alloc_i32(&[1i32, 0, 2]);
+    let out = tensor_embedding(w, idx);
+    let got = read_f32(out);
+    assert_eq!(got, vec![3.0, 4.0, 5.0, 0.0, 1.0, 2.0, 6.0, 7.0, 8.0]);
+    assert_eq!(shape_of(out), vec![3, 3]);
+    tensor_free(w);
+    tensor_free(idx);
+    tensor_free(out);
+}
+
+#[test]
+fn test_embedding_forward_i64_indices() {
+    // Same test as above but with i64 index tensor.
+    let wdata: Vec<f32> = (0..12).map(|i| i as f32).collect();
+    let w = alloc_2d(&wdata, 4, 3);
+    let idx = alloc_i64(&[2i64, 1, 0]);
+    let out = tensor_embedding(w, idx);
+    let got = read_f32(out);
+    assert_eq!(got, vec![6.0, 7.0, 8.0, 3.0, 4.0, 5.0, 0.0, 1.0, 2.0]);
+    tensor_free(w);
+    tensor_free(idx);
+    tensor_free(out);
+}
+
+#[test]
+fn test_embedding_vjp_scatter_add() {
+    // weight [4, 2]; indices [0, 2, 1, 0] (index 0 appears twice).
+    // loss = sum(embedding(w, idx)).
+    // dw[0] = 2*ones_2; dw[1] = 1*ones_2; dw[2] = 1*ones_2; dw[3] = zeros_2.
+    tape_reset();
+    let wdata = vec![1.0f32; 8];
+    let w = alloc_2d(&wdata, 4, 2);
+    tensor_retain(w);
+    tape_register_leaf(w);
+
+    let idx = alloc_i32(&[0i32, 2, 1, 0]);
+    let out = tensor_embedding(w, idx);
+    tensor_retain(out);
+    tape_record_embedding(OpTag::Embedding as i32, w, idx, out);
+
+    let loss = tensor_sum(out);
+    tensor_retain(loss);
+    tape_record_unary(OpTag::Sum as i32, out, loss);
+
+    backward(loss);
+    let gw = tape_get_grad(w);
+    let gw_data = read_f32(gw);
+    assert_eq!(shape_of(gw), vec![4, 2]);
+    // row 0 → 2.0 (appeared twice)
+    assert!((gw_data[0] - 2.0).abs() < 1e-5, "row0 col0: {}", gw_data[0]);
+    assert!((gw_data[1] - 2.0).abs() < 1e-5, "row0 col1: {}", gw_data[1]);
+    // row 1 → 1.0
+    assert!((gw_data[2] - 1.0).abs() < 1e-5, "row1 col0: {}", gw_data[2]);
+    assert!((gw_data[3] - 1.0).abs() < 1e-5, "row1 col1: {}", gw_data[3]);
+    // row 2 → 1.0
+    assert!((gw_data[4] - 1.0).abs() < 1e-5, "row2 col0: {}", gw_data[4]);
+    assert!((gw_data[5] - 1.0).abs() < 1e-5, "row2 col1: {}", gw_data[5]);
+    // row 3 → 0.0
+    assert!((gw_data[6] - 0.0).abs() < 1e-5, "row3 col0: {}", gw_data[6]);
+    assert!((gw_data[7] - 0.0).abs() < 1e-5, "row3 col1: {}", gw_data[7]);
+    tensor_free(gw);
+    tensor_release(w);
+    tape_reset();
+}
+
+#[test]
+fn test_embedding_gradient_matches_finite_differences() {
+    // Finite-difference check: ∂(sum(embedding(w, [2,0,1,2])))/∂w[i,j] == count(indices==i).
+    // Analytic: dw[0]=1, dw[1]=2, dw[2]=1, others 0 (with D=2 per row).
+    // FD: perturb w[i,j] by eps; (f(w+eps) - f(w-eps)) / (2*eps).
+    const V: usize = 5;
+    const D: usize = 2;
+    const EPS: f32 = 1e-2;
+    let indices = [2i32, 0, 1, 2];
+    let wdata: Vec<f32> = (0..(V * D)).map(|i| i as f32 * 0.1 + 0.5).collect();
+
+    // Expected counts per row.
+    let mut expected_count = vec![0u32; V];
+    for &t in &indices { expected_count[t as usize] += 1; }
+
+    for i in 0..V {
+        for j in 0..D {
+            let mut wp = wdata.clone();
+            let mut wm = wdata.clone();
+            wp[i * D + j] += EPS;
+            wm[i * D + j] -= EPS;
+
+            let wp_h = alloc_2d(&wp, V, D);
+            let idx_h = alloc_i32(&indices);
+            let outp = tensor_embedding(wp_h, idx_h);
+            let sum_p = tensor_sum(outp);
+            let lossp: f32 = read_f32(sum_p)[0];
+            tensor_free(sum_p);
+            tensor_free(outp);
+            tensor_free(idx_h);
+            tensor_free(wp_h);
+
+            let wm_h = alloc_2d(&wm, V, D);
+            let idx_h2 = alloc_i32(&indices);
+            let outm = tensor_embedding(wm_h, idx_h2);
+            let sum_m = tensor_sum(outm);
+            let lossm: f32 = read_f32(sum_m)[0];
+            tensor_free(sum_m);
+            tensor_free(outm);
+            tensor_free(idx_h2);
+            tensor_free(wm_h);
+
+            let fd = (lossp - lossm) / (2.0 * EPS);
+            let analytic = expected_count[i] as f32;
+            assert!(
+                (fd - analytic).abs() < 1e-3,
+                "FD grad at [{i},{j}]: fd={fd:.6} analytic={analytic:.6}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_randn_shape_and_nonzero() {
+    let shape = [3usize, 4];
+    let h = tensor_randn(shape.as_ptr(), 2);
+    assert_eq!(shape_of(h), vec![3, 4]);
+    assert_eq!(unsafe { &*(h as *const TensorBuffer) }.len, 12);
+    let data = read_f32(h);
+    // Philox output: not all zero (probability essentially zero for random vector)
+    let nonzero = data.iter().any(|&v| v != 0.0);
+    assert!(nonzero, "randn should produce non-zero values");
+    tensor_free(h);
+}
+
+#[test]
+fn test_randn_deterministic_per_call_counter() {
+    // Two consecutive calls with the same shape in a fresh counter state produce
+    // different outputs (different call indices drive the Philox key).
+    let shape = [4usize];
+    let h1 = tensor_randn(shape.as_ptr(), 1);
+    let h2 = tensor_randn(shape.as_ptr(), 1);
+    let d1 = read_f32(h1);
+    let d2 = read_f32(h2);
+    assert_ne!(d1, d2, "consecutive randn calls should differ (different call counter)");
+    tensor_free(h1);
+    tensor_free(h2);
 }
