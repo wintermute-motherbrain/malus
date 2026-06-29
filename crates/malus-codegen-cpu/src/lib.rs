@@ -113,6 +113,8 @@ pub struct RuntimeSymbols {
     pub tape_clear:             extern "C" fn(),
     pub tape_get_grad:          extern "C" fn(i64) -> i64,
     pub backward:               extern "C" fn(i64),
+    // M15 tape ABI.
+    pub tape_zero_grad:         extern "C" fn(*const i64, usize),
 }
 
 // ── Error ─────────────────────────────────────────────────────────────────────
@@ -303,6 +305,8 @@ struct Codegen<'m> {
     rt_tape_clear:         FuncId,
     rt_tape_get_grad:      FuncId,
     rt_backward:           FuncId,
+    // M15: tape ABI.
+    rt_tape_zero_grad:     FuncId,
 }
 
 impl<'m> Codegen<'m> {
@@ -1368,6 +1372,27 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                     let handle = self.lower_expr(&args[0])?;
                     self.call_backward(handle);
                     Ok(self.builder.ins().iconst(I64, 0))
+                } else if callee == "zero_grad" {
+                    // zero_grad(v1, v2, ...) — clear accumulated grads for given Variables.
+                    let n = args.len() as u32;
+                    if n == 0 {
+                        return Ok(self.builder.ins().iconst(I64, 0));
+                    }
+                    let slot = self.builder.create_sized_stack_slot(
+                        cranelift_codegen::ir::StackSlotData::new(
+                            cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                            n * 8,
+                            3,
+                        )
+                    );
+                    for (i, arg) in args.iter().enumerate() {
+                        let val = self.lower_expr(arg)?;
+                        self.builder.ins().stack_store(val, slot, (i as i32) * 8);
+                    }
+                    let handles_ptr = self.builder.ins().stack_addr(self.codegen.ptr_type(), slot, 0);
+                    let n_val = self.builder.ins().iconst(self.codegen.ptr_type(), n as i64);
+                    self.call_tape_zero_grad(handles_ptr, n_val);
+                    Ok(self.builder.ins().iconst(I64, 0))
                 } else if callee == "tensor_print" {
                     let handle = self.lower_expr(&args[0])?;
                     self.call_runtime_print(handle);
@@ -1983,6 +2008,15 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
         let func_ref = self.import_func(self.codegen.rt_backward);
         self.builder.ins().call(func_ref, &[loss]);
     }
+
+    fn call_tape_zero_grad(
+        &mut self,
+        handles_ptr: cranelift_codegen::ir::Value,
+        count: cranelift_codegen::ir::Value,
+    ) {
+        let func_ref = self.import_func(self.codegen.rt_tape_zero_grad);
+        self.builder.ins().call(func_ref, &[handles_ptr, count]);
+    }
 }
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -2040,6 +2074,8 @@ pub fn compile_and_run(
     jit_builder.symbol("tape_clear",             symbols.tape_clear             as *const u8);
     jit_builder.symbol("tape_get_grad",          symbols.tape_get_grad          as *const u8);
     jit_builder.symbol("backward",               symbols.backward               as *const u8);
+    // M15 tape ABI.
+    jit_builder.symbol("tape_zero_grad",         symbols.tape_zero_grad         as *const u8);
 
     let mut module = JITModule::new(jit_builder);
     let ptr = module.target_config().pointer_type();
@@ -2228,6 +2264,15 @@ pub fn compile_and_run(
     // tape_get_grad(handle: i64) -> i64  (same as sig_unary_tensor_ret)
     let rt_tape_get_grad = module.declare_function("tape_get_grad", Linkage::Import, &sig_unary_tensor_ret)
         .map_err(|e| CodegenError::JitError(e.to_string()))?;
+    // tape_zero_grad(handles: *const i64, count: usize) -> ()
+    let sig_tape_zero_grad = {
+        let mut s = Signature::new(call_conv);
+        s.params.push(AbiParam::new(ptr));  // handles_ptr
+        s.params.push(AbiParam::new(ptr));  // count
+        s
+    };
+    let rt_tape_zero_grad = module.declare_function("tape_zero_grad", Linkage::Import, &sig_tape_zero_grad)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
 
     // First pass: declare all user fn signatures.
     let mut func_ids: HashMap<String, FuncId> = HashMap::new();
@@ -2280,6 +2325,7 @@ pub fn compile_and_run(
         rt_tape_clear,
         rt_tape_get_grad,
         rt_backward,
+        rt_tape_zero_grad,
     };
 
     // Second pass: compile each fn body.

@@ -350,6 +350,9 @@ pub extern "C" fn backward(loss: i64) {
     }
 
     // Fold each leaf's transient grad into the persistent registry (accumulate).
+    // Stash handles to release outside the borrow so tape_on_release (called from
+    // tensor_release) can borrow_mut LEAVES/LEAF_GRAD without hitting a re-entrant panic.
+    let mut to_release: Vec<i64> = Vec::new();
     LEAVES.with(|leaves_cell| {
         LEAF_GRAD.with(|lg_cell| {
             let leaves = leaves_cell.borrow();
@@ -362,8 +365,8 @@ pub extern "C" fn backward(loss: i64) {
                         }
                         Some(old_grad) => {
                             let summed = elem_add(old_grad, new_grad);
-                            tensor_release(old_grad);
-                            tensor_release(new_grad);
+                            to_release.push(old_grad);
+                            to_release.push(new_grad);
                             lg.insert(leaf, summed);
                         }
                     }
@@ -371,6 +374,9 @@ pub extern "C" fn backward(loss: i64) {
             }
         });
     });
+    for h in to_release {
+        tensor_release(h);
+    }
 
     // Release remaining transient grads (intermediates not in LEAVES).
     for (_, grad) in grads {
@@ -383,17 +389,69 @@ pub extern "C" fn backward(loss: i64) {
 // ── Test / reset helper (not extern "C"; not JIT-injected) ───────────────────
 
 /// Clear all tape state including the persistent leaf-grad registry and leaves
-/// set.  Used by tests and future M15 full-reset paths.  Not JIT-injected.
+/// set.  Used by tests.  Not JIT-injected.
 pub fn tape_reset() {
     LEAVES.with(|l| l.borrow_mut().clear());
+    let mut to_release: Vec<i64> = Vec::new();
     LEAF_GRAD.with(|lg| {
         let mut lg = lg.borrow_mut();
         for (_, grad) in lg.drain() {
-            tensor_release(grad);
+            to_release.push(grad);
         }
     });
+    for g in to_release {
+        tensor_release(g);
+    }
     tape_clear();
     RECORDING.with(|r| r.set(true));
+}
+
+/// Lazily clear the accumulated gradient for each passed leaf: release the
+/// stored grad tensor and remove the registry entry.  tape_get_grad already
+/// returns a fresh zeros tensor when the entry is absent, so the observable
+/// effect is identical to storing zeros.  Called by the JIT-lowered zero_grad
+/// builtin at the start of each training step.
+#[no_mangle]
+pub extern "C" fn tape_zero_grad(handles: *const i64, count: usize) {
+    if handles.is_null() || count == 0 {
+        return;
+    }
+    let hs = unsafe { std::slice::from_raw_parts(handles, count) };
+    let mut to_release: Vec<i64> = Vec::new();
+    LEAF_GRAD.with(|lg| {
+        let mut lg = lg.borrow_mut();
+        for &h in hs {
+            if let Some(grad) = lg.remove(&h) {
+                to_release.push(grad);
+            }
+        }
+    });
+    for g in to_release {
+        tensor_release(g);
+    }
+}
+
+/// Called by tensor_release (metal.rs) on the 1→0 refcount transition,
+/// before the TensorBuffer box is dropped.  Removes the handle from LEAVES
+/// and releases + removes its LEAF_GRAD entry so the leaf registry never
+/// outlives its tensor.  Not extern "C" — called directly from metal.rs
+/// (same crate).
+pub(crate) fn tape_on_release(handle: i64) {
+    let grad = LEAF_GRAD.with(|lg| lg.borrow_mut().remove(&handle));
+    LEAVES.with(|l| { l.borrow_mut().remove(&handle); });
+    if let Some(g) = grad {
+        // g is a different handle (a grad tensor); it is not a leaf, so the
+        // recursive tensor_release → tape_on_release is a bounded lookup-miss.
+        tensor_release(g);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn registry_lens() -> (usize, usize) {
+    (
+        LEAVES.with(|l| l.borrow().len()),
+        LEAF_GRAD.with(|lg| lg.borrow().len()),
+    )
 }
 
 // ── Private CPU math helpers ──────────────────────────────────────────────────

@@ -20,7 +20,7 @@ mod tape;
 pub use tape::{
     tape_record_binop, tape_record_unary, tape_register_leaf,
     tape_pause, tape_resume, tape_get_grad, tape_clear,
-    backward, OpTag, tape_reset,
+    backward, tape_zero_grad, OpTag, tape_reset,
 };
 
 #[cfg(test)]

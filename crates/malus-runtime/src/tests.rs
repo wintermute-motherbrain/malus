@@ -8,7 +8,7 @@ use crate::{
     kernel_dispatch, gpu_barrier,
     tape_record_binop, tape_record_unary, tape_register_leaf,
     tape_pause, tape_resume, tape_get_grad, tape_clear,
-    backward, OpTag, tape_reset,
+    backward, tape_zero_grad, OpTag, tape_reset,
 };
 
 #[test]
@@ -772,4 +772,80 @@ fn test_chain_sum_sigmoid_matmul() {
 fn alloc_like_vec(template: i64, data: &[f32]) -> i64 {
     let tb = unsafe { &*(template as *const TensorBuffer) };
     tensor_alloc_gpu(0, tb.shape.as_ptr(), tb.shape.len(), data.as_ptr())
+}
+
+// ── M15: zero_grad + leaf-registry lifecycle ──────────────────────────────────
+
+#[test]
+fn test_zero_grad_clears_leaf_grad() {
+    tape_reset();
+    let x = alloc_f32(&[3.0]);
+    tape_register_leaf(x);
+    let out = alloc_f32(&[3.0]);
+    tape_record_unary(OpTag::Neg as i32, x, out);
+    backward(out);
+
+    // After backward, x has an accumulated grad.
+    let g1 = tape_get_grad(x);
+    let g1_val = read_f32(g1)[0];
+    tensor_release(g1);
+    assert!((g1_val - (-1.0)).abs() < 1e-6, "expected grad -1.0, got {g1_val}");
+
+    // zero_grad should clear it; next tape_get_grad returns zeros.
+    let handles = [x];
+    tape_zero_grad(handles.as_ptr(), handles.len());
+    let g2 = tape_get_grad(x);
+    let g2_val = read_f32(g2)[0];
+    tensor_release(g2);
+    assert_eq!(g2_val, 0.0, "grad should be 0 after zero_grad");
+
+    tensor_release(x);
+    tensor_release(out);
+}
+
+#[test]
+fn test_rewrap_registry_stays_bounded() {
+    // Simulate the SGD re-wrap idiom across 50 iterations and assert that
+    // LEAVES and LEAF_GRAD stay bounded — this is the core M15 leak check.
+    // Without the tape_on_release hook, LEAVES grows by 1 per iteration.
+    tape_reset();
+
+    let mut w = alloc_f32(&[0.5, 0.5]);
+    let lr = 0.01f32;
+
+    for _ in 0..50 {
+        tape_register_leaf(w);
+
+        // Tiny forward: out = -w  (Neg VJP: dx = -dout = -ones)
+        let out = alloc_f32(&[-0.5, -0.5]);
+        tape_record_unary(OpTag::Neg as i32, w, out);
+        backward(out);
+        tensor_release(out);
+
+        let g = tape_get_grad(w);
+
+        // zero_grad
+        let handles = [w];
+        tape_zero_grad(handles.as_ptr(), handles.len());
+
+        // SGD update: new_w = w_data - lr * g  (produce new tensor)
+        let w_data = read_f32(w);
+        let g_data = read_f32(g);
+        let new_data: Vec<f32> = w_data.iter().zip(g_data.iter())
+            .map(|(wi, gi)| wi - lr * gi).collect();
+        let shape = [2usize];
+        let new_w = tensor_alloc_gpu(0, shape.as_ptr(), 1, new_data.as_ptr());
+
+        tensor_release(g);
+        // Release old leaf — triggers tape_on_release, deregisters from LEAVES/LEAF_GRAD.
+        tensor_release(w);
+        w = new_w;
+    }
+
+    let (leaves, grads) = crate::tape::registry_lens();
+    assert!(leaves <= 1, "LEAVES must stay bounded across re-wrap, got {leaves}");
+    assert!(grads  == 0, "LEAF_GRAD must be empty after zero_grad + re-wrap, got {grads}");
+
+    tensor_release(w);
+    tape_reset();
 }

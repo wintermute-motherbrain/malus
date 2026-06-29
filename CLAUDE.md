@@ -4,7 +4,7 @@
 
 malus is a compiled ML DSL for Apple Silicon. Python-like syntax, dual compilation pipeline: `fn` bodies → Cranelift JIT (CPU), `kernel` bodies → Metal Shading Language (GPU). The CTMM memory model inserts static `free`/barrier calls at compile time, falling back to reference counting only when lifetimes are structurally ambiguous.
 
-## Current state: **M14 done — Tape + backward(), 15-op VJP table, no_grad scope; M15 (zero_grad + V2 XOR capstone) next**
+## Current state: **M15 done — zero_grad, leaf-registry lifecycle fix, V2 XOR capstone; M16 (broadcasting + axis reductions) next**
 
 | Milestone | Status | Crate |
 |---|---|---|
@@ -25,7 +25,7 @@ malus is a compiled ML DSL for Apple Silicon. Python-like syntax, dual compilati
 | M13 — The `Variable` Type (type-directed RC, dormant retain/release ABI activated) | ✅ done | `malus-syntax`, `malus-sema`, `malus-codegen-cpu`, `malus-runtime` |
 | M13.5 — Tuples (anonymous product types, positional access, `let` destructuring, fn return types) | ✅ done | `malus-syntax`, `malus-sema`, `malus-codegen-cpu` |
 | M14 — The Tape + `backward()` (global tape, VJPs for all V1 ops, `no_grad`) | ✅ done | `malus-runtime`, `malus-sema`, `malus-codegen-cpu` |
-| M15 — Differentiable Stdlib + Capstone (`zero_grad`, V2 XOR capstone) | 🔲 planned | all crates |
+| M15 — Differentiable Stdlib + Capstone (`zero_grad`, V2 XOR capstone) | ✅ done | all crates |
 | **V3 — nanoGPT** | | |
 | M16 — Broadcasting + Axis Reductions (NumPy broadcast, `mean`/`var`/`max` over axis) | 🔲 planned | `malus-syntax`, `malus-sema`, `malus-codegen-cpu`, `malus-runtime` |
 | M17 — Shapes + Batched Matmul (`reshape`/`view`, `transpose(dims)`, 3-D matmul) | 🔲 planned | `malus-syntax`, `malus-sema`, `malus-codegen-cpu`, `malus-runtime` |

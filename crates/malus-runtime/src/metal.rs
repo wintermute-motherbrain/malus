@@ -194,6 +194,7 @@ pub extern "C" fn tensor_release(handle: i64) {
     // AcqRel: Acquire on the last decrement so all prior writes to the buffer
     // are visible before the drop; Release on all earlier decrements.
     if tb.ref_count.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 {
+        crate::tape::tape_on_release(handle);
         unsafe { drop(Box::from_raw(handle as *mut TensorBuffer)); }
     }
 }

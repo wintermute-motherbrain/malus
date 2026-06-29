@@ -31,6 +31,7 @@ fn real_symbols() -> RuntimeSymbols {
         tape_clear:             malus_runtime::tape_clear,
         tape_get_grad:          malus_runtime::tape_get_grad,
         backward:               malus_runtime::backward,
+        tape_zero_grad:         malus_runtime::tape_zero_grad,
     }
 }
 

@@ -173,6 +173,8 @@ extern "C" fn mock_tape_resume() {}
 extern "C" fn mock_tape_clear() {}
 extern "C" fn mock_tape_get_grad(_handle: i64) -> i64 { 0 }
 extern "C" fn mock_backward(_loss: i64) {}
+// M15 tape ABI.
+extern "C" fn mock_tape_zero_grad(_handles: *const i64, _count: usize) {}
 
 fn mock_symbols() -> RuntimeSymbols {
     RuntimeSymbols {
@@ -197,6 +199,7 @@ fn mock_symbols() -> RuntimeSymbols {
         tape_clear:             mock_tape_clear,
         tape_get_grad:          mock_tape_get_grad,
         backward:               mock_backward,
+        tape_zero_grad:         mock_tape_zero_grad,
     }
 }
 
@@ -1218,4 +1221,54 @@ fn main():
     println("{}", x)
 "#;
     run_src(src).expect("tuple parse roundtrip");
+}
+
+// ── M15: zero_grad + re-wrap SGD ─────────────────────────────────────────────
+
+#[test]
+fn test_zero_grad_compiles_and_runs() {
+    let src = r#"
+fn main():
+    let t = Tensor.gpu<f32>([1.0, 2.0])
+    let v = variable(t)
+    zero_grad(v)
+"#;
+    run_src(src).expect("zero_grad should compile and run");
+    assert_eq!(live_tensor_count(), 0, "no leaks after zero_grad");
+}
+
+#[test]
+fn test_zero_grad_multiple_args() {
+    let src = r#"
+fn main():
+    let a = Tensor.gpu<f32>([1.0])
+    let b = Tensor.gpu<f32>([2.0])
+    let va = variable(a)
+    let vb = variable(b)
+    zero_grad(va, vb)
+"#;
+    run_src(src).expect("zero_grad with multiple args");
+    assert_eq!(live_tensor_count(), 0, "no leaks after zero_grad with multiple args");
+}
+
+#[test]
+fn test_zero_grad_rewrap_no_leak() {
+    // Verify that CTMM correctly drops the old Variable handle on each re-wrap
+    // and that zero_grad emits its call without leaking mock tensors.
+    // We avoid Variable binops (vx @ w etc.) because their intermediate
+    // tensors are managed by the tape in the real runtime but the mock tape
+    // ABI is all no-ops — intermediate lifetime is a runtime concern, tested
+    // separately in malus-runtime::tests::test_rewrap_registry_stays_bounded.
+    let src = r#"
+fn main():
+    let t1 = Tensor.gpu<f32>([0.5, 0.5])
+    let mut w = variable(t1)
+    zero_grad(w)
+    let t2 = Tensor.gpu<f32>([0.3, 0.3])
+    zero_grad(w)
+    w = variable(t2)
+    zero_grad(w)
+"#;
+    run_src(src).expect("zero_grad + re-wrap should compile and run");
+    assert_eq!(live_tensor_count(), 0, "no mock-tensor leaks from zero_grad + Variable re-wrap");
 }

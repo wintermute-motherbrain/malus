@@ -11,6 +11,8 @@ pub enum BuiltinKind {
     Variadic,
     /// Accepts any number of i64 scalars as shape args (e.g., zeros, ones).
     ShapeArgs,
+    /// Accepts any number of args, each constrained to a single type (e.g., zero_grad).
+    VariadicTyped(ResolvedTy),
 }
 
 #[derive(Debug, Clone)]
@@ -94,6 +96,13 @@ pub fn register_builtins() -> HashMap<String, BuiltinSig> {
     // backward(loss: Variable<f32>) — walk the tape in reverse, accumulate grads, clear tape.
     m.insert("backward".to_string(), BuiltinSig {
         kind: BuiltinKind::Fixed(vec![ResolvedTy::Variable { dtype: ScalarTy::F32 }]),
+        return_ty: ResolvedTy::Unit,
+        return_placement: None,
+    });
+
+    // zero_grad(v1, v2, ...) — clear accumulated grads for the given Variables.
+    m.insert("zero_grad".to_string(), BuiltinSig {
+        kind: BuiltinKind::VariadicTyped(ResolvedTy::Variable { dtype: ScalarTy::F32 }),
         return_ty: ResolvedTy::Unit,
         return_placement: None,
     });

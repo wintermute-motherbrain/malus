@@ -130,6 +130,7 @@ fn run_script(path: &str) {
             tape_clear:             malus_runtime::tape_clear,
             tape_get_grad:          malus_runtime::tape_get_grad,
             backward:               malus_runtime::backward,
+            tape_zero_grad:         malus_runtime::tape_zero_grad,
         };
         if let Err(e) = malus_codegen_cpu::compile_and_run(&typed, &symbols, &kernel_ids) {
             eprintln!("error: {e}");

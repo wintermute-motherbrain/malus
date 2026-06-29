@@ -1119,6 +1119,22 @@ fn check_call(
                     }
                     out
                 }
+                BuiltinKind::VariadicTyped(expected) => {
+                    let mut out = Vec::new();
+                    for arg in positional.iter() {
+                        let ta = check_expr(arg, Some(expected), ctx)?;
+                        if ta.ty != *expected {
+                            ctx.errors.push(SemaError::TypeMismatch {
+                                expected: expected.clone(),
+                                found: ta.ty.clone(),
+                                span: arg.span,
+                            });
+                            return None;
+                        }
+                        out.push(ta);
+                    }
+                    out
+                }
             };
             // Validate format string arg count for print/println.
             if is_print_call {
