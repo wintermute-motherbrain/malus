@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use objc2_metal::MTLBuffer;
+
 use crate::{
     Dtype, TensorBuffer, runtime_init,
     tensor_alloc_gpu, tensor_alloc_zeros_gpu, tensor_alloc_ones_gpu,
@@ -67,7 +69,7 @@ fn shape_of(handle: i64) -> Vec<usize> {
 
 fn read_f32(handle: i64) -> Vec<f32> {
     let tb = unsafe { &*(handle as *const TensorBuffer) };
-    let ptr = tb.buffer.contents() as *const f32;
+    let ptr = tb.buffer.contents().as_ptr() as *const f32;
     unsafe { std::slice::from_raw_parts(ptr, tb.len).to_vec() }
 }
 
@@ -82,7 +84,7 @@ fn test_tensor_alloc_roundtrip() {
     assert_eq!(tb.shape, &[4]);
     assert_eq!(tb.dtype, Dtype::F32);
 
-    let ptr = tb.buffer.contents() as *const f32;
+    let ptr = tb.buffer.contents().as_ptr() as *const f32;
     let slice = unsafe { std::slice::from_raw_parts(ptr, tb.len) };
     assert_eq!(slice, &[1.0, 2.0, 3.0, 4.0]);
 
@@ -96,7 +98,7 @@ fn test_tensor_alloc_null_data() {
     assert!(handle != 0);
 
     let tb = unsafe { &*(handle as *const TensorBuffer) };
-    let ptr = tb.buffer.contents() as *const f32;
+    let ptr = tb.buffer.contents().as_ptr() as *const f32;
     let slice = unsafe { std::slice::from_raw_parts(ptr, tb.len) };
     assert!(slice.iter().all(|v| *v == 0.0), "buffer should be zeroed");
 
@@ -308,7 +310,7 @@ fn test_kernel_dispatch_add() {
     assert_eq!(tb.shape, &[4]);
     assert_eq!(tb.dtype, Dtype::F32);
 
-    let ptr = tb.buffer.contents() as *const f32;
+    let ptr = tb.buffer.contents().as_ptr() as *const f32;
     let slice = unsafe { std::slice::from_raw_parts(ptr, tb.len) };
     assert_eq!(slice, &[6.0, 8.0, 10.0, 12.0]);
 

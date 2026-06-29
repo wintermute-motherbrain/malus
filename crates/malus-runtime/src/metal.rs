@@ -2,10 +2,13 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-use foreign_types::{ForeignType, ForeignTypeRef};
-use metal::{
-    CommandBuffer, CommandQueue, CompileOptions, ComputePipelineState,
-    Device, MTLResourceOptions, MTLSize, NSUInteger,
+use objc2::rc::Retained;
+use objc2::runtime::ProtocolObject;
+use objc2_foundation::NSString;
+use objc2_metal::{
+    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
+    MTLComputeCommandEncoder, MTLComputePipelineState, MTLCreateSystemDefaultDevice,
+    MTLDevice, MTLLibrary, MTLResourceOptions, MTLSize,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -53,19 +56,25 @@ impl Dtype {
 }
 
 struct MetalContext {
-    device: Device,
-    command_queue: CommandQueue,
-    current_command_buffer: Mutex<Option<CommandBuffer>>,
-    pipelines: Mutex<HashMap<u64, ComputePipelineState>>,
+    device: Retained<ProtocolObject<dyn MTLDevice>>,
+    command_queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
+    current_command_buffer: Mutex<Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>>>,
+    pipelines: Mutex<HashMap<u64, Retained<ProtocolObject<dyn MTLComputePipelineState>>>>,
 }
+
+// Safety: Metal objects are thread-safe per the Metal specification.
+// Access to the command buffer is already serialized through the Mutex.
+unsafe impl Send for MetalContext {}
+unsafe impl Sync for MetalContext {}
 
 static CONTEXT: OnceLock<MetalContext> = OnceLock::new();
 
 fn context() -> &'static MetalContext {
     CONTEXT.get_or_init(|| {
-        let device = Device::system_default()
+        let device = MTLCreateSystemDefaultDevice()
             .expect("malus: no Metal device available");
-        let command_queue = device.new_command_queue();
+        let command_queue = device.newCommandQueue()
+            .expect("malus: failed to create MTLCommandQueue");
         MetalContext {
             device,
             command_queue,
@@ -76,7 +85,7 @@ fn context() -> &'static MetalContext {
 }
 
 pub struct TensorBuffer {
-    pub buffer: metal::Buffer,
+    pub buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
     pub dtype: Dtype,
     pub len: usize,
     pub shape: Vec<usize>,
@@ -93,16 +102,17 @@ pub fn runtime_init(registry: &HashMap<u64, String>) {
     let mut pipelines = ctx.pipelines.lock().unwrap();
 
     for (id, source) in registry {
-        let options = CompileOptions::new();
+        let source_ns = NSString::from_str(source);
         let library = ctx.device
-            .new_library_with_source(source, &options)
+            .newLibraryWithSource_options_error(&source_ns, None)
             .unwrap_or_else(|e| panic!("malus: MSL compilation failed for kernel {}: {}", id, e));
         let func_name = format!("malus_kernel_{}", id);
+        let func_name_ns = NSString::from_str(&func_name);
         let function = library
-            .get_function(&func_name, None)
-            .unwrap_or_else(|e| panic!("malus: kernel function '{}' not found: {}", func_name, e));
+            .newFunctionWithName(&func_name_ns)
+            .unwrap_or_else(|| panic!("malus: kernel function '{}' not found", func_name));
         let pipeline = ctx.device
-            .new_compute_pipeline_state_with_function(&function)
+            .newComputePipelineStateWithFunction_error(&*function)
             .unwrap_or_else(|e| panic!("malus: pipeline creation failed for kernel {}: {}", id, e));
         pipelines.insert(*id, pipeline);
     }
@@ -131,16 +141,15 @@ pub extern "C" fn tensor_alloc_gpu(
     // tensors (`zeros(0)`, empty kernel output) are safe to allocate and free.
     // `tb.len` stays = n (0) so slices and shape queries remain correct.
     let alloc_len = byte_len.max(1);
-    let buffer = ctx.device.new_buffer(
-        alloc_len as u64,
-        MTLResourceOptions::StorageModeShared,
-    );
+    let buffer = ctx.device
+        .newBufferWithLength_options(alloc_len, MTLResourceOptions::StorageModeShared)
+        .expect("malus: failed to allocate MTLBuffer");
 
     if !data.is_null() && n > 0 {
         unsafe {
             std::ptr::copy_nonoverlapping(
                 data as *const u8,
-                buffer.contents() as *mut u8,
+                buffer.contents().as_ptr() as *mut u8,
                 byte_len,
             );
         }
@@ -218,19 +227,19 @@ pub extern "C" fn tensor_print(handle: i64) {
     match tb.dtype {
         Dtype::I32 => {
             let slice = unsafe {
-                std::slice::from_raw_parts(tb.buffer.contents() as *const i32, tb.len)
+                std::slice::from_raw_parts(tb.buffer.contents().as_ptr() as *const i32, tb.len)
             };
             print_nd_i32(slice, &tb.shape, 0);
         }
         Dtype::I64 => {
             let slice = unsafe {
-                std::slice::from_raw_parts(tb.buffer.contents() as *const i64, tb.len)
+                std::slice::from_raw_parts(tb.buffer.contents().as_ptr() as *const i64, tb.len)
             };
             print_nd_i64(slice, &tb.shape, 0);
         }
         _ => {
             let slice = unsafe {
-                std::slice::from_raw_parts(tb.buffer.contents() as *const f32, tb.len)
+                std::slice::from_raw_parts(tb.buffer.contents().as_ptr() as *const f32, tb.len)
             };
             print_nd(slice, &tb.shape, 0);
         }
@@ -312,7 +321,7 @@ pub extern "C" fn gpu_barrier() {
     let mut guard = ctx.current_command_buffer.lock().unwrap();
     if let Some(cmd_buf) = guard.take() {
         cmd_buf.commit();
-        cmd_buf.wait_until_completed();
+        cmd_buf.waitUntilCompleted();
     }
 }
 
@@ -339,8 +348,8 @@ pub extern "C" fn tensor_matmul(handle_a: i64, handle_b: i64) -> i64 {
                     a.shape, b.shape
                 );
             }
-            let a_data = unsafe { std::slice::from_raw_parts(a.buffer.contents() as *const f32, a.len) };
-            let b_data = unsafe { std::slice::from_raw_parts(b.buffer.contents() as *const f32, b.len) };
+            let a_data = unsafe { std::slice::from_raw_parts(a.buffer.contents().as_ptr() as *const f32, a.len) };
+            let b_data = unsafe { std::slice::from_raw_parts(b.buffer.contents().as_ptr() as *const f32, b.len) };
             let mut out_data = vec![0.0f32; m * n];
             for i in 0..m {
                 for j in 0..n {
@@ -369,8 +378,8 @@ pub extern "C" fn tensor_matmul(handle_a: i64, handle_b: i64) -> i64 {
                     k, k2, a.shape, b.shape
                 );
             }
-            let a_data = unsafe { std::slice::from_raw_parts(a.buffer.contents() as *const f32, a.len) };
-            let b_data = unsafe { std::slice::from_raw_parts(b.buffer.contents() as *const f32, b.len) };
+            let a_data = unsafe { std::slice::from_raw_parts(a.buffer.contents().as_ptr() as *const f32, a.len) };
+            let b_data = unsafe { std::slice::from_raw_parts(b.buffer.contents().as_ptr() as *const f32, b.len) };
             let out_len = batch * m * n;
             let mut out_data = vec![0.0f32; out_len];
             for bx in 0..batch {
@@ -400,8 +409,8 @@ pub extern "C" fn tensor_matmul(handle_a: i64, handle_b: i64) -> i64 {
                     a.shape, b.shape
                 );
             }
-            let a_data = unsafe { std::slice::from_raw_parts(a.buffer.contents() as *const f32, a.len) };
-            let b_data = unsafe { std::slice::from_raw_parts(b.buffer.contents() as *const f32, b.len) };
+            let a_data = unsafe { std::slice::from_raw_parts(a.buffer.contents().as_ptr() as *const f32, a.len) };
+            let b_data = unsafe { std::slice::from_raw_parts(b.buffer.contents().as_ptr() as *const f32, b.len) };
             let out_len = batch * m * n;
             let mut out_data = vec![0.0f32; out_len];
             for bx in 0..batch {
@@ -437,7 +446,7 @@ pub extern "C" fn tensor_transpose(handle: i64) -> i64 {
     let m = tb.shape[0];
     let n = tb.shape[1];
 
-    let in_data = unsafe { std::slice::from_raw_parts(tb.buffer.contents() as *const f32, tb.len) };
+    let in_data = unsafe { std::slice::from_raw_parts(tb.buffer.contents().as_ptr() as *const f32, tb.len) };
     let mut out_data = vec![0.0f32; tb.len];
     for i in 0..m {
         for j in 0..n {
@@ -453,7 +462,7 @@ pub extern "C" fn tensor_transpose(handle: i64) -> i64 {
 pub extern "C" fn tensor_sum(handle: i64) -> i64 {
     gpu_barrier();
     let tb = unsafe { &*(handle as *const TensorBuffer) };
-    let data = unsafe { std::slice::from_raw_parts(tb.buffer.contents() as *const f32, tb.len) };
+    let data = unsafe { std::slice::from_raw_parts(tb.buffer.contents().as_ptr() as *const f32, tb.len) };
     let total: f32 = data.iter().sum();
     let shape = [1usize];
     tensor_alloc_gpu(0, shape.as_ptr(), 1, &total)
@@ -526,8 +535,8 @@ fn tensor_broadcast_op(kernel_id: u64, a_h: i64, b_h: i64, op: impl Fn(f32, f32)
     } else {
         gpu_barrier();
         let out_shape = broadcast_result_shape(&a.shape, &b.shape);
-        let a_data = unsafe { std::slice::from_raw_parts(a.buffer.contents() as *const f32, a.len) };
-        let b_data = unsafe { std::slice::from_raw_parts(b.buffer.contents() as *const f32, b.len) };
+        let a_data = unsafe { std::slice::from_raw_parts(a.buffer.contents().as_ptr() as *const f32, a.len) };
+        let b_data = unsafe { std::slice::from_raw_parts(b.buffer.contents().as_ptr() as *const f32, b.len) };
         let out_len: usize = out_shape.iter().product();
         let mut out_data = vec![0.0f32; out_len.max(1)];
         broadcast_cpu_loop(a_data, &a.shape, b_data, &b.shape, &mut out_data, &out_shape, op);
@@ -626,7 +635,7 @@ pub extern "C" fn tensor_reduce_sum_axis(h: i64, axis: i64, keepdim: i64) -> i64
     let out_shape = reduce_axis_shape(&tb.shape, axis_u, keepdim_b);
     let out_len: usize = out_shape.iter().product::<usize>().max(1);
     let mut out_data = vec![0.0f32; out_len];
-    let in_data = unsafe { std::slice::from_raw_parts(tb.buffer.contents() as *const f32, tb.len) };
+    let in_data = unsafe { std::slice::from_raw_parts(tb.buffer.contents().as_ptr() as *const f32, tb.len) };
     reduce_elements(in_data, &tb.shape, axis_u, keepdim_b, &out_shape, &mut out_data, |a, b| a + b);
     tensor_alloc_gpu(0, out_shape.as_ptr(), out_shape.len(), out_data.as_ptr())
 }
@@ -641,7 +650,7 @@ pub extern "C" fn tensor_reduce_mean_axis(h: i64, axis: i64, keepdim: i64) -> i6
     let out_shape = reduce_axis_shape(&tb.shape, axis_u, keepdim_b);
     let out_len: usize = out_shape.iter().product::<usize>().max(1);
     let mut out_data = vec![0.0f32; out_len];
-    let in_data = unsafe { std::slice::from_raw_parts(tb.buffer.contents() as *const f32, tb.len) };
+    let in_data = unsafe { std::slice::from_raw_parts(tb.buffer.contents().as_ptr() as *const f32, tb.len) };
     reduce_elements(in_data, &tb.shape, axis_u, keepdim_b, &out_shape, &mut out_data, |a, b| a + b);
     for v in out_data.iter_mut() { *v /= n; }
     tensor_alloc_gpu(0, out_shape.as_ptr(), out_shape.len(), out_data.as_ptr())
@@ -656,7 +665,7 @@ pub extern "C" fn tensor_reduce_max_axis(h: i64, axis: i64, keepdim: i64) -> i64
     let out_shape = reduce_axis_shape(&tb.shape, axis_u, keepdim_b);
     let out_len: usize = out_shape.iter().product::<usize>().max(1);
     let mut out_data = vec![f32::NEG_INFINITY; out_len];
-    let in_data = unsafe { std::slice::from_raw_parts(tb.buffer.contents() as *const f32, tb.len) };
+    let in_data = unsafe { std::slice::from_raw_parts(tb.buffer.contents().as_ptr() as *const f32, tb.len) };
     reduce_elements(in_data, &tb.shape, axis_u, keepdim_b, &out_shape, &mut out_data, f32::max);
     tensor_alloc_gpu(0, out_shape.as_ptr(), out_shape.len(), out_data.as_ptr())
 }
@@ -670,7 +679,7 @@ pub extern "C" fn tensor_reduce_var_axis(h: i64, axis: i64, keepdim: i64) -> i64
     let n = tb.shape[axis_u] as f32;
     let out_shape = reduce_axis_shape(&tb.shape, axis_u, keepdim_b);
     let out_len: usize = out_shape.iter().product::<usize>().max(1);
-    let in_data = unsafe { std::slice::from_raw_parts(tb.buffer.contents() as *const f32, tb.len) };
+    let in_data = unsafe { std::slice::from_raw_parts(tb.buffer.contents().as_ptr() as *const f32, tb.len) };
     let ndims = tb.shape.len();
     let in_shape = tb.shape.clone();
 
@@ -762,7 +771,7 @@ pub(crate) fn permute_by_perm(handle: i64, perm: &[usize]) -> i64 {
         in_strides[i] = in_strides[i + 1] * tb_in.shape[i + 1];
     }
     let out_len: usize = out_shape.iter().product::<usize>().max(1);
-    let in_data = unsafe { std::slice::from_raw_parts(tb_in.buffer.contents() as *const f32, tb_in.len) };
+    let in_data = unsafe { std::slice::from_raw_parts(tb_in.buffer.contents().as_ptr() as *const f32, tb_in.len) };
     let mut out_data = vec![0.0f32; out_len];
     // Row-major strides for the output.
     let mut out_strides = vec![1usize; rank];
@@ -872,7 +881,7 @@ pub extern "C" fn tensor_softmax_axis(h: i64, axis: i64) -> i64 {
     gpu_barrier();
     let tb = unsafe { &*(h as *const TensorBuffer) };
     let axis_u = normalize_axis(axis as i32, tb.shape.len());
-    let in_data = unsafe { std::slice::from_raw_parts(tb.buffer.contents() as *const f32, tb.len) };
+    let in_data = unsafe { std::slice::from_raw_parts(tb.buffer.contents().as_ptr() as *const f32, tb.len) };
     let out_data = softmax_axis_cpu(in_data, &tb.shape, axis_u);
     tensor_alloc_gpu(0, tb.shape.as_ptr(), tb.shape.len(), out_data.as_ptr())
 }
@@ -888,7 +897,7 @@ pub extern "C" fn tensor_layernorm_axis(h: i64, axis: i64, var_out: *mut i64) ->
     let axis_size = tb.shape[axis_u];
     let outer: usize = tb.shape[..axis_u].iter().product::<usize>().max(1);
     let inner: usize = tb.shape[axis_u + 1..].iter().product::<usize>().max(1);
-    let in_data = unsafe { std::slice::from_raw_parts(tb.buffer.contents() as *const f32, tb.len) };
+    let in_data = unsafe { std::slice::from_raw_parts(tb.buffer.contents().as_ptr() as *const f32, tb.len) };
 
     let need_var = !var_out.is_null();
     let mut var_data = if need_var { vec![0.0f32; outer * inner] } else { vec![] };
@@ -931,7 +940,7 @@ pub extern "C" fn tensor_layernorm_axis(h: i64, axis: i64, var_out: *mut i64) ->
 pub extern "C" fn tensor_gelu(h: i64) -> i64 {
     gpu_barrier();
     let tb = unsafe { &*(h as *const TensorBuffer) };
-    let in_data = unsafe { std::slice::from_raw_parts(tb.buffer.contents() as *const f32, tb.len) };
+    let in_data = unsafe { std::slice::from_raw_parts(tb.buffer.contents().as_ptr() as *const f32, tb.len) };
     const C0: f32 = 0.7978845608;
     const C1: f32 = 0.044715;
     let out_data: Vec<f32> = in_data.iter().map(|&x| {
@@ -962,12 +971,12 @@ pub extern "C" fn tensor_cross_entropy(logits: i64, targets: i64, softmax_out: *
         panic!("malus: cross_entropy logits N={} but targets has {} elements", n, targets_tb.shape[0]);
     }
     let logits_data = unsafe {
-        std::slice::from_raw_parts(logits_tb.buffer.contents() as *const f32, logits_tb.len)
+        std::slice::from_raw_parts(logits_tb.buffer.contents().as_ptr() as *const f32, logits_tb.len)
     };
 
     let sm_data = softmax_axis_cpu(logits_data, &logits_tb.shape, 1);
 
-    let idx_buf = targets_tb.buffer.contents() as *const u8;
+    let idx_buf = targets_tb.buffer.contents().as_ptr() as *const u8;
     let mut loss = 0.0f32;
     for i in 0..n {
         let t = read_int_index(idx_buf, i, targets_tb.dtype);
@@ -1031,9 +1040,9 @@ pub extern "C" fn tensor_embedding(weight: i64, indices: i64) -> i64 {
     let embed_dim   = w.shape[1];
     let seq_len     = idx.shape[0];
     let weight_data = unsafe {
-        std::slice::from_raw_parts(w.buffer.contents() as *const f32, w.len)
+        std::slice::from_raw_parts(w.buffer.contents().as_ptr() as *const f32, w.len)
     };
-    let idx_buf = idx.buffer.contents() as *const u8;
+    let idx_buf = idx.buffer.contents().as_ptr() as *const u8;
     let mut out = vec![0.0f32; seq_len * embed_dim];
     for t in 0..seq_len {
         let row = read_int_index(idx_buf, t, idx.dtype);
@@ -1057,9 +1066,9 @@ pub(crate) fn tensor_scatter_add(dout: i64, indices: i64, vocab_size: i64) -> i6
     let embed_dim = dout_tb.shape[1];
     let v         = vocab_size as usize;
     let dout_data = unsafe {
-        std::slice::from_raw_parts(dout_tb.buffer.contents() as *const f32, dout_tb.len)
+        std::slice::from_raw_parts(dout_tb.buffer.contents().as_ptr() as *const f32, dout_tb.len)
     };
-    let idx_buf = idx_tb.buffer.contents() as *const u8;
+    let idx_buf = idx_tb.buffer.contents().as_ptr() as *const u8;
     let mut dw = vec![0.0f32; v * embed_dim];
     for t in 0..seq_len {
         let row = read_int_index(idx_buf, t, idx_tb.dtype);
@@ -1136,7 +1145,7 @@ pub(crate) fn broadcast_to_shape(h: i64, out_shape: &[usize]) -> i64 {
     let n = out_shape.len();
     let mut padded = vec![1usize; n - t.shape.len()];
     padded.extend_from_slice(&t.shape);
-    let in_data = unsafe { std::slice::from_raw_parts(t.buffer.contents() as *const f32, t.len) };
+    let in_data = unsafe { std::slice::from_raw_parts(t.buffer.contents().as_ptr() as *const f32, t.len) };
     let out_len: usize = out_shape.iter().product();
     let mut out_data = vec![0.0f32; out_len.max(1)];
     for flat in 0..out_len {
@@ -1167,7 +1176,7 @@ pub(crate) fn sum_to_shape(grad: i64, target_shape: &[usize]) -> i64 {
     let n_target = target_shape.len();
     let mut padded = vec![1usize; n - n_target];
     padded.extend_from_slice(target_shape);
-    let in_data = unsafe { std::slice::from_raw_parts(t.buffer.contents() as *const f32, t.len) };
+    let in_data = unsafe { std::slice::from_raw_parts(t.buffer.contents().as_ptr() as *const f32, t.len) };
     let out_len: usize = target_shape.iter().product::<usize>().max(1);
     let mut out_data = vec![0.0f32; out_len];
     for flat in 0..t.len {
@@ -1190,7 +1199,7 @@ pub(crate) fn sum_to_shape(grad: i64, target_shape: &[usize]) -> i64 {
 /// Returns an owned handle (refcount=1).
 pub(crate) fn unsqueeze_at(h: i64, axis: usize) -> i64 {
     let t = unsafe { &*(h as *const TensorBuffer) };
-    let data = unsafe { std::slice::from_raw_parts(t.buffer.contents() as *const f32, t.len) };
+    let data = unsafe { std::slice::from_raw_parts(t.buffer.contents().as_ptr() as *const f32, t.len) };
     let mut new_shape = t.shape.clone();
     new_shape.insert(axis, 1);
     tensor_alloc_gpu(0, new_shape.as_ptr(), new_shape.len(), data.as_ptr())
@@ -1237,33 +1246,33 @@ pub extern "C" fn kernel_dispatch(kernel_id: u64, handles: *const i64, count: us
 
     let mut guard = ctx.current_command_buffer.lock().unwrap();
     if guard.is_none() {
-        let cmd_buf_ref = ctx.command_queue.new_command_buffer();
-        let retained: *mut metal::MTLCommandBuffer = unsafe {
-            msg_send![cmd_buf_ref.as_ptr(), retain]
-        };
-        let cmd_buf = unsafe { CommandBuffer::from_ptr(retained) };
+        let cmd_buf = ctx.command_queue
+            .commandBuffer()
+            .expect("malus: failed to create MTLCommandBuffer");
         *guard = Some(cmd_buf);
     }
     let cmd_buf = guard.as_ref().unwrap();
 
-    let encoder = cmd_buf.new_compute_command_encoder();
-    encoder.set_compute_pipeline_state(&pipeline);
+    let encoder = cmd_buf
+        .computeCommandEncoder()
+        .expect("malus: failed to create MTLComputeCommandEncoder");
+    encoder.setComputePipelineState(&*pipeline);
 
     for (i, input) in inputs.iter().enumerate() {
-        encoder.set_buffer(i as NSUInteger, Some(&input.buffer), 0);
+        unsafe { encoder.setBuffer_offset_atIndex(Some(&*input.buffer), 0, i) };
     }
-    encoder.set_buffer(count as NSUInteger, Some(&output_tb.buffer), 0);
+    unsafe { encoder.setBuffer_offset_atIndex(Some(&*output_tb.buffer), 0, count) };
 
     let out_len = output_tb.len;
-    let grid_size = MTLSize::new(out_len as NSUInteger, 1, 1);
-    let max_threads = pipeline.max_total_threads_per_threadgroup();
-    let threadgroup_size = MTLSize::new(
-        max_threads.min(out_len as NSUInteger),
-        1,
-        1,
-    );
-    encoder.dispatch_threads(grid_size, threadgroup_size);
-    encoder.end_encoding();
+    let grid_size = MTLSize { width: out_len, height: 1, depth: 1 };
+    let max_threads = pipeline.maxTotalThreadsPerThreadgroup();
+    let threadgroup_size = MTLSize {
+        width: max_threads.min(out_len),
+        height: 1,
+        depth: 1,
+    };
+    encoder.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
+    encoder.endEncoding();
 
     output_handle
 }

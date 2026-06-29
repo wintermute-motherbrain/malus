@@ -1,6 +1,8 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 
+use objc2_metal::MTLBuffer;
+
 use crate::metal::{
     broadcast_to_shape, gpu_barrier, invert_perm, normalize_perm, permute_by_perm,
     reshape_to, sum_to_shape, tensor_alloc_gpu, tensor_alloc_ones_gpu,
@@ -533,7 +535,7 @@ pub extern "C" fn backward(loss: i64) {
                 let x = node.saved[0];
                 let scalar_val = {
                     let tb = unsafe { &*(dout as *const TensorBuffer) };
-                    let ptr = tb.buffer.contents() as *const f32;
+                    let ptr = tb.buffer.contents().as_ptr() as *const f32;
                     unsafe { *ptr }
                 };
                 let dx = elem_apply(x, |_| scalar_val);
@@ -719,7 +721,7 @@ pub extern "C" fn backward(loss: i64) {
                 let c = tb(logits).shape[1];
                 let scale = read(dout)[0] / n as f32;
                 let mut grad_data = read(sm_h);
-                let tgt_buf = tb(targets).buffer.contents() as *const u8;
+                let tgt_buf = tb(targets).buffer.contents().as_ptr() as *const u8;
                 let tgt_dtype = tb(targets).dtype;
                 for i in 0..n {
                     let t = read_int_index_tape(tgt_buf, i, tgt_dtype);
@@ -869,7 +871,7 @@ fn tb(handle: i64) -> &'static TensorBuffer {
 
 fn read(handle: i64) -> Vec<f32> {
     let t = tb(handle);
-    let ptr = t.buffer.contents() as *const f32;
+    let ptr = t.buffer.contents().as_ptr() as *const f32;
     unsafe { std::slice::from_raw_parts(ptr, t.len).to_vec() }
 }
 

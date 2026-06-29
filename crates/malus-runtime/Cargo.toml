@@ -4,6 +4,18 @@ version = "0.1.0"
 edition = "2021"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-metal = "0.29"
-foreign-types = "0.5"
-objc = "0.2"
+objc2 = { version = "0.6", features = ["std"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["NSString"] }
+objc2-metal = { version = "0.3", default-features = false, features = [
+    "MTLDevice",
+    "MTLBuffer",
+    "MTLCommandQueue",
+    "MTLCommandBuffer",
+    "MTLCommandEncoder",
+    "MTLComputeCommandEncoder",
+    "MTLComputePipeline",
+    "MTLAllocation",
+    "MTLResource",
+    "MTLLibrary",
+    "MTLTypes",
+] }
