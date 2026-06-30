@@ -64,6 +64,13 @@ struct MetalContext {
     command_queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     current_command_buffer: Mutex<Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>>>,
     pipelines: Mutex<HashMap<u64, Retained<ProtocolObject<dyn MTLComputePipelineState>>>>,
+    // Keyed by MSL source text (stable across compilations, unlike the
+    // numeric kernel id which is reassigned per `compile_kernels` call).
+    // Recompiling byte-identical MSL repeatedly within one process is both
+    // wasted work and, empirically, unreliable in some toolchain/driver
+    // states — so `runtime_init` reuses an existing pipeline when the
+    // source text already matches one it has compiled before.
+    pipelines_by_source: Mutex<HashMap<String, Retained<ProtocolObject<dyn MTLComputePipelineState>>>>,
 }
 
 // Safety: Metal objects are thread-safe per the Metal specification.
@@ -84,6 +91,7 @@ fn context() -> &'static MetalContext {
             command_queue,
             current_command_buffer: Mutex::new(None),
             pipelines: Mutex::new(HashMap::new()),
+            pipelines_by_source: Mutex::new(HashMap::new()),
         }
     })
 }
@@ -101,11 +109,27 @@ pub struct TensorBuffer {
 
 // ── Runtime init: compile all MSL kernels ─────────────────────────────────────
 
+/// Replace the per-compilation `malus_kernel_<id>` function name with a
+/// fixed placeholder so byte-identical kernel bodies compiled under
+/// different numeric ids (a different `compile_kernels` call assigns ids
+/// sequentially per combined program) hash to the same cache key.
+fn normalize_kernel_source_for_cache(id: u64, source: &str) -> String {
+    let needle = format!("malus_kernel_{id}");
+    source.replacen(&needle, "malus_kernel_X", 1)
+}
+
 pub fn runtime_init(registry: &HashMap<u64, String>) {
     let ctx = context();
     let mut pipelines = ctx.pipelines.lock().unwrap();
+    let mut by_source = ctx.pipelines_by_source.lock().unwrap();
 
     for (id, source) in registry {
+        let cache_key = normalize_kernel_source_for_cache(*id, source);
+        if let Some(cached) = by_source.get(&cache_key) {
+            pipelines.insert(*id, cached.clone());
+            continue;
+        }
+
         let source_ns = NSString::from_str(source);
         let library = ctx.device
             .newLibraryWithSource_options_error(&source_ns, None)
@@ -118,6 +142,7 @@ pub fn runtime_init(registry: &HashMap<u64, String>) {
         let pipeline = ctx.device
             .newComputePipelineStateWithFunction_error(&*function)
             .unwrap_or_else(|e| panic!("malus: pipeline creation failed for kernel {}: {}", id, e));
+        by_source.insert(cache_key, pipeline.clone());
         pipelines.insert(*id, pipeline);
     }
 }
@@ -586,6 +611,11 @@ pub extern "C" fn tensor_matmul(handle_a: i64, handle_b: i64) -> i64 {
     }
 }
 
+// M26 / ADR-0031 / ADR-0032: retired forward CPU fallback. Replaced by the
+// malus __transpose_2d_fwd kernel (M25); gated behind cpu_fallback so the
+// canonical gate build can't reach it even by accident — kept for
+// malus-runtime's own isolated unit tests (tests.rs).
+#[cfg(feature = "cpu_fallback")]
 #[no_mangle]
 pub extern "C" fn tensor_transpose(handle: i64) -> i64 {
     gpu_barrier();
@@ -610,6 +640,10 @@ pub extern "C" fn tensor_transpose(handle: i64) -> i64 {
     tensor_alloc_gpu(0, out_shape.as_ptr(), 2, out_data.as_ptr())
 }
 
+// M26 / ADR-0031 / ADR-0032: retired forward CPU fallback. The malus `sum(t)`
+// builtin now routes to __reduce_all_sum_fwd; gated for the same reason as
+// tensor_transpose above, kept for tests.rs's direct-call test utility role.
+#[cfg(feature = "cpu_fallback")]
 #[no_mangle]
 pub extern "C" fn tensor_sum(handle: i64) -> i64 {
     gpu_barrier();
@@ -628,7 +662,13 @@ pub extern "C" fn tensor_sum(handle: i64) -> i64 {
 //
 // Equal-shape element-wise ops keep the existing GPU kernel path; broadcasting
 // falls back to an eager CPU loop and returns a ready tensor.
+//
+// M26 / ADR-0031 / ADR-0032: this whole CPU-broadcast group is retired
+// forward fallback — replaced by the malus __broadcast_*_fwd kernels (M25)
+// — and gated behind cpu_fallback. Not in RuntimeSymbols (already
+// unreachable from the JIT); kept for tests.rs's direct-call tests.
 
+#[cfg(feature = "cpu_fallback")]
 fn broadcast_result_shape(sa: &[usize], sb: &[usize]) -> Vec<usize> {
     let n = sa.len().max(sb.len());
     let mut out = Vec::with_capacity(n);
@@ -649,6 +689,7 @@ fn broadcast_result_shape(sa: &[usize], sb: &[usize]) -> Vec<usize> {
     out
 }
 
+#[cfg(feature = "cpu_fallback")]
 fn broadcast_cpu_loop(
     a_data: &[f32], a_shape: &[usize],
     b_data: &[f32], b_shape: &[usize],
@@ -680,6 +721,7 @@ fn broadcast_cpu_loop(
     }
 }
 
+#[cfg(feature = "cpu_fallback")]
 fn tensor_broadcast_op(kernel_id: u64, a_h: i64, b_h: i64, op: impl Fn(f32, f32) -> f32) -> i64 {
     let a = unsafe { &*(a_h as *const TensorBuffer) };
     let b = unsafe { &*(b_h as *const TensorBuffer) };
@@ -698,28 +740,38 @@ fn tensor_broadcast_op(kernel_id: u64, a_h: i64, b_h: i64, op: impl Fn(f32, f32)
     }
 }
 
+#[cfg(feature = "cpu_fallback")]
 #[no_mangle]
 pub extern "C" fn tensor_broadcast_add(kernel_id: u64, a: i64, b: i64) -> i64 {
     tensor_broadcast_op(kernel_id, a, b, |x, y| x + y)
 }
 
+#[cfg(feature = "cpu_fallback")]
 #[no_mangle]
 pub extern "C" fn tensor_broadcast_sub(kernel_id: u64, a: i64, b: i64) -> i64 {
     tensor_broadcast_op(kernel_id, a, b, |x, y| x - y)
 }
 
+#[cfg(feature = "cpu_fallback")]
 #[no_mangle]
 pub extern "C" fn tensor_broadcast_mul(kernel_id: u64, a: i64, b: i64) -> i64 {
     tensor_broadcast_op(kernel_id, a, b, |x, y| x * y)
 }
 
+#[cfg(feature = "cpu_fallback")]
 #[no_mangle]
 pub extern "C" fn tensor_broadcast_div(kernel_id: u64, a: i64, b: i64) -> i64 {
     tensor_broadcast_op(kernel_id, a, b, |x, y| x / y)
 }
 
 // ── Axis reduction helpers ────────────────────────────────────────────────────
+//
+// M26 / ADR-0031 / ADR-0032: this whole group (axis-reduction CPU loops +
+// normalize_axis, also used by the gated softmax/layernorm/cross_entropy
+// group below) is retired forward fallback — replaced by the malus
+// __reduce_{sum,mean,max,var}_fwd kernels (M25) — gated behind cpu_fallback.
 
+#[cfg(feature = "cpu_fallback")]
 fn normalize_axis(axis: i32, ndims: usize) -> usize {
     let a = if axis < 0 { axis + ndims as i32 } else { axis };
     if a < 0 || (a as usize) >= ndims {
@@ -728,6 +780,7 @@ fn normalize_axis(axis: i32, ndims: usize) -> usize {
     a as usize
 }
 
+#[cfg(feature = "cpu_fallback")]
 fn reduce_axis_shape(in_shape: &[usize], axis: usize, keepdim: bool) -> Vec<usize> {
     if keepdim {
         let mut s = in_shape.to_vec();
@@ -741,6 +794,7 @@ fn reduce_axis_shape(in_shape: &[usize], axis: usize, keepdim: bool) -> Vec<usiz
     }
 }
 
+#[cfg(feature = "cpu_fallback")]
 fn reduce_out_flat(in_idx: &[usize], axis: usize, keepdim: bool, out_shape: &[usize]) -> usize {
     let mut flat = 0usize;
     let mut out_i = 0usize;
@@ -758,6 +812,7 @@ fn reduce_out_flat(in_idx: &[usize], axis: usize, keepdim: bool, out_shape: &[us
     flat
 }
 
+#[cfg(feature = "cpu_fallback")]
 fn reduce_elements(
     in_data: &[f32],
     in_shape: &[usize],
@@ -780,6 +835,7 @@ fn reduce_elements(
     }
 }
 
+#[cfg(feature = "cpu_fallback")]
 #[no_mangle]
 pub extern "C" fn tensor_reduce_sum_axis(h: i64, axis: i64, keepdim: i64) -> i64 {
     gpu_barrier();
@@ -795,6 +851,7 @@ pub extern "C" fn tensor_reduce_sum_axis(h: i64, axis: i64, keepdim: i64) -> i64
     tensor_alloc_gpu(0, out_shape.as_ptr(), out_shape.len(), out_data.as_ptr())
 }
 
+#[cfg(feature = "cpu_fallback")]
 #[no_mangle]
 pub extern "C" fn tensor_reduce_mean_axis(h: i64, axis: i64, keepdim: i64) -> i64 {
     gpu_barrier();
@@ -812,6 +869,7 @@ pub extern "C" fn tensor_reduce_mean_axis(h: i64, axis: i64, keepdim: i64) -> i6
     tensor_alloc_gpu(0, out_shape.as_ptr(), out_shape.len(), out_data.as_ptr())
 }
 
+#[cfg(feature = "cpu_fallback")]
 #[no_mangle]
 pub extern "C" fn tensor_reduce_max_axis(h: i64, axis: i64, keepdim: i64) -> i64 {
     gpu_barrier();
@@ -827,6 +885,7 @@ pub extern "C" fn tensor_reduce_max_axis(h: i64, axis: i64, keepdim: i64) -> i64
     tensor_alloc_gpu(0, out_shape.as_ptr(), out_shape.len(), out_data.as_ptr())
 }
 
+#[cfg(feature = "cpu_fallback")]
 #[no_mangle]
 pub extern "C" fn tensor_reduce_var_axis(h: i64, axis: i64, keepdim: i64) -> i64 {
     gpu_barrier();
@@ -1006,6 +1065,7 @@ pub extern "C" fn tensor_reshape(handle: i64, dims_ptr: *const usize, ndims: usi
 
 /// Numerically stable softmax over one axis.  Called by tensor_softmax_axis
 /// and tensor_cross_entropy (which shares this helper).
+#[cfg(feature = "cpu_fallback")]
 pub(crate) fn softmax_axis_cpu(in_data: &[f32], in_shape: &[usize], axis: usize) -> Vec<f32> {
     crate::cpu_compute_inc();
     let axis_size = in_shape[axis];
@@ -1036,6 +1096,7 @@ pub(crate) fn softmax_axis_cpu(in_data: &[f32], in_shape: &[usize], axis: usize)
     out
 }
 
+#[cfg(feature = "cpu_fallback")]
 #[no_mangle]
 pub extern "C" fn tensor_softmax_axis(h: i64, axis: i64) -> i64 {
     gpu_barrier();
@@ -1049,6 +1110,7 @@ pub extern "C" fn tensor_softmax_axis(h: i64, axis: i64) -> i64 {
 /// Forward layernorm.  When `var_out` is non-null, writes the population
 /// variance tensor (keepdim=1 at axis) to `*var_out` for use by the VJP
 /// recorder.  Caller transfers ownership of the written handle to the tape.
+#[cfg(feature = "cpu_fallback")]
 #[no_mangle]
 pub extern "C" fn tensor_layernorm_axis(h: i64, axis: i64, var_out: *mut i64) -> i64 {
     gpu_barrier();
@@ -1097,6 +1159,7 @@ pub extern "C" fn tensor_layernorm_axis(h: i64, axis: i64, var_out: *mut i64) ->
     tensor_alloc_gpu(0, tb.shape.as_ptr(), tb.shape.len(), norm_data.as_ptr())
 }
 
+#[cfg(feature = "cpu_fallback")]
 #[no_mangle]
 pub extern "C" fn tensor_gelu(h: i64) -> i64 {
     gpu_barrier();
@@ -1116,6 +1179,7 @@ pub extern "C" fn tensor_gelu(h: i64) -> i64 {
 /// then -log(softmax[i, target[i]]) averaged over N.
 /// When `softmax_out` is non-null, writes the softmax tensor handle to
 /// `*softmax_out` for use by the VJP recorder.  Caller transfers ownership.
+#[cfg(feature = "cpu_fallback")]
 #[no_mangle]
 pub extern "C" fn tensor_cross_entropy(logits: i64, targets: i64, softmax_out: *mut i64) -> i64 {
     gpu_barrier();
@@ -1178,6 +1242,7 @@ pub extern "C" fn tensor_causal_mask(t_size: i64) -> i64 {
 
 /// Read element `i` of an integer (i32 or i64) buffer as `usize`.
 /// Panics if dtype is not an integer index type.
+#[cfg(feature = "cpu_fallback")]
 fn read_int_index(buf: *const u8, i: usize, dtype: Dtype) -> usize {
     match dtype {
         Dtype::I32 => unsafe { *(buf.add(i * 4) as *const i32) as usize }
@@ -1188,6 +1253,7 @@ fn read_int_index(buf: *const u8, i: usize, dtype: Dtype) -> usize {
 
 /// Embedding lookup: out[t] = weight[indices[t]], shape [T, D].
 /// weight must be [V, D], indices must be [T] of dtype i32 or i64.
+#[cfg(feature = "cpu_fallback")]
 #[no_mangle]
 pub extern "C" fn tensor_embedding(weight: i64, indices: i64) -> i64 {
     gpu_barrier();
@@ -1223,6 +1289,7 @@ pub extern "C" fn tensor_embedding(weight: i64, indices: i64) -> i64 {
 /// Scatter-add: dweight[indices[t]] += dout[t, :] for t in 0..T.
 /// dout is [T, D], indices is [T] (i32/i64), vocab_size is V.
 /// Returns a [V, D] tensor.
+#[cfg(feature = "cpu_fallback")]
 pub(crate) fn tensor_scatter_add(dout: i64, indices: i64, vocab_size: i64) -> i64 {
     crate::cpu_compute_inc();
     let dout_tb = unsafe { &*(dout as *const TensorBuffer) };
@@ -1324,10 +1391,17 @@ pub extern "C" fn malus_tensor_get_f32(handle: i64, idx: i64) -> f32 {
     data[idx as usize]
 }
 
-// ── VJP helpers (pub(crate) for tape.rs) ─────────────────────────────────────
+// ── VJP helpers (pub(crate) for tape.rs cpu_fallback module only) ────────────
+//
+// M26 / ADR-0031 / ADR-0032: these are the V3 CPU VJP helpers, retired by
+// the malus backward kernels (see malus-stdlib/stdlib/backward/) and gated
+// behind cpu_fallback. permute_by_perm above stays ungated — it's still
+// load-bearing for tensor_permute's general N-D path outside the M25
+// fast-path coverage.
 
 /// Expand `h` to `out_shape` using NumPy broadcast semantics.
 /// Returns a retained handle (caller must release). Identity (retain only) when shapes match.
+#[cfg(feature = "cpu_fallback")]
 pub(crate) fn broadcast_to_shape(h: i64, out_shape: &[usize]) -> i64 {
     let t = unsafe { &*(h as *const TensorBuffer) };
     if t.shape.as_slice() == out_shape {
@@ -1359,6 +1433,7 @@ pub(crate) fn broadcast_to_shape(h: i64, out_shape: &[usize]) -> i64 {
 
 /// Sum `grad` down to `target_shape` (the operand shape before broadcasting).
 /// Returns a retained handle. Identity (retain only) when shapes already match.
+#[cfg(feature = "cpu_fallback")]
 pub(crate) fn sum_to_shape(grad: i64, target_shape: &[usize]) -> i64 {
     let t = unsafe { &*(grad as *const TensorBuffer) };
     if t.shape.as_slice() == target_shape {
@@ -1391,6 +1466,7 @@ pub(crate) fn sum_to_shape(grad: i64, target_shape: &[usize]) -> i64 {
 
 /// Insert a size-1 dimension at `axis` (reshape; no data copy cost beyond alloc).
 /// Returns an owned handle (refcount=1).
+#[cfg(feature = "cpu_fallback")]
 pub(crate) fn unsqueeze_at(h: i64, axis: usize) -> i64 {
     let t = unsafe { &*(h as *const TensorBuffer) };
     let data = unsafe { std::slice::from_raw_parts(t.buffer.contents().as_ptr() as *const f32, t.len) };

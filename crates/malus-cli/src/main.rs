@@ -122,7 +122,6 @@ fn run_script(path: &str) {
             tensor_alloc_zeros_gpu: malus_runtime::tensor_alloc_zeros_gpu,
             tensor_alloc_ones_gpu:  malus_runtime::tensor_alloc_ones_gpu,
             tensor_matmul:          malus_runtime::tensor_matmul,
-            tensor_sum:             malus_runtime::tensor_sum,
             tensor_len:             malus_runtime::tensor_len,
             tensor_retain:          malus_runtime::tensor_retain,
             tensor_release:         malus_runtime::tensor_release,
@@ -167,6 +166,8 @@ fn run_script(path: &str) {
             tensor_ndim:               malus_runtime::tensor_ndim,
             tensor_dim:                malus_runtime::tensor_dim,
             kernel_dispatch_v2:        malus_runtime::kernel_dispatch_v2,
+            tape_register_backward_fn: malus_runtime::tape_register_backward_fn,
+            malus_record_diff:         malus_runtime::malus_record_diff,
         };
         if let Err(e) = malus_codegen_cpu::compile_and_run(&typed, &symbols, &kernel_ids) {
             eprintln!("error: {e}");

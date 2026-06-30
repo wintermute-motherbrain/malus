@@ -55,6 +55,16 @@ pub fn register_builtins() -> HashMap<String, BuiltinSig> {
         return_placement: None,
     });
 
+    // record_diff(value: f32) — M26 gradient-check test infra. Tracks the
+    // max value seen across a run (malus_gradcheck_max_diff(), Rust-side);
+    // lets gradient_check.ml report a tolerance without a malus assert
+    // builtin or stdout-parsing in the test harness.
+    m.insert("record_diff".to_string(), BuiltinSig {
+        kind: BuiltinKind::Fixed(vec![ResolvedTy::Scalar(ScalarTy::F32)]),
+        return_ty: ResolvedTy::Unit,
+        return_placement: None,
+    });
+
     // zeros(d0, d1, ...) -> Tensor<f32> on GPU
     m.insert("zeros".to_string(), BuiltinSig {
         kind: BuiltinKind::ShapeArgs,

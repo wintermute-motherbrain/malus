@@ -4,7 +4,7 @@
 
 malus is a compiled ML DSL for Apple Silicon. Python-like syntax, dual compilation pipeline: `fn` bodies → Cranelift JIT (CPU), `kernel` bodies → Metal Shading Language (GPU). The CTMM memory model uses escape analysis + Lobster-style borrow-inference to insert static `free` calls at compile time, falling back to reference counting only for tensors that genuinely escape their creation scope (primarily tape-saved tensors for autograd). There is one tensor type: `Tensor<dtype>`.
 
-## Current state: **V4 in progress — M24 done (2026-06-30)**
+## Current state: **V4 in progress — M26 done (2026-06-30)**
 
 | Milestone | Status | Crate |
 |---|---|---|
@@ -38,12 +38,12 @@ malus is a compiled ML DSL for Apple Silicon. Python-like syntax, dual compilati
 | M23 — De-risk spike (extended `kernel_dispatch` ABI + CPU-compute counter CI gate) | ✅ done | `malus-runtime` |
 | M24 — Kernel language v2 (thread hierarchy, flat indexing, `let shared`, `barrier()`, control flow, scalar uniforms) | ✅ done | `malus-codegen-gpu`, `malus-syntax`, `malus-sema`, `malus-runtime` |
 | M25 — Stdlib forward kernels (all CPU-loop ops → malus `.ml` kernels; forward-hot-path CPU-counter==0) | ✅ done | all crates |
-| M26 — Backward kernels (GPU autograd; full-step CPU-counter==0 canonical gate) | 🔲 todo | `malus-runtime` |
+| M26 — Backward kernels (GPU autograd; full-step CPU-counter==0 canonical gate) | ✅ done | `malus-runtime`, `malus-codegen-cpu`, `malus-stdlib` |
 | M27 — Kill `Variable` (static grad-inference; one `Tensor` type) | 🔲 todo | `malus-sema`, `malus-codegen-cpu` |
 | M28 — Module trait + generic optimizer (generics, `impl`, `List<T>`; no-unroll lint gate) | 🔲 todo | all crates |
 | M29 — Borrow-inference RC + benchmark (Lobster single-owner/borrow pass; ≤~5% RC ops; Nx PyTorch-MPS) | 🔲 todo | `malus-sema` |
 
-Full milestone specs: `docs/milestones/`. V1 plan: `docs/milestones/v1-plan.md`. V2 plan: `docs/milestones/v2-plan.md`. V3 plan: `docs/milestones/v3-plan.md`. V4 plan: `docs/milestones/v4-plan.md` + individual specs `m23` through `m29`. Architecture decisions: `docs/adr/` (V4 ADRs: 0026–0031). Domain vocabulary: `CONTEXT.md`.
+Full milestone specs: `docs/milestones/`. V1 plan: `docs/milestones/v1-plan.md`. V2 plan: `docs/milestones/v2-plan.md`. V3 plan: `docs/milestones/v3-plan.md`. V4 plan: `docs/milestones/v4-plan.md` + individual specs `m23` through `m29`. Architecture decisions: `docs/adr/` (V4 ADRs: 0026–0032). Domain vocabulary: `CONTEXT.md`.
 
 ## V2 Design Decisions
 
@@ -197,7 +197,7 @@ The `i64` handle is a raw pointer to a heap-allocated `TensorBuffer { buffer: me
 | Transformer stdlib (softmax, layernorm, GELU, cross-entropy) | ✅ M18 | Done; `gelu` uses tanh approx; `layernorm` has no affine (additive post-V3) |
 | Index tensors, `embedding`, `randn` (Philox4x32-10) | ✅ M19 | Done; `gather` reserved (different PyTorch contract); user seed post-V3 |
 | Lvalue assignment (`a[i]=e`, `s.f=e`) | ✅ M20 | Done; `mut` params for interior-only borrows; `**` power op |
-| `transpose`/`sum`/axis reductions are CPU loops | **M25** | Will be replaced by malus `.ml` kernels (ADR-0027/0028); CPU-counter CI gate enforces this; counter instrumented in M23 |
+| `transpose`/`sum`/axis reductions are CPU loops | ✅ M25/M26 | All replaced by malus `.ml` kernels (ADR-0027/0028); CPU-counter CI gate enforces this |
 | File I/O / data loading | ✅ M22 | `read_file`, `str_len`, `str_char_at`, `str_from_char`, `Buffer<i32>`, `freeze`, `rand_int`, `rand_uniform`, `tensor.data[i]` — all done |
 | Non-f32 compute dtypes (f16, bf16) | Post-V4 | Only i32/i64 for index tensors; f16/bf16 mixed-precision deferred (D10) |
 | Cross-module structs/enums unsupported (loader `exported_names` gap) | Post-V4 | See `docs/milestones/cross-module-types.md` |
@@ -208,8 +208,11 @@ The `i64` handle is a raw pointer to a heap-allocated `TensorBuffer { buffer: me
 | Lobster borrow-inference RC elimination | **M29** | The founding CTMM differentiator; ADR-0026 |
 | Kernel language beyond elementwise maps | ✅ M24 | Thread hierarchy, flat indexing, `let shared`, `barrier()`, control flow, scalar uniforms (ADR-0027) |
 | Multi-dim `a[i,j]` indexing + `TensorMeta` strides | **M25** | M24 uses flat 1-D indexing; rank/stride infra deferred with launch-config |
-| Stdlib ops as malus kernels (dogfooding) | **M25** | Currently Rust CPU loops; will move to kernel language (ADR-0028) |
-| Backward kernels on GPU | **M26** | Currently Rust CPU VJPs in tape.rs; will become GPU kernel dispatches (ADR-0031 gate) |
+| Stdlib ops as malus kernels (dogfooding) | ✅ M25/M26 | Forward (M25) and backward (M26) ops are malus kernels; only `matmul` stays a Rust/MPS vendor builtin (ADR-0028) |
+| Backward kernels on GPU | ✅ M26 | Every VJP is a malus kernel + host fn (ADR-0032); `tape.rs` keeps only the tape-walk orchestration; canonical `count()==0` full-train-step gate passes |
+| Embedding backward scatter-add uses per-row gather, not atomics | Post-V4 | Deterministic and exact at nanoGPT's char-level vocab scale; `atomic<f32>`/`atomic_fetch_add_explicit` deferred as a real kernel-language feature for large-vocab efficiency (ADR-0032) |
+| Backward reductions inherit forward's ≤1024 reduced-axis cap | Post-V4 | Single-threadgroup `Array<f32,1024>` scratch (M25); grid-stride reduction to lift it deferred — never hit at nanoGPT's gate config (ADR-0032) |
+| `gpu_barrier()` is barrier-before-*drop*, not barrier-before-*read* | Post-V4 | CTMM's `insert_barriers` only flushes before a pending Tensor's static drop; `Variable` (RC-managed) reads can see stale GPU state if nothing else triggers a flush first. Worked around per-call-site (e.g. `examples/gradient_check.ml`'s `__flush()`); not fixed at the CTMM level (ADR-0032) |
 | Flash attention | Post-V4 | Composed attention ships V4 (ADR-0029); flash requires simdgroup_matrix + mixed precision |
 
 ## Coding conventions

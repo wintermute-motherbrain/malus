@@ -3,6 +3,16 @@ name = "malus-runtime"
 version = "0.1.0"
 edition = "2021"
 
+# M26 / ADR-0031: CPU-arithmetic fallback paths (legacy Rust VJP/forward
+# loops, retired by malus backward kernels) are gated behind this feature so
+# the canonical hot-path gate build can omit it — making stray CPU compute a
+# link error, not a silent pass. On by default so `cargo test --workspace`
+# keeps exercising the reference-implementation tests; the M26 gate test
+# binary is built with `--no-default-features` to prove the property.
+[features]
+default = ["cpu_fallback"]
+cpu_fallback = []
+
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { version = "0.6", features = ["std"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["NSString"] }

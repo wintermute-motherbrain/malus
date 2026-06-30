@@ -1,13 +1,9 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 
-use objc2_metal::MTLBuffer;
-
 use crate::metal::{
-    broadcast_to_shape, gpu_barrier, invert_perm, normalize_perm, permute_by_perm,
-    reshape_to, sum_to_shape, tensor_alloc_gpu, tensor_alloc_ones_gpu,
-    tensor_alloc_zeros_gpu, tensor_matmul, tensor_reduce_mean_axis, tensor_reduce_sum_axis,
-    tensor_retain, tensor_release, tensor_scatter_add, unsqueeze_at, TensorBuffer,
+    invert_perm, normalize_perm, reshape_to, tensor_alloc_ones_gpu,
+    tensor_alloc_zeros_gpu, tensor_retain, tensor_release, TensorBuffer,
 };
 
 // ── OpTag ─────────────────────────────────────────────────────────────────────
@@ -80,6 +76,100 @@ impl OpTag {
             _  => panic!("malus: unknown op tag {tag}"),
         }
     }
+}
+
+// ── BwdSlot ───────────────────────────────────────────────────────────────────
+//
+// M26 (ADR-0032): each VJP is a malus kernel + host fn living in
+// malus-stdlib/stdlib/backward/.  codegen-cpu resolves each fn's finalized
+// JIT pointer after compilation and registers it here by numeric slot —
+// mirroring OpTag's codegen-cpu/malus-runtime dual-definition pattern
+// (drift-tested in tests.rs).  `backward` below transmutes the registered
+// pointer to the slot's known signature and calls it directly; no
+// `bwd_kernel_id` on `TapeNode` is needed because kernel-id resolution
+// happens inside the malus host fn itself, exactly like the forward path.
+
+#[repr(i32)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BwdSlot {
+    AddBwdA           = 0,
+    AddBwdB           = 1,
+    SubBwdA           = 2,
+    SubBwdB           = 3,
+    MulBwdA           = 4,
+    MulBwdB           = 5,
+    DivBwdA           = 6,
+    DivBwdB           = 7,
+    SigmoidBwd        = 8,
+    ReluBwd           = 9,
+    TanhBwd           = 10,
+    ExpBwd            = 11,
+    LogBwd            = 12,
+    SqrtBwd           = 13,
+    AbsBwd            = 14,
+    NegBwd            = 15,
+    SumBwd            = 16,
+    PermuteBwd2D      = 17,
+    PermuteBwd3D      = 18,
+    ReduceSumAxisBwd  = 19,
+    ReduceMeanAxisBwd = 20,
+    ReduceMaxAxisBwd  = 21,
+    ReduceVarAxisBwd  = 22,
+    SoftmaxBwd        = 23,
+    LayernormBwd      = 24,
+    GeluBwd           = 25,
+    CrossEntropyBwd   = 26,
+    EmbeddingBwd      = 27,
+    MatmulBwdA        = 28,
+    MatmulBwdB        = 29,
+    GradAcc           = 30,
+}
+
+pub const N_BWD_SLOTS: usize = 31;
+
+thread_local! {
+    static BWD_SLOTS: RefCell<[usize; N_BWD_SLOTS]> = const { RefCell::new([0; N_BWD_SLOTS]) };
+}
+
+/// Register a backward kernel's finalized JIT function pointer by slot.
+/// Called by codegen-cpu's `compile_and_run` after `finalize_definitions()`
+/// (production), and by the `cpu_fallback` self-registration path (tests).
+/// `extern "C"` for ABI consistency with the rest of `RuntimeSymbols`, but
+/// it is always called directly from Rust on both sides — never injected
+/// into the JIT, never called by JIT'd code.
+#[no_mangle]
+pub extern "C" fn tape_register_backward_fn(slot: i32, func_ptr: usize) {
+    BWD_SLOTS.with(|s| {
+        s.borrow_mut()[slot as usize] = func_ptr;
+    });
+}
+
+fn bwd_slot(slot: BwdSlot) -> usize {
+    let ptr = BWD_SLOTS.with(|s| s.borrow()[slot as usize]);
+    if ptr != 0 {
+        return ptr;
+    }
+
+    // Unregistered: compile_and_run always registers every slot in one
+    // batch before backward() can ever run, so reaching here means this
+    // call never went through that production wiring — malus-runtime's
+    // own isolated tape tests calling backward() directly. Self-register
+    // the cpu_fallback closures (once) and retry. Checking the slot value
+    // first (not a separate "have I registered" flag) is load-bearing: it
+    // guarantees this path never fires after production registration,
+    // even on the very first backward() call in this thread.
+    #[cfg(feature = "cpu_fallback")]
+    {
+        cpu_fallback::ensure_registered();
+        let ptr = BWD_SLOTS.with(|s| s.borrow()[slot as usize]);
+        assert!(ptr != 0, "malus: backward kernel slot {slot:?} not registered even after cpu_fallback self-registration");
+        return ptr;
+    }
+    #[cfg(not(feature = "cpu_fallback"))]
+    panic!(
+        "malus: backward kernel slot {slot:?} not registered — compile_and_run must register \
+         every malus-stdlib backward fn before calling backward()"
+    );
 }
 
 // ── TapeNode ─────────────────────────────────────────────────────────────────
@@ -320,11 +410,14 @@ pub extern "C" fn tape_get_grad(handle: i64) -> i64 {
 
 /// Walk the tape in reverse, accumulate gradients into leaf .grad slots,
 /// then clear the tape.  seed grad is ones_like(loss).
+///
+/// Every VJP dispatches a malus backward kernel via the BwdSlot table
+/// (ADR-0032) — no CPU tensor arithmetic happens in this function. No
+/// leading gpu_barrier(): each malus host fn's own `t[i]` reads get a
+/// barrier auto-inserted by CTMM, so synchronization is handled per-call,
+/// not upfront.
 #[no_mangle]
 pub extern "C" fn backward(loss: i64) {
-    // Flush any pending GPU work so saved handles are readable on the CPU.
-    gpu_barrier();
-
     // Snapshot node data (clones Vec<i64> contents only; no TensorBuffer copies).
     struct NodeSnap {
         op:     OpTag,
@@ -347,7 +440,7 @@ pub extern "C" fn backward(loss: i64) {
     // Transient grad map: input_handle → owned grad tensor (fresh per backward).
     let mut grads: HashMap<i64, i64> = HashMap::new();
 
-    // Seed: ones_like(loss).
+    // Seed: ones_like(loss).  Allocation, not arithmetic — doesn't count.
     {
         let tb = unsafe { &*(loss as *const TensorBuffer) };
         let seed = tensor_alloc_ones_gpu(tb.shape.as_ptr(), tb.shape.len());
@@ -364,380 +457,240 @@ pub extern "C" fn backward(loss: i64) {
         match node.op {
             OpTag::Matmul => {
                 let (a, b) = (node.saved[0], node.saved[1]);
-                let (rank_a, rank_b) = (tb(a).shape.len(), tb(b).shape.len());
-                if rank_a == 2 && rank_b == 2 {
-                    // C (M,N) = A (M,K) @ B (K,N)
-                    let bt = permute_by_perm(b, &[1, 0]);
-                    let da = tensor_matmul(dout, bt);
-                    tensor_release(bt);
-                    let at = permute_by_perm(a, &[1, 0]);
-                    let db = tensor_matmul(at, dout);
-                    tensor_release(at);
-                    accumulate_grad(&mut grads, a, da);
-                    accumulate_grad(&mut grads, b, db);
-                } else if rank_a == 3 && rank_b == 3 {
-                    // C (B,M,N) = A (B,M,K) @ B (B,K,N)
-                    let bt = permute_by_perm(b, &[0, 2, 1]);
-                    let da = tensor_matmul(dout, bt);
-                    tensor_release(bt);
-                    let at = permute_by_perm(a, &[0, 2, 1]);
-                    let db = tensor_matmul(at, dout);
-                    tensor_release(at);
-                    accumulate_grad(&mut grads, a, da);
-                    accumulate_grad(&mut grads, b, db);
-                } else {
-                    // C (B,M,N) = A (B,M,K) @ B (K,N)
-                    // dA (B,M,K) = dC (B,M,N) @ Bᵀ (N,K)   [3D @ 2D]
-                    // dB (K,N)   = sum_b( Aᵀ[b] @ dC[b] ) = reduce_sum(Aᵀ (B,K,M) @ dC (B,M,N), axis=0)
-                    let bt = permute_by_perm(b, &[1, 0]);
-                    let da = tensor_matmul(dout, bt);     // (B,M,N) @ (N,K) → (B,M,K) via (3,2)
-                    tensor_release(bt);
-                    let at = permute_by_perm(a, &[0, 2, 1]);   // (B,K,M)
-                    let db_3d = tensor_matmul(at, dout);       // (B,K,M) @ (B,M,N) → (B,K,N)
-                    tensor_release(at);
-                    let db = tensor_reduce_sum_axis(db_3d, 0, 0); // sum batch → (K,N)
-                    tensor_release(db_3d);
-                    accumulate_grad(&mut grads, a, da);
-                    accumulate_grad(&mut grads, b, db);
-                }
+                let fa: extern "C" fn(i64, i64, i64) -> i64 =
+                    unsafe { std::mem::transmute(bwd_slot(BwdSlot::MatmulBwdA)) };
+                let fb: extern "C" fn(i64, i64, i64) -> i64 =
+                    unsafe { std::mem::transmute(bwd_slot(BwdSlot::MatmulBwdB)) };
+                let da = fa(a, b, dout);
+                let db = fb(a, b, dout);
+                accumulate_grad(&mut grads, a, da);
+                accumulate_grad(&mut grads, b, db);
             }
             OpTag::Add => {
-                // C = A + B  →  dA = reduce_to(dC, A.shape),  dB = reduce_to(dC, B.shape)
-                // Identity fast-paths when shapes match (no broadcast).
                 let (a, b) = (node.saved[0], node.saved[1]);
-                let da = sum_to_shape(dout, &tb(a).shape.clone());
-                let db = sum_to_shape(dout, &tb(b).shape.clone());
+                let fa: extern "C" fn(i64, i64) -> i64 =
+                    unsafe { std::mem::transmute(bwd_slot(BwdSlot::AddBwdA)) };
+                let fb: extern "C" fn(i64, i64) -> i64 =
+                    unsafe { std::mem::transmute(bwd_slot(BwdSlot::AddBwdB)) };
+                let da = fa(dout, a);
+                let db = fb(dout, b);
                 accumulate_grad(&mut grads, a, da);
                 accumulate_grad(&mut grads, b, db);
             }
             OpTag::Sub => {
-                // C = A - B  →  dA = reduce_to(dC, A.shape),  dB = -reduce_to(dC, B.shape)
                 let (a, b) = (node.saved[0], node.saved[1]);
-                let da = sum_to_shape(dout, &tb(a).shape.clone());
-                let neg_dout = scalar_mul(dout, -1.0);
-                let db = sum_to_shape(neg_dout, &tb(b).shape.clone());
-                tensor_release(neg_dout);
+                let fa: extern "C" fn(i64, i64) -> i64 =
+                    unsafe { std::mem::transmute(bwd_slot(BwdSlot::SubBwdA)) };
+                let fb: extern "C" fn(i64, i64) -> i64 =
+                    unsafe { std::mem::transmute(bwd_slot(BwdSlot::SubBwdB)) };
+                let da = fa(dout, a);
+                let db = fb(dout, b);
                 accumulate_grad(&mut grads, a, da);
                 accumulate_grad(&mut grads, b, db);
             }
             OpTag::Mul => {
-                // C = A * B  →  dA = reduce_to(dC * broadcast(B), A.shape)
-                //               dB = reduce_to(broadcast(A) * dC, B.shape)
                 let (a, b) = (node.saved[0], node.saved[1]);
-                let out_shape = tb(dout).shape.clone();
-                let a_shape = tb(a).shape.clone();
-                let b_shape = tb(b).shape.clone();
-                let b_bc = broadcast_to_shape(b, &out_shape);
-                let da_full = elem_mul(dout, b_bc);
-                tensor_release(b_bc);
-                let da = sum_to_shape(da_full, &a_shape);
-                tensor_release(da_full);
-                let a_bc = broadcast_to_shape(a, &out_shape);
-                let db_full = elem_mul(a_bc, dout);
-                tensor_release(a_bc);
-                let db = sum_to_shape(db_full, &b_shape);
-                tensor_release(db_full);
+                let fa: extern "C" fn(i64, i64, i64) -> i64 =
+                    unsafe { std::mem::transmute(bwd_slot(BwdSlot::MulBwdA)) };
+                let fb: extern "C" fn(i64, i64, i64) -> i64 =
+                    unsafe { std::mem::transmute(bwd_slot(BwdSlot::MulBwdB)) };
+                let da = fa(dout, a, b);
+                let db = fb(dout, a, b);
                 accumulate_grad(&mut grads, a, da);
                 accumulate_grad(&mut grads, b, db);
             }
             OpTag::Div => {
-                // C = A / B  →  dA = reduce_to(dC / broadcast(B), A.shape)
-                //               dB = reduce_to(-dC * broadcast(A) / broadcast(B)², B.shape)
                 let (a, b) = (node.saved[0], node.saved[1]);
-                let out_shape = tb(dout).shape.clone();
-                let a_shape = tb(a).shape.clone();
-                let b_shape = tb(b).shape.clone();
-                let b_bc = broadcast_to_shape(b, &out_shape);
-                let da_full = elem_div(dout, b_bc);
-                tensor_release(b_bc);
-                let da = sum_to_shape(da_full, &a_shape);
-                tensor_release(da_full);
-                let a_bc = broadcast_to_shape(a, &out_shape);
-                let tmp = elem_mul(dout, a_bc);
-                tensor_release(a_bc);
-                let neg_tmp = scalar_mul(tmp, -1.0);
-                tensor_release(tmp);
-                let b_bc2 = broadcast_to_shape(b, &out_shape);
-                let b_sq = elem_mul(b_bc2, b_bc2);
-                tensor_release(b_bc2);
-                let db_full = elem_div(neg_tmp, b_sq);
-                tensor_release(neg_tmp);
-                tensor_release(b_sq);
-                let db = sum_to_shape(db_full, &b_shape);
-                tensor_release(db_full);
+                let fa: extern "C" fn(i64, i64, i64) -> i64 =
+                    unsafe { std::mem::transmute(bwd_slot(BwdSlot::DivBwdA)) };
+                let fb: extern "C" fn(i64, i64, i64) -> i64 =
+                    unsafe { std::mem::transmute(bwd_slot(BwdSlot::DivBwdB)) };
+                let da = fa(dout, a, b);
+                let db = fb(dout, a, b);
                 accumulate_grad(&mut grads, a, da);
                 accumulate_grad(&mut grads, b, db);
             }
             OpTag::Sigmoid => {
-                // s = σ(x)  →  dx = dC * s * (1 - s)
-                // node.output = s (forward output, retained by tape)
                 let x = node.saved[0];
                 let s = node.output;
-                let one_minus_s = elem_apply(s, |v| 1.0 - v);
-                let tmp = elem_mul(dout, s);
-                let dx = elem_mul(tmp, one_minus_s);
-                tensor_release(tmp);
-                tensor_release(one_minus_s);
+                let f: extern "C" fn(i64, i64) -> i64 =
+                    unsafe { std::mem::transmute(bwd_slot(BwdSlot::SigmoidBwd)) };
+                let dx = f(s, dout);
                 accumulate_grad(&mut grads, x, dx);
             }
             OpTag::Relu => {
-                // r = max(x, 0)  →  dx = dC * (x > 0)
                 let x = node.saved[0];
-                let mask = elem_apply(x, |v| if v > 0.0 { 1.0 } else { 0.0 });
-                let dx = elem_mul(dout, mask);
-                tensor_release(mask);
+                let f: extern "C" fn(i64, i64) -> i64 =
+                    unsafe { std::mem::transmute(bwd_slot(BwdSlot::ReluBwd)) };
+                let dx = f(x, dout);
                 accumulate_grad(&mut grads, x, dx);
             }
             OpTag::Tanh => {
-                // t = tanh(x)  →  dx = dC * (1 - t²)
                 let x = node.saved[0];
                 let t = node.output;
-                let one_minus_t_sq = elem_apply(t, |v| 1.0 - v * v);
-                let dx = elem_mul(dout, one_minus_t_sq);
-                tensor_release(one_minus_t_sq);
+                let f: extern "C" fn(i64, i64) -> i64 =
+                    unsafe { std::mem::transmute(bwd_slot(BwdSlot::TanhBwd)) };
+                let dx = f(t, dout);
                 accumulate_grad(&mut grads, x, dx);
             }
             OpTag::Exp => {
-                // e = exp(x)  →  dx = dC * e
+                // e = exp(x)  ->  dx = dout * e — reuses the forward
+                // broadcast-mul kernel directly (same-shape multiply).
                 let x = node.saved[0];
                 let e = node.output;
-                let dx = elem_mul(dout, e);
+                let f: extern "C" fn(i64, i64) -> i64 =
+                    unsafe { std::mem::transmute(bwd_slot(BwdSlot::ExpBwd)) };
+                let dx = f(dout, e);
                 accumulate_grad(&mut grads, x, dx);
             }
             OpTag::Log => {
-                // l = log(x)  →  dx = dC / x
+                // l = log(x)  ->  dx = dout / x — reuses the forward
+                // broadcast-div kernel directly (same-shape divide).
                 let x = node.saved[0];
-                let dx = elem_div(dout, x);
+                let f: extern "C" fn(i64, i64) -> i64 =
+                    unsafe { std::mem::transmute(bwd_slot(BwdSlot::LogBwd)) };
+                let dx = f(dout, x);
                 accumulate_grad(&mut grads, x, dx);
             }
             OpTag::Sqrt => {
-                // s = sqrt(x)  →  dx = dC / (2 * s)
                 let x = node.saved[0];
                 let s = node.output;
-                let two_s = scalar_mul(s, 2.0);
-                let dx = elem_div(dout, two_s);
-                tensor_release(two_s);
+                let f: extern "C" fn(i64, i64) -> i64 =
+                    unsafe { std::mem::transmute(bwd_slot(BwdSlot::SqrtBwd)) };
+                let dx = f(s, dout);
                 accumulate_grad(&mut grads, x, dx);
             }
             OpTag::Abs => {
-                // a = |x|  →  dx = dC * sign(x)
                 let x = node.saved[0];
-                let sign = elem_apply(x, |v| {
-                    if v > 0.0 { 1.0 } else if v < 0.0 { -1.0 } else { 0.0 }
-                });
-                let dx = elem_mul(dout, sign);
-                tensor_release(sign);
+                let f: extern "C" fn(i64, i64) -> i64 =
+                    unsafe { std::mem::transmute(bwd_slot(BwdSlot::AbsBwd)) };
+                let dx = f(x, dout);
                 accumulate_grad(&mut grads, x, dx);
             }
             OpTag::Sum => {
-                // s = sum(x)  →  dx = ones_like(x) * dC[0]
-                // dout is a [1] tensor; read the scalar value.
+                // s = sum(x) (full-tensor)  ->  dx = fill_like(x, dout[0]).
+                // dout[0] is read inside the malus host fn (CTMM-inserted
+                // barrier), not here.
                 let x = node.saved[0];
-                let scalar_val = {
-                    let tb = unsafe { &*(dout as *const TensorBuffer) };
-                    let ptr = tb.buffer.contents().as_ptr() as *const f32;
-                    unsafe { *ptr }
-                };
-                let dx = elem_apply(x, |_| scalar_val);
+                let f: extern "C" fn(i64, i64) -> i64 =
+                    unsafe { std::mem::transmute(bwd_slot(BwdSlot::SumBwd)) };
+                let dx = f(x, dout);
                 accumulate_grad(&mut grads, x, dx);
             }
             OpTag::Transpose => {
-                // B = permute(A, perm)  →  dA = permute(dB, inverse_perm)
-                // meta holds the raw dim args recorded at forward time.
+                // B = permute(A, perm)  ->  dA = permute(dB, inverse_perm).
+                // Computing the inverse perm is scalar index arithmetic over
+                // a length<=3 list — orchestration, not tensor compute
+                // (ADR-0031) — so it stays in Rust; the actual gather is the
+                // malus permute_bwd kernel.
                 let x = node.saved[0];
                 let rank = tb(x).shape.len();
                 let raw: Vec<usize> = node.meta.iter().map(|&v| v as usize).collect();
                 let perm = normalize_perm(&raw, rank);
                 let inv  = invert_perm(&perm);
-                let dx   = permute_by_perm(dout, &inv);
+                let dx = if rank == 2 {
+                    let f: extern "C" fn(i64) -> i64 =
+                        unsafe { std::mem::transmute(bwd_slot(BwdSlot::PermuteBwd2D)) };
+                    f(dout)
+                } else {
+                    let f: extern "C" fn(i64, i64, i64, i64) -> i64 =
+                        unsafe { std::mem::transmute(bwd_slot(BwdSlot::PermuteBwd3D)) };
+                    f(dout, inv[0] as i64, inv[1] as i64, inv[2] as i64)
+                };
                 accumulate_grad(&mut grads, x, dx);
             }
             OpTag::Reshape => {
-                // y = reshape(x, new_shape)  →  dx = reshape(dy, x.shape)
+                // y = reshape(x, new_shape)  ->  dx = reshape(dy, x.shape).
+                // Zero-copy (same MTLBuffer) — orchestration, not compute;
+                // stays the existing Rust helper (ADR-0031).
                 let x = node.saved[0];
                 let x_shape = tb(x).shape.clone();
                 let dx = reshape_to(dout, &x_shape);
                 accumulate_grad(&mut grads, x, dx);
             }
             OpTag::Neg => {
-                // y = -x  →  dx = -dC
+                // y = -x  ->  dx = -dout — reuses the scale-by-constant
+                // kernel with c=-1.0.
                 let x = node.saved[0];
-                let dx = scalar_mul(dout, -1.0);
+                let f: extern "C" fn(i64, f32) -> i64 =
+                    unsafe { std::mem::transmute(bwd_slot(BwdSlot::NegBwd)) };
+                let dx = f(dout, -1.0);
                 accumulate_grad(&mut grads, x, dx);
             }
             OpTag::ReduceSumAxis => {
-                // y = sum(x, axis, keepdim)  →  dx = broadcast_to(unsqueeze_if_needed(dout), x.shape)
                 let x = node.saved[0];
-                let axis = node.meta[0] as usize;
-                let keepdim = node.meta[1] != 0;
-                let x_shape = tb(x).shape.clone();
-                let dout_exp = if keepdim { tensor_retain(dout); dout } else { unsqueeze_at(dout, axis) };
-                let dx = broadcast_to_shape(dout_exp, &x_shape);
-                tensor_release(dout_exp);
+                let axis = node.meta[0];
+                let f: extern "C" fn(i64, i64, i64) -> i64 =
+                    unsafe { std::mem::transmute(bwd_slot(BwdSlot::ReduceSumAxisBwd)) };
+                let dx = f(x, dout, axis);
                 accumulate_grad(&mut grads, x, dx);
             }
             OpTag::ReduceMeanAxis => {
-                // y = mean(x, axis, keepdim)  →  dx = broadcast_to(dout / N, x.shape)
                 let x = node.saved[0];
-                let axis = node.meta[0] as usize;
-                let keepdim = node.meta[1] != 0;
-                let x_shape = tb(x).shape.clone();
-                let n = x_shape[axis] as f32;
-                let dout_scaled = scalar_mul(dout, 1.0 / n);
-                let dout_exp = if keepdim {
-                    tensor_retain(dout_scaled); dout_scaled
-                } else {
-                    let u = unsqueeze_at(dout_scaled, axis);
-                    tensor_release(dout_scaled);
-                    u
-                };
-                let dx = broadcast_to_shape(dout_exp, &x_shape);
-                tensor_release(dout_exp);
+                let axis = node.meta[0];
+                let f: extern "C" fn(i64, i64, i64) -> i64 =
+                    unsafe { std::mem::transmute(bwd_slot(BwdSlot::ReduceMeanAxisBwd)) };
+                let dx = f(x, dout, axis);
                 accumulate_grad(&mut grads, x, dx);
             }
             OpTag::ReduceMaxAxis => {
-                // y = max(x, axis, keepdim)  →  dx = dout_bc * (x == max_val) mask
-                // node.output holds the per-axis max values (retained by tape).
                 let x = node.saved[0];
-                let out = node.output;
-                let axis = node.meta[0] as usize;
-                let keepdim = node.meta[1] != 0;
-                let x_shape = tb(x).shape.clone();
-                let out_exp = if keepdim { tensor_retain(out); out } else { unsqueeze_at(out, axis) };
-                let out_bc = broadcast_to_shape(out_exp, &x_shape);
-                tensor_release(out_exp);
-                let mask = elem_cmp_eq(x, out_bc);
-                tensor_release(out_bc);
-                let dout_exp = if keepdim { tensor_retain(dout); dout } else { unsqueeze_at(dout, axis) };
-                let dout_bc = broadcast_to_shape(dout_exp, &x_shape);
-                tensor_release(dout_exp);
-                let dx = elem_mul(dout_bc, mask);
-                tensor_release(dout_bc);
-                tensor_release(mask);
+                let y = node.output;
+                let axis = node.meta[0];
+                let f: extern "C" fn(i64, i64, i64, i64) -> i64 =
+                    unsafe { std::mem::transmute(bwd_slot(BwdSlot::ReduceMaxAxisBwd)) };
+                let dx = f(x, y, dout, axis);
                 accumulate_grad(&mut grads, x, dx);
             }
             OpTag::ReduceVarAxis => {
-                // y = var(x, axis, keepdim) population  →  dx = dout * 2 * (x - mean) / N
                 let x = node.saved[0];
-                let axis = node.meta[0] as usize;
-                let keepdim = node.meta[1] != 0;
-                let x_shape = tb(x).shape.clone();
-                let n = x_shape[axis] as f32;
-                // Recompute mean (cold path; keepdim=1 for easy broadcasting).
-                let mean_h = tensor_reduce_mean_axis(x, axis as i64, 1);
-                let mean_bc = broadcast_to_shape(mean_h, &x_shape);
-                tensor_release(mean_h);
-                // 2 * (x - mean) / N
-                let x_minus_mean = elem_sub(x, mean_bc);
-                tensor_release(mean_bc);
-                let coeff = 2.0 / n;
-                let scaled = scalar_mul(x_minus_mean, coeff);
-                tensor_release(x_minus_mean);
-                // Expand dout to x.shape
-                let dout_exp = if keepdim { tensor_retain(dout); dout } else { unsqueeze_at(dout, axis) };
-                let dout_bc = broadcast_to_shape(dout_exp, &x_shape);
-                tensor_release(dout_exp);
-                let dx = elem_mul(dout_bc, scaled);
-                tensor_release(dout_bc);
-                tensor_release(scaled);
+                let axis = node.meta[0];
+                let f: extern "C" fn(i64, i64, i64) -> i64 =
+                    unsafe { std::mem::transmute(bwd_slot(BwdSlot::ReduceVarAxisBwd)) };
+                let dx = f(x, dout, axis);
                 accumulate_grad(&mut grads, x, dx);
             }
             OpTag::Softmax => {
-                // s = softmax(x, axis)  →  dx = s ⊙ (dout − sum(dout⊙s, axis, keepdim=1))
                 let x = node.saved[0];
                 let s = node.output;
                 let axis = node.meta[0];
-                let x_shape = tb(x).shape.clone();
-                let dout_s = elem_mul(dout, s);
-                let sum_ds = tensor_reduce_sum_axis(dout_s, axis, 1);
-                tensor_release(dout_s);
-                let sum_bc = broadcast_to_shape(sum_ds, &x_shape);
-                tensor_release(sum_ds);
-                let diff = elem_sub(dout, sum_bc);
-                tensor_release(sum_bc);
-                let dx = elem_mul(s, diff);
-                tensor_release(diff);
+                let f: extern "C" fn(i64, i64, i64) -> i64 =
+                    unsafe { std::mem::transmute(bwd_slot(BwdSlot::SoftmaxBwd)) };
+                let dx = f(s, dout, axis);
                 accumulate_grad(&mut grads, x, dx);
             }
             OpTag::Layernorm => {
-                // y = (x − μ) / σ,  σ = sqrt(var + 1e-5)
-                // dx = (1/σ) · (dy − mean(dy, axis, k) − y ⊙ mean(dy⊙y, axis, k))
                 let x = node.saved[0];
                 let var_h = node.saved[1];
                 let y = node.output;
                 let axis = node.meta[0];
-                let x_shape = tb(x).shape.clone();
-                // 1/σ (keepdim shape matching var_h)
-                let inv_sigma_h = elem_apply(var_h, |v| 1.0 / (v + 1e-5_f32).sqrt());
-                let inv_sigma_bc = broadcast_to_shape(inv_sigma_h, &x_shape);
-                tensor_release(inv_sigma_h);
-                // mean(dy, axis, keepdim=1) broadcast
-                let dy_mean_h = tensor_reduce_mean_axis(dout, axis, 1);
-                let dy_mean_bc = broadcast_to_shape(dy_mean_h, &x_shape);
-                tensor_release(dy_mean_h);
-                // mean(dy ⊙ y, axis, keepdim=1) broadcast
-                let dy_y = elem_mul(dout, y);
-                let dy_y_mean_h = tensor_reduce_mean_axis(dy_y, axis, 1);
-                tensor_release(dy_y);
-                let dy_y_mean_bc = broadcast_to_shape(dy_y_mean_h, &x_shape);
-                tensor_release(dy_y_mean_h);
-                // y ⊙ mean(dy⊙y)
-                let y_term = elem_mul(y, dy_y_mean_bc);
-                tensor_release(dy_y_mean_bc);
-                // dy − mean(dy) − y⊙mean(dy⊙y)
-                let tmp = elem_sub(dout, dy_mean_bc);
-                tensor_release(dy_mean_bc);
-                let numer = elem_sub(tmp, y_term);
-                tensor_release(tmp);
-                tensor_release(y_term);
-                let dx = elem_mul(numer, inv_sigma_bc);
-                tensor_release(numer);
-                tensor_release(inv_sigma_bc);
+                let f: extern "C" fn(i64, i64, i64, i64) -> i64 =
+                    unsafe { std::mem::transmute(bwd_slot(BwdSlot::LayernormBwd)) };
+                let dx = f(y, var_h, dout, axis);
                 accumulate_grad(&mut grads, x, dx);
             }
             OpTag::Gelu => {
-                // y = 0.5·x·(1 + tanh(g)),  g = c0·(x + c1·x³)
-                // dy/dx = 0.5·(1+t) + 0.5·x·(1−t²)·g',  t = tanh(g),  g' = c0·(1 + 3·c1·x²)
                 let x = node.saved[0];
-                const C0: f32 = 0.7978845608;
-                const C1: f32 = 0.044715;
-                let gelu_deriv = elem_apply(x, |xi| {
-                    let g  = C0 * (xi + C1 * xi * xi * xi);
-                    let t  = g.tanh();
-                    let gp = C0 * (1.0 + 3.0 * C1 * xi * xi);
-                    0.5 * (1.0 + t) + 0.5 * xi * (1.0 - t * t) * gp
-                });
-                let dx = elem_mul(dout, gelu_deriv);
-                tensor_release(gelu_deriv);
+                let f: extern "C" fn(i64, i64) -> i64 =
+                    unsafe { std::mem::transmute(bwd_slot(BwdSlot::GeluBwd)) };
+                let dx = f(x, dout);
                 accumulate_grad(&mut grads, x, dx);
             }
             OpTag::CrossEntropy => {
-                // L = −mean(log(s[i, t[i]])),  s = softmax(logits, axis=1)
-                // d_logits[i,j] = dout[0]/N · (s[i,j] − 1{j == t[i]})
                 let logits  = node.saved[0];
                 let sm_h    = node.saved[1];
                 let targets = node.saved[2];
-                let n = tb(logits).shape[0];
-                let c = tb(logits).shape[1];
-                let scale = read(dout)[0] / n as f32;
-                let mut grad_data = read(sm_h);
-                let tgt_buf = tb(targets).buffer.contents().as_ptr() as *const u8;
-                let tgt_dtype = tb(targets).dtype;
-                for i in 0..n {
-                    let t = read_int_index_tape(tgt_buf, i, tgt_dtype);
-                    grad_data[i * c + t] -= 1.0;
-                }
-                for v in grad_data.iter_mut() { *v *= scale; }
-                let logits_shape = tb(logits).shape.clone();
-                let dx = tensor_alloc_gpu(0, logits_shape.as_ptr(), logits_shape.len(), grad_data.as_ptr());
+                let f: extern "C" fn(i64, i64, i64) -> i64 =
+                    unsafe { std::mem::transmute(bwd_slot(BwdSlot::CrossEntropyBwd)) };
+                let dx = f(sm_h, targets, dout);
                 accumulate_grad(&mut grads, logits, dx);
             }
             OpTag::Embedding => {
-                // dweight[indices[t]] += dout[t, :] for t in 0..T (scatter-add)
                 let weight  = node.saved[0];
                 let indices = node.saved[1];
-                let vocab_size = tb(weight).shape[0] as i64;
-                let dweight = tensor_scatter_add(dout, indices, vocab_size);
+                let f: extern "C" fn(i64, i64, i64) -> i64 =
+                    unsafe { std::mem::transmute(bwd_slot(BwdSlot::EmbeddingBwd)) };
+                let dweight = f(weight, indices, dout);
                 accumulate_grad(&mut grads, weight, dweight);
             }
         }
@@ -758,7 +711,7 @@ pub extern "C" fn backward(loss: i64) {
                             lg.insert(leaf, new_grad);
                         }
                         Some(old_grad) => {
-                            let summed = elem_add(old_grad, new_grad);
+                            let summed = grad_acc(old_grad, new_grad);
                             to_release.push(old_grad);
                             to_release.push(new_grad);
                             lg.insert(leaf, summed);
@@ -848,88 +801,21 @@ pub(crate) fn registry_lens() -> (usize, usize) {
     )
 }
 
-// ── Integer index reader (for embedding/cross_entropy backward) ───────────────
-
-use crate::metal::Dtype;
-
-fn read_int_index_tape(buf: *const u8, i: usize, dtype: Dtype) -> usize {
-    match dtype {
-        Dtype::I32 => unsafe { *(buf.add(i * 4) as *const i32) as usize }
-        Dtype::I64 => unsafe { *(buf.add(i * 8) as *const i64) as usize }
-        _ => panic!("malus: integer index tensor must be Tensor<i32> or Tensor<i64>, got {:?}", dtype),
-    }
-}
-
-// ── Private CPU math helpers ──────────────────────────────────────────────────
-//
-// All helpers allocate a new owned tensor; callers release temporaries.
-// No GPU work: backward always calls gpu_barrier() first.
+// ── Shared helpers ─────────────────────────────────────────────────────────
 
 fn tb(handle: i64) -> &'static TensorBuffer {
     unsafe { &*(handle as *const TensorBuffer) }
 }
 
-fn read(handle: i64) -> Vec<f32> {
-    let t = tb(handle);
-    let ptr = t.buffer.contents().as_ptr() as *const f32;
-    unsafe { std::slice::from_raw_parts(ptr, t.len).to_vec() }
+/// Add new_grad into old_grad via the registered GradAcc slot (the forward
+/// broadcast-add kernel — gradients accumulated against the same node always
+/// share its shape, so the broadcast machinery degenerates to a same-shape
+/// add). Does not release operands; callers own that.
+fn grad_acc(old: i64, new: i64) -> i64 {
+    let f: extern "C" fn(i64, i64) -> i64 =
+        unsafe { std::mem::transmute(bwd_slot(BwdSlot::GradAcc)) };
+    f(old, new)
 }
-
-fn alloc_like(template: i64, data: &[f32]) -> i64 {
-    let t = tb(template);
-    tensor_alloc_gpu(0, t.shape.as_ptr(), t.shape.len(), data.as_ptr())
-}
-
-fn elem_add(a: i64, b: i64) -> i64 {
-    crate::cpu_compute_inc();
-    let (ad, bd) = (read(a), read(b));
-    let out: Vec<f32> = ad.iter().zip(bd.iter()).map(|(x, y)| x + y).collect();
-    alloc_like(a, &out)
-}
-
-fn elem_sub(a: i64, b: i64) -> i64 {
-    crate::cpu_compute_inc();
-    let (ad, bd) = (read(a), read(b));
-    let out: Vec<f32> = ad.iter().zip(bd.iter()).map(|(x, y)| x - y).collect();
-    alloc_like(a, &out)
-}
-
-fn elem_cmp_eq(a: i64, b: i64) -> i64 {
-    crate::cpu_compute_inc();
-    let (ad, bd) = (read(a), read(b));
-    let out: Vec<f32> = ad.iter().zip(bd.iter()).map(|(x, y)| if x == y { 1.0 } else { 0.0 }).collect();
-    alloc_like(a, &out)
-}
-
-fn elem_mul(a: i64, b: i64) -> i64 {
-    crate::cpu_compute_inc();
-    let (ad, bd) = (read(a), read(b));
-    let out: Vec<f32> = ad.iter().zip(bd.iter()).map(|(x, y)| x * y).collect();
-    alloc_like(a, &out)
-}
-
-fn elem_div(a: i64, b: i64) -> i64 {
-    crate::cpu_compute_inc();
-    let (ad, bd) = (read(a), read(b));
-    let out: Vec<f32> = ad.iter().zip(bd.iter()).map(|(x, y)| x / y).collect();
-    alloc_like(a, &out)
-}
-
-fn scalar_mul(a: i64, s: f32) -> i64 {
-    crate::cpu_compute_inc();
-    let ad = read(a);
-    let out: Vec<f32> = ad.iter().map(|x| x * s).collect();
-    alloc_like(a, &out)
-}
-
-fn elem_apply(a: i64, f: impl Fn(f32) -> f32) -> i64 {
-    crate::cpu_compute_inc();
-    let ad = read(a);
-    let out: Vec<f32> = ad.iter().map(|&v| f(v)).collect();
-    alloc_like(a, &out)
-}
-
-// ── Grad accumulation helper ──────────────────────────────────────────────────
 
 /// Add new_grad into grads[input_handle].  Takes ownership of new_grad.
 fn accumulate_grad(grads: &mut HashMap<i64, i64>, input_handle: i64, new_grad: i64) {
@@ -938,10 +824,438 @@ fn accumulate_grad(grads: &mut HashMap<i64, i64>, input_handle: i64, new_grad: i
             grads.insert(input_handle, new_grad);
         }
         Some(old) => {
-            let summed = elem_add(old, new_grad);
+            let summed = grad_acc(old, new_grad);
             tensor_release(old);
             tensor_release(new_grad);
             grads.insert(input_handle, summed);
         }
+    }
+}
+
+// ── CPU fallback (M26 / ADR-0031 / ADR-0032) ─────────────────────────────────
+//
+// Self-registers the legacy V3 Rust VJP closures into the BwdSlot table the
+// first time `backward()` runs, so malus-runtime's own isolated tape tests
+// (which exercise `backward()` directly, without going through
+// compile_and_run/malus-stdlib) keep working unchanged. Production wiring
+// (codegen-cpu) always registers every slot with real GPU kernel pointers
+// before `backward()` is ever called, so this lazy path never fires there —
+// and without the `cpu_fallback` feature, this module doesn't exist at all,
+// making a stray CPU-compute path structurally impossible to reach in the
+// canonical gate build (the M26 done-when).
+#[cfg(feature = "cpu_fallback")]
+mod cpu_fallback {
+    use std::cell::Cell;
+
+    use objc2_metal::MTLBuffer;
+
+    use crate::metal::{
+        broadcast_to_shape, permute_by_perm, sum_to_shape,
+        tensor_alloc_gpu, tensor_matmul, tensor_reduce_mean_axis, tensor_reduce_sum_axis,
+        tensor_release, tensor_scatter_add, Dtype,
+    };
+
+    use super::{tape_register_backward_fn, tb, BwdSlot};
+
+    thread_local! {
+        static REGISTERED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(super) fn ensure_registered() {
+        REGISTERED.with(|r| {
+            if r.get() {
+                return;
+            }
+            r.set(true);
+            register_all();
+        });
+    }
+
+    fn register_all() {
+        tape_register_backward_fn(BwdSlot::AddBwdA as i32, add_bwd_a as *const () as usize);
+        tape_register_backward_fn(BwdSlot::AddBwdB as i32, add_bwd_b as *const () as usize);
+        tape_register_backward_fn(BwdSlot::SubBwdA as i32, sub_bwd_a as *const () as usize);
+        tape_register_backward_fn(BwdSlot::SubBwdB as i32, sub_bwd_b as *const () as usize);
+        tape_register_backward_fn(BwdSlot::MulBwdA as i32, mul_bwd_a as *const () as usize);
+        tape_register_backward_fn(BwdSlot::MulBwdB as i32, mul_bwd_b as *const () as usize);
+        tape_register_backward_fn(BwdSlot::DivBwdA as i32, div_bwd_a as *const () as usize);
+        tape_register_backward_fn(BwdSlot::DivBwdB as i32, div_bwd_b as *const () as usize);
+        tape_register_backward_fn(BwdSlot::SigmoidBwd as i32, sigmoid_bwd as *const () as usize);
+        tape_register_backward_fn(BwdSlot::ReluBwd as i32, relu_bwd as *const () as usize);
+        tape_register_backward_fn(BwdSlot::TanhBwd as i32, tanh_bwd as *const () as usize);
+        tape_register_backward_fn(BwdSlot::ExpBwd as i32, exp_bwd as *const () as usize);
+        tape_register_backward_fn(BwdSlot::LogBwd as i32, log_bwd as *const () as usize);
+        tape_register_backward_fn(BwdSlot::SqrtBwd as i32, sqrt_bwd as *const () as usize);
+        tape_register_backward_fn(BwdSlot::AbsBwd as i32, abs_bwd as *const () as usize);
+        tape_register_backward_fn(BwdSlot::NegBwd as i32, neg_bwd as *const () as usize);
+        tape_register_backward_fn(BwdSlot::SumBwd as i32, sum_bwd as *const () as usize);
+        tape_register_backward_fn(BwdSlot::PermuteBwd2D as i32, permute_bwd_2d as *const () as usize);
+        tape_register_backward_fn(BwdSlot::PermuteBwd3D as i32, permute_bwd_3d as *const () as usize);
+        tape_register_backward_fn(BwdSlot::ReduceSumAxisBwd as i32, reduce_sum_axis_bwd as *const () as usize);
+        tape_register_backward_fn(BwdSlot::ReduceMeanAxisBwd as i32, reduce_mean_axis_bwd as *const () as usize);
+        tape_register_backward_fn(BwdSlot::ReduceMaxAxisBwd as i32, reduce_max_axis_bwd as *const () as usize);
+        tape_register_backward_fn(BwdSlot::ReduceVarAxisBwd as i32, reduce_var_axis_bwd as *const () as usize);
+        tape_register_backward_fn(BwdSlot::SoftmaxBwd as i32, softmax_bwd as *const () as usize);
+        tape_register_backward_fn(BwdSlot::LayernormBwd as i32, layernorm_bwd as *const () as usize);
+        tape_register_backward_fn(BwdSlot::GeluBwd as i32, gelu_bwd as *const () as usize);
+        tape_register_backward_fn(BwdSlot::CrossEntropyBwd as i32, cross_entropy_bwd as *const () as usize);
+        tape_register_backward_fn(BwdSlot::EmbeddingBwd as i32, embedding_bwd as *const () as usize);
+        tape_register_backward_fn(BwdSlot::MatmulBwdA as i32, matmul_bwd_a as *const () as usize);
+        tape_register_backward_fn(BwdSlot::MatmulBwdB as i32, matmul_bwd_b as *const () as usize);
+        tape_register_backward_fn(BwdSlot::GradAcc as i32, elem_add as *const () as usize);
+    }
+
+    fn read(handle: i64) -> Vec<f32> {
+        let t = tb(handle);
+        let ptr = t.buffer.contents().as_ptr() as *const f32;
+        unsafe { std::slice::from_raw_parts(ptr, t.len).to_vec() }
+    }
+
+    fn alloc_like(template: i64, data: &[f32]) -> i64 {
+        let t = tb(template);
+        tensor_alloc_gpu(0, t.shape.as_ptr(), t.shape.len(), data.as_ptr())
+    }
+
+    fn elem_add(a: i64, b: i64) -> i64 {
+        crate::cpu_compute_inc();
+        let (ad, bd) = (read(a), read(b));
+        let out: Vec<f32> = ad.iter().zip(bd.iter()).map(|(x, y)| x + y).collect();
+        alloc_like(a, &out)
+    }
+
+    fn elem_sub(a: i64, b: i64) -> i64 {
+        crate::cpu_compute_inc();
+        let (ad, bd) = (read(a), read(b));
+        let out: Vec<f32> = ad.iter().zip(bd.iter()).map(|(x, y)| x - y).collect();
+        alloc_like(a, &out)
+    }
+
+    fn elem_cmp_eq(a: i64, b: i64) -> i64 {
+        crate::cpu_compute_inc();
+        let (ad, bd) = (read(a), read(b));
+        let out: Vec<f32> = ad.iter().zip(bd.iter()).map(|(x, y)| if x == y { 1.0 } else { 0.0 }).collect();
+        alloc_like(a, &out)
+    }
+
+    fn elem_mul(a: i64, b: i64) -> i64 {
+        crate::cpu_compute_inc();
+        let (ad, bd) = (read(a), read(b));
+        let out: Vec<f32> = ad.iter().zip(bd.iter()).map(|(x, y)| x * y).collect();
+        alloc_like(a, &out)
+    }
+
+    fn elem_div(a: i64, b: i64) -> i64 {
+        crate::cpu_compute_inc();
+        let (ad, bd) = (read(a), read(b));
+        let out: Vec<f32> = ad.iter().zip(bd.iter()).map(|(x, y)| x / y).collect();
+        alloc_like(a, &out)
+    }
+
+    fn scalar_mul(a: i64, s: f32) -> i64 {
+        crate::cpu_compute_inc();
+        let ad = read(a);
+        let out: Vec<f32> = ad.iter().map(|x| x * s).collect();
+        alloc_like(a, &out)
+    }
+
+    fn elem_apply(a: i64, f: impl Fn(f32) -> f32) -> i64 {
+        crate::cpu_compute_inc();
+        let ad = read(a);
+        let out: Vec<f32> = ad.iter().map(|&v| f(v)).collect();
+        alloc_like(a, &out)
+    }
+
+    fn read_int_index(buf: *const u8, i: usize, dtype: Dtype) -> usize {
+        match dtype {
+            Dtype::I32 => unsafe { *(buf.add(i * 4) as *const i32) as usize }
+            Dtype::I64 => unsafe { *(buf.add(i * 8) as *const i64) as usize }
+            _ => panic!("malus: integer index tensor must be Tensor<i32> or Tensor<i64>, got {:?}", dtype),
+        }
+    }
+
+    extern "C" fn add_bwd_a(dout: i64, a: i64) -> i64 { sum_to_shape(dout, &tb(a).shape.clone()) }
+    extern "C" fn add_bwd_b(dout: i64, b: i64) -> i64 { sum_to_shape(dout, &tb(b).shape.clone()) }
+    extern "C" fn sub_bwd_a(dout: i64, a: i64) -> i64 { sum_to_shape(dout, &tb(a).shape.clone()) }
+    extern "C" fn sub_bwd_b(dout: i64, b: i64) -> i64 {
+        let neg = scalar_mul(dout, -1.0);
+        let r = sum_to_shape(neg, &tb(b).shape.clone());
+        tensor_release(neg);
+        r
+    }
+
+    extern "C" fn mul_bwd_a(dout: i64, a: i64, b: i64) -> i64 {
+        let out_shape = tb(dout).shape.clone();
+        let b_bc = broadcast_to_shape(b, &out_shape);
+        let full = elem_mul(dout, b_bc);
+        tensor_release(b_bc);
+        let r = sum_to_shape(full, &tb(a).shape.clone());
+        tensor_release(full);
+        r
+    }
+    extern "C" fn mul_bwd_b(dout: i64, a: i64, b: i64) -> i64 {
+        let out_shape = tb(dout).shape.clone();
+        let a_bc = broadcast_to_shape(a, &out_shape);
+        let full = elem_mul(a_bc, dout);
+        tensor_release(a_bc);
+        let r = sum_to_shape(full, &tb(b).shape.clone());
+        tensor_release(full);
+        r
+    }
+    extern "C" fn div_bwd_a(dout: i64, a: i64, b: i64) -> i64 {
+        let out_shape = tb(dout).shape.clone();
+        let b_bc = broadcast_to_shape(b, &out_shape);
+        let full = elem_div(dout, b_bc);
+        tensor_release(b_bc);
+        let r = sum_to_shape(full, &tb(a).shape.clone());
+        tensor_release(full);
+        r
+    }
+    extern "C" fn div_bwd_b(dout: i64, a: i64, b: i64) -> i64 {
+        let out_shape = tb(dout).shape.clone();
+        let a_bc = broadcast_to_shape(a, &out_shape);
+        let tmp = elem_mul(dout, a_bc);
+        tensor_release(a_bc);
+        let neg_tmp = scalar_mul(tmp, -1.0);
+        tensor_release(tmp);
+        let b_bc = broadcast_to_shape(b, &out_shape);
+        let b_sq = elem_mul(b_bc, b_bc);
+        tensor_release(b_bc);
+        let full = elem_div(neg_tmp, b_sq);
+        tensor_release(neg_tmp);
+        tensor_release(b_sq);
+        let r = sum_to_shape(full, &tb(b).shape.clone());
+        tensor_release(full);
+        r
+    }
+
+    extern "C" fn sigmoid_bwd(s: i64, dout: i64) -> i64 {
+        let one_minus_s = elem_apply(s, |v| 1.0 - v);
+        let tmp = elem_mul(dout, s);
+        let dx = elem_mul(tmp, one_minus_s);
+        tensor_release(tmp);
+        tensor_release(one_minus_s);
+        dx
+    }
+    extern "C" fn relu_bwd(x: i64, dout: i64) -> i64 {
+        let mask = elem_apply(x, |v| if v > 0.0 { 1.0 } else { 0.0 });
+        let dx = elem_mul(dout, mask);
+        tensor_release(mask);
+        dx
+    }
+    extern "C" fn tanh_bwd(t: i64, dout: i64) -> i64 {
+        let one_minus_t_sq = elem_apply(t, |v| 1.0 - v * v);
+        let dx = elem_mul(dout, one_minus_t_sq);
+        tensor_release(one_minus_t_sq);
+        dx
+    }
+    extern "C" fn exp_bwd(dout: i64, e: i64) -> i64 { elem_mul(dout, e) }
+    extern "C" fn log_bwd(dout: i64, x: i64) -> i64 { elem_div(dout, x) }
+    extern "C" fn sqrt_bwd(s: i64, dout: i64) -> i64 {
+        let two_s = scalar_mul(s, 2.0);
+        let dx = elem_div(dout, two_s);
+        tensor_release(two_s);
+        dx
+    }
+    extern "C" fn abs_bwd(x: i64, dout: i64) -> i64 {
+        let sign = elem_apply(x, |v| if v > 0.0 { 1.0 } else if v < 0.0 { -1.0 } else { 0.0 });
+        let dx = elem_mul(dout, sign);
+        tensor_release(sign);
+        dx
+    }
+    extern "C" fn neg_bwd(dout: i64, c: f32) -> i64 { scalar_mul(dout, c) }
+
+    extern "C" fn sum_bwd(x: i64, dout: i64) -> i64 {
+        let scalar_val = {
+            let t = tb(dout);
+            let ptr = t.buffer.contents().as_ptr() as *const f32;
+            unsafe { *ptr }
+        };
+        elem_apply(x, |_| scalar_val)
+    }
+
+    extern "C" fn permute_bwd_2d(dout: i64) -> i64 { permute_by_perm(dout, &[1, 0]) }
+    extern "C" fn permute_bwd_3d(dout: i64, inv0: i64, inv1: i64, inv2: i64) -> i64 {
+        permute_by_perm(dout, &[inv0 as usize, inv1 as usize, inv2 as usize])
+    }
+
+    extern "C" fn reduce_sum_axis_bwd(x: i64, dout: i64, axis: i64) -> i64 {
+        use crate::metal::unsqueeze_at;
+        let axis = axis as usize;
+        let x_shape = tb(x).shape.clone();
+        let dout_exp = if x_shape.len() == tb(dout).shape.len() { tensor_retain_ret(dout) } else { unsqueeze_at(dout, axis) };
+        let dx = broadcast_to_shape(dout_exp, &x_shape);
+        tensor_release(dout_exp);
+        dx
+    }
+    extern "C" fn reduce_mean_axis_bwd(x: i64, dout: i64, axis: i64) -> i64 {
+        use crate::metal::unsqueeze_at;
+        let axis = axis as usize;
+        let x_shape = tb(x).shape.clone();
+        let n = x_shape[axis] as f32;
+        let dout_scaled = scalar_mul(dout, 1.0 / n);
+        let dout_exp = if x_shape.len() == tb(dout_scaled).shape.len() {
+            dout_scaled
+        } else {
+            let u = unsqueeze_at(dout_scaled, axis);
+            tensor_release(dout_scaled);
+            u
+        };
+        let dx = broadcast_to_shape(dout_exp, &x_shape);
+        tensor_release(dout_exp);
+        dx
+    }
+    extern "C" fn reduce_max_axis_bwd(x: i64, y: i64, dout: i64, axis: i64) -> i64 {
+        use crate::metal::unsqueeze_at;
+        let axis = axis as usize;
+        let x_shape = tb(x).shape.clone();
+        let out_exp = if x_shape.len() == tb(y).shape.len() { tensor_retain_ret(y) } else { unsqueeze_at(y, axis) };
+        let out_bc = broadcast_to_shape(out_exp, &x_shape);
+        tensor_release(out_exp);
+        let mask = elem_cmp_eq(x, out_bc);
+        tensor_release(out_bc);
+        let dout_exp = if x_shape.len() == tb(dout).shape.len() { tensor_retain_ret(dout) } else { unsqueeze_at(dout, axis) };
+        let dout_bc = broadcast_to_shape(dout_exp, &x_shape);
+        tensor_release(dout_exp);
+        let dx = elem_mul(dout_bc, mask);
+        tensor_release(dout_bc);
+        tensor_release(mask);
+        dx
+    }
+    extern "C" fn reduce_var_axis_bwd(x: i64, dout: i64, axis_i64: i64) -> i64 {
+        use crate::metal::unsqueeze_at;
+        let axis = axis_i64 as usize;
+        let x_shape = tb(x).shape.clone();
+        let n = x_shape[axis] as f32;
+        let mean_h = tensor_reduce_mean_axis(x, axis_i64, 1);
+        let mean_bc = broadcast_to_shape(mean_h, &x_shape);
+        tensor_release(mean_h);
+        let x_minus_mean = elem_sub(x, mean_bc);
+        tensor_release(mean_bc);
+        let scaled = scalar_mul(x_minus_mean, 2.0 / n);
+        tensor_release(x_minus_mean);
+        let dout_exp = if x_shape.len() == tb(dout).shape.len() { tensor_retain_ret(dout) } else { unsqueeze_at(dout, axis) };
+        let dout_bc = broadcast_to_shape(dout_exp, &x_shape);
+        tensor_release(dout_exp);
+        let dx = elem_mul(dout_bc, scaled);
+        tensor_release(dout_bc);
+        tensor_release(scaled);
+        dx
+    }
+
+    extern "C" fn softmax_bwd(s: i64, dout: i64, axis: i64) -> i64 {
+        let x_shape = tb(s).shape.clone();
+        let dout_s = elem_mul(dout, s);
+        let sum_ds = tensor_reduce_sum_axis(dout_s, axis, 1);
+        tensor_release(dout_s);
+        let sum_bc = broadcast_to_shape(sum_ds, &x_shape);
+        tensor_release(sum_ds);
+        let diff = elem_sub(dout, sum_bc);
+        tensor_release(sum_bc);
+        let dx = elem_mul(s, diff);
+        tensor_release(diff);
+        dx
+    }
+    extern "C" fn layernorm_bwd(y: i64, var_h: i64, dout: i64, axis: i64) -> i64 {
+        let x_shape = tb(y).shape.clone();
+        let inv_sigma_h = elem_apply(var_h, |v| 1.0 / (v + 1e-5_f32).sqrt());
+        let inv_sigma_bc = broadcast_to_shape(inv_sigma_h, &x_shape);
+        tensor_release(inv_sigma_h);
+        let dy_mean_h = tensor_reduce_mean_axis(dout, axis, 1);
+        let dy_mean_bc = broadcast_to_shape(dy_mean_h, &x_shape);
+        tensor_release(dy_mean_h);
+        let dy_y = elem_mul(dout, y);
+        let dy_y_mean_h = tensor_reduce_mean_axis(dy_y, axis, 1);
+        tensor_release(dy_y);
+        let dy_y_mean_bc = broadcast_to_shape(dy_y_mean_h, &x_shape);
+        tensor_release(dy_y_mean_h);
+        let y_term = elem_mul(y, dy_y_mean_bc);
+        tensor_release(dy_y_mean_bc);
+        let tmp = elem_sub(dout, dy_mean_bc);
+        tensor_release(dy_mean_bc);
+        let numer = elem_sub(tmp, y_term);
+        tensor_release(tmp);
+        tensor_release(y_term);
+        let dx = elem_mul(numer, inv_sigma_bc);
+        tensor_release(numer);
+        tensor_release(inv_sigma_bc);
+        dx
+    }
+    extern "C" fn gelu_bwd(x: i64, dout: i64) -> i64 {
+        const C0: f32 = 0.7978845608;
+        const C1: f32 = 0.044715;
+        let gelu_deriv = elem_apply(x, |xi| {
+            let g  = C0 * (xi + C1 * xi * xi * xi);
+            let t  = g.tanh();
+            let gp = C0 * (1.0 + 3.0 * C1 * xi * xi);
+            0.5 * (1.0 + t) + 0.5 * xi * (1.0 - t * t) * gp
+        });
+        let dx = elem_mul(dout, gelu_deriv);
+        tensor_release(gelu_deriv);
+        dx
+    }
+    extern "C" fn cross_entropy_bwd(probs: i64, targets: i64, dout: i64) -> i64 {
+        crate::cpu_compute_inc();
+        let n = tb(probs).shape[0];
+        let c = tb(probs).shape[1];
+        let scale = read(dout)[0] / n as f32;
+        let mut grad_data = read(probs);
+        let tgt_buf = tb(targets).buffer.contents().as_ptr() as *const u8;
+        let tgt_dtype = tb(targets).dtype;
+        for i in 0..n {
+            let t = read_int_index(tgt_buf, i, tgt_dtype);
+            grad_data[i * c + t] -= 1.0;
+        }
+        for v in grad_data.iter_mut() { *v *= scale; }
+        alloc_like(probs, &grad_data)
+    }
+    extern "C" fn embedding_bwd(weight: i64, indices: i64, dout: i64) -> i64 {
+        let vocab_size = tb(weight).shape[0] as i64;
+        tensor_scatter_add(dout, indices, vocab_size)
+    }
+
+    extern "C" fn matmul_bwd_a(a: i64, b: i64, dout: i64) -> i64 {
+        let (rank_a, rank_b) = (tb(a).shape.len(), tb(b).shape.len());
+        if rank_a == 2 && rank_b == 2 {
+            let bt = permute_by_perm(b, &[1, 0]);
+            let da = tensor_matmul(dout, bt);
+            tensor_release(bt);
+            da
+        } else if rank_a == 3 && rank_b == 3 {
+            let bt = permute_by_perm(b, &[0, 2, 1]);
+            let da = tensor_matmul(dout, bt);
+            tensor_release(bt);
+            da
+        } else {
+            let bt = permute_by_perm(b, &[1, 0]);
+            let da = tensor_matmul(dout, bt);
+            tensor_release(bt);
+            da
+        }
+    }
+    extern "C" fn matmul_bwd_b(a: i64, b: i64, dout: i64) -> i64 {
+        let (rank_a, rank_b) = (tb(a).shape.len(), tb(b).shape.len());
+        if rank_a == 2 && rank_b == 2 {
+            let at = permute_by_perm(a, &[1, 0]);
+            let db = tensor_matmul(at, dout);
+            tensor_release(at);
+            db
+        } else if rank_a == 3 && rank_b == 3 {
+            let at = permute_by_perm(a, &[0, 2, 1]);
+            let db = tensor_matmul(at, dout);
+            tensor_release(at);
+            db
+        } else {
+            let at = permute_by_perm(a, &[0, 2, 1]);
+            let db_3d = tensor_matmul(at, dout);
+            tensor_release(at);
+            let db = tensor_reduce_sum_axis(db_3d, 0, 0);
+            tensor_release(db_3d);
+            db
+        }
+    }
+
+    fn tensor_retain_ret(h: i64) -> i64 {
+        crate::metal::tensor_retain(h);
+        h
     }
 }

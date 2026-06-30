@@ -305,7 +305,6 @@ fn mock_symbols() -> RuntimeSymbols {
         tensor_alloc_zeros_gpu: mock_tensor_alloc_zeros_gpu,
         tensor_alloc_ones_gpu:  mock_tensor_alloc_ones_gpu,
         tensor_matmul:          mock_tensor_matmul,
-        tensor_sum:             mock_tensor_sum,
         tensor_len:             mock_tensor_len,
         tensor_retain:          mock_tensor_retain,
         tensor_release:         mock_tensor_release,
@@ -350,6 +349,10 @@ fn mock_symbols() -> RuntimeSymbols {
         tensor_ndim:               mock_tensor_ndim,
         tensor_dim:                mock_tensor_dim,
         kernel_dispatch_v2:        mock_kernel_dispatch_v2,
+        // M26 — just stores a raw pointer; harmless to use the real fn here
+        // (same as malus_rand_uniform/malus_rand_int above).
+        tape_register_backward_fn: malus_runtime::tape_register_backward_fn,
+        malus_record_diff:         malus_runtime::malus_record_diff,
     }
 }
 

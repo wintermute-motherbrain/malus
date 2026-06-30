@@ -19,6 +19,10 @@ fn __cross_entropy_fwd(logits: Tensor<f32>, targets: Tensor<i32>) -> (Tensor<f32
     let n_tokens = logits.shape[0]
     let vocab = logits.shape[1]
     let probs = __softmax_fwd(logits, 1)
-    let nll = __cross_entropy_nll_kernel[grid=[n_tokens, 1, 1], tg=[1, 1, 1]](probs, targets, vocab)
+    # out= must be explicit here: with no out=, kernel_dispatch_v2 infers the
+    # output shape from input[0] (probs, shape [n_tokens, vocab]) rather than
+    # the kernel's actual [n_tokens] output, corrupting the downstream mean
+    # reduction (which then sees a 2-D tensor and reduces the wrong axis).
+    let nll = __cross_entropy_nll_kernel[grid=[n_tokens, 1, 1], tg=[1, 1, 1], out=[n_tokens, 0, 0]](probs, targets, vocab)
     let loss = __reduce_mean_fwd(nll, 0, 1)
     return (loss, probs)

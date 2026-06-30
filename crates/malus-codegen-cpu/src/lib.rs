@@ -98,7 +98,6 @@ pub struct RuntimeSymbols {
     pub tensor_alloc_zeros_gpu: extern "C" fn(*const usize, usize) -> i64,
     pub tensor_alloc_ones_gpu:  extern "C" fn(*const usize, usize) -> i64,
     pub tensor_matmul:          extern "C" fn(i64, i64) -> i64,
-    pub tensor_sum:             extern "C" fn(i64) -> i64,
     pub tensor_len:             extern "C" fn(i64) -> i64,
     // M9 RC ABI — wired now, unused by M9 CTMM, consumed by M10.
     pub tensor_retain:          extern "C" fn(i64),
@@ -148,7 +147,51 @@ pub struct RuntimeSymbols {
     pub tensor_dim:                extern "C" fn(i64, i64) -> i64,
     // M25 extended dispatch ABI (kernel_dispatch_v2).
     pub kernel_dispatch_v2:        extern "C" fn(u64, *const i64, usize, *const usize, *const usize, *const usize, usize, i32, *const std::ffi::c_void, usize) -> i64,
+    // M26 — registers a backward kernel's finalized JIT pointer by BwdSlot
+    // (ADR-0032). Called directly from Rust in compile_and_run after
+    // finalize_definitions(), never injected into the JIT module itself —
+    // malus source code never calls it.
+    pub tape_register_backward_fn: extern "C" fn(i32, usize),
+    // M26 — gradient-check test infra (record_diff builtin).
+    pub malus_record_diff: extern "C" fn(f32),
 }
+
+// M26 — (BwdSlot discriminant, malus-stdlib fn name) pairs. The discriminant
+// numbering must match `malus_runtime::tape::BwdSlot` exactly; drift is
+// caught the same way as OpTag's (see malus-runtime tests.rs).
+const BWD_SLOT_FNS: &[(i32, &str)] = &[
+    (0,  "__add_bwd_a"),
+    (1,  "__add_bwd_b"),
+    (2,  "__sub_bwd_a"),
+    (3,  "__sub_bwd_b"),
+    (4,  "__mul_bwd_a"),
+    (5,  "__mul_bwd_b"),
+    (6,  "__div_bwd_a"),
+    (7,  "__div_bwd_b"),
+    (8,  "__sigmoid_bwd"),
+    (9,  "__relu_bwd"),
+    (10, "__tanh_bwd"),
+    (11, "__broadcast_mul_fwd"), // ExpBwd: dx = dout * e
+    (12, "__broadcast_div_fwd"), // LogBwd: dx = dout / x
+    (13, "__sqrt_bwd"),
+    (14, "__abs_bwd"),
+    (15, "__scale_fwd"),         // NegBwd: dx = dout * -1.0
+    (16, "__sum_bwd"),
+    (17, "__permute_bwd_2d"),
+    (18, "__permute_bwd_3d"),
+    (19, "__reduce_sum_axis_bwd"),
+    (20, "__reduce_mean_axis_bwd"),
+    (21, "__reduce_max_axis_bwd"),
+    (22, "__reduce_var_axis_bwd"),
+    (23, "__softmax_bwd"),
+    (24, "__layernorm_bwd"),
+    (25, "__gelu_bwd"),
+    (26, "__cross_entropy_bwd"),
+    (27, "__embedding_bwd"),
+    (28, "__matmul_bwd_a"),
+    (29, "__matmul_bwd_b"),
+    (30, "__broadcast_add_fwd"), // GradAcc
+];
 
 // ── Error ─────────────────────────────────────────────────────────────────────
 
@@ -348,7 +391,6 @@ struct Codegen<'m> {
     rt_tensor_alloc_zeros_gpu: FuncId,
     rt_tensor_alloc_ones_gpu: FuncId,
     rt_tensor_matmul: FuncId,
-    rt_tensor_sum: FuncId,
     rt_tensor_len: FuncId,
     rt_print_cstr: FuncId,
     rt_print_f32: FuncId,
@@ -398,6 +440,8 @@ struct Codegen<'m> {
     rt_print_str:                  FuncId,
     // M22: rand_uniform.
     rt_malus_rand_uniform:         FuncId,
+    // M26: record_diff (gradient-check test infra).
+    rt_malus_record_diff:          FuncId,
     // M22: Buffer<i32>.
     rt_malus_buffer_i32:           FuncId,
     rt_malus_buffer_get_i32:       FuncId,
@@ -1618,6 +1662,11 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                     let func_ref = self.import_func(self.codegen.rt_malus_rand_uniform);
                     let call = self.builder.ins().call(func_ref, &[]);
                     Ok(self.builder.inst_results(call).to_vec()[0])
+                } else if callee == "record_diff" {
+                    let v = self.lower_expr(&args[0])?;
+                    let func_ref = self.import_func(self.codegen.rt_malus_record_diff);
+                    self.builder.ins().call(func_ref, &[v]);
+                    Ok(self.builder.ins().iconst(I64, 0))
                 } else if callee == "rand_int" {
                     let n = self.lower_expr(&args[0])?;
                     let func_ref = self.import_func(self.codegen.rt_malus_rand_int);
@@ -2357,10 +2406,15 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
 
     fn lower_eager_cpu_op_with_handle(
         &mut self,
-        name: &str,
+        _name: &str,
         handle: cranelift_codegen::ir::Value,
     ) -> Result<cranelift_codegen::ir::Value, CodegenError> {
-        let func_ref = self.import_func(self.codegen.rt_tensor_sum);
+        // M26: sum(t) routes to the malus __reduce_all_sum_fwd kernel instead
+        // of the retired CPU rt_tensor_sum (ADR-0031/0032).
+        let func_id = self.codegen.func_ids.get("__reduce_all_sum_fwd")
+            .copied()
+            .ok_or_else(|| CodegenError::UnsupportedExpr("stdlib __reduce_all_sum_fwd not found".into()))?;
+        let func_ref = self.import_func(func_id);
         let call = self.builder.ins().call(func_ref, &[handle]);
         Ok(self.builder.inst_results(call).to_vec()[0])
     }
@@ -2847,7 +2901,6 @@ pub fn compile_and_run(
     jit_builder.symbol("tensor_alloc_zeros_gpu", symbols.tensor_alloc_zeros_gpu as *const u8);
     jit_builder.symbol("tensor_alloc_ones_gpu",  symbols.tensor_alloc_ones_gpu  as *const u8);
     jit_builder.symbol("tensor_matmul",          symbols.tensor_matmul          as *const u8);
-    jit_builder.symbol("tensor_sum",             symbols.tensor_sum             as *const u8);
     jit_builder.symbol("tensor_len",             symbols.tensor_len             as *const u8);
     jit_builder.symbol("tensor_retain",          symbols.tensor_retain          as *const u8);
     jit_builder.symbol("tensor_release",         symbols.tensor_release         as *const u8);
@@ -2896,6 +2949,7 @@ pub fn compile_and_run(
     jit_builder.symbol("print_str",                print_str                         as *const u8);
     // M22 rand_uniform.
     jit_builder.symbol("malus_rand_uniform",        symbols.malus_rand_uniform        as *const u8);
+    jit_builder.symbol("malus_record_diff",         symbols.malus_record_diff         as *const u8);
     // M22 Buffer<i32>.
     jit_builder.symbol("malus_buffer_i32",         symbols.malus_buffer_i32          as *const u8);
     jit_builder.symbol("malus_buffer_get_i32",     symbols.malus_buffer_get_i32      as *const u8);
@@ -3003,8 +3057,6 @@ pub fn compile_and_run(
     let rt_tensor_alloc_ones_gpu = module.declare_function("tensor_alloc_ones_gpu", Linkage::Import, &sig_alloc_shape)
         .map_err(|e| CodegenError::JitError(e.to_string()))?;
     let rt_tensor_matmul = module.declare_function("tensor_matmul", Linkage::Import, &sig_binop_tensor)
-        .map_err(|e| CodegenError::JitError(e.to_string()))?;
-    let rt_tensor_sum = module.declare_function("tensor_sum", Linkage::Import, &sig_unary_tensor_ret)
         .map_err(|e| CodegenError::JitError(e.to_string()))?;
     let rt_tensor_len = module.declare_function("tensor_len", Linkage::Import, &sig_unary_tensor_ret)
         .map_err(|e| CodegenError::JitError(e.to_string()))?;
@@ -3248,6 +3300,15 @@ pub fn compile_and_run(
     let rt_malus_rand_uniform = module.declare_function("malus_rand_uniform", Linkage::Import, &sig_rand_uniform)
         .map_err(|e| CodegenError::JitError(e.to_string()))?;
 
+    // M26 record_diff(value: f32) -> Unit.
+    let sig_record_diff = {
+        let mut s = Signature::new(call_conv);
+        s.params.push(AbiParam::new(F32));
+        s
+    };
+    let rt_malus_record_diff = module.declare_function("malus_record_diff", Linkage::Import, &sig_record_diff)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
+
     // M22 Buffer<i32> signatures.
     // malus_buffer_i32(len: i64) -> i64
     let sig_buffer_i32 = {
@@ -3362,7 +3423,6 @@ pub fn compile_and_run(
         rt_tensor_alloc_zeros_gpu,
         rt_tensor_alloc_ones_gpu,
         rt_tensor_matmul,
-        rt_tensor_sum,
         rt_tensor_len,
         rt_print_cstr,
         rt_print_f32,
@@ -3411,6 +3471,7 @@ pub fn compile_and_run(
         rt_tensor_ndim,
         rt_tensor_dim,
         rt_kernel_dispatch_v2,
+        rt_malus_record_diff,
     };
 
     // Second pass: compile each fn body.
@@ -3421,6 +3482,20 @@ pub fn compile_and_run(
 
     cg.module.finalize_definitions()
         .map_err(|e| CodegenError::JitError(e.to_string()))?;
+
+    // M26 (ADR-0032): register every backward kernel's finalized JIT pointer
+    // before main runs, so tape.rs::backward can dispatch to it. Every name
+    // in BWD_SLOT_FNS is a malus-stdlib item, present in func_ids regardless
+    // of call-graph reachability (the first compilation pass declares every
+    // fn in the combined stdlib+user program) — a missing entry means the
+    // stdlib file was renamed/dropped, a real wiring bug worth panicking on.
+    for &(slot, name) in BWD_SLOT_FNS {
+        let func_id = *cg.func_ids.get(name).unwrap_or_else(|| {
+            panic!("malus: backward kernel fn '{name}' (slot {slot}) not found in compiled program")
+        });
+        let ptr = cg.module.get_finalized_function(func_id);
+        (symbols.tape_register_backward_fn)(slot, ptr as usize);
+    }
 
     let main_id = cg.func_ids["main"];
     let main_ptr = cg.module.get_finalized_function(main_id);

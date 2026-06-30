@@ -1,0 +1,41 @@
+# ADR-0032 — Backward Pass as Malus Host Fns (`BackwardSymbols`, no `bwd_kernel_id`)
+
+**Status:** Accepted (V4-M3 / M26)
+**Amends:** M26 spec (which proposed Rust-side `kernel_dispatch_v2` calls + a `bwd_kernel_id` field on `TapeNode`)
+
+## Context
+
+Before M26, `tape.rs::backward` computed every VJP as a Rust CPU loop — the same "defer into Rust" pattern V4 exists to retire (ADR-0028 already drew this line for forward ops: only `matmul` stays a Rust/MPS vendor builtin). The M26 spec's plan was: keep the tape walk in Rust, and have each VJP arm compute its own launch config (grid/threadgroup/output-shape) from the saved tensors' shapes in Rust, then call `kernel_dispatch_v2` directly — with a `bwd_kernel_id: u64` field added to `TapeNode`, populated from a `builtin_to_kernel_id` map threaded into `runtime_init`.
+
+That plan re-implements launch-config and shape-inference logic in Rust that the forward path (M25) already expresses in malus itself, via the `__<op>_fwd` host-fn pattern (e.g. `__softmax_fwd` derives outer/axis/inner from `.shape`/`.ndim` and dispatches via `kernel[grid=...,tg=...](args)`). Given V4's purpose — make malus a real language, not a thin shim over Rust — the backward path should follow the same pattern, not reintroduce the dispatch-glue-in-Rust style M26 set out to eliminate.
+
+## Decision
+
+Every VJP ships as a malus `kernel __<op>_bwd_kernel(...)` + host `fn __<op>_bwd(...)` pair in `crates/malus-stdlib/stdlib/backward/`, mirroring the forward `__<op>_fwd` idiom exactly: the host fn derives launch config from `.shape`/`.ndim` and dispatches via the kernel-launch syntax. **Malus owns all compute, launch-config, and shape-inference; Rust keeps only the tape engine** — the reverse walk over `TapeNode`s, node storage, the leaf→grad map, retain/release, and a thin fn-pointer dispatch table.
+
+**Wiring — `BackwardSymbols`, not `bwd_kernel_id`:** `codegen-cpu::compile_and_run`, after `module.finalize_definitions()` and before running `main`, looks up each `__<op>_bwd` fn by name in `func_ids`, gets its finalized JIT pointer, and registers it into `malus-runtime::tape` via `tape_register_backward_fn(slot: i32, func_ptr: usize)` — a numeric `BwdSlot` enum dual-defined in both crates (codegen-cpu's `BWD_SLOT_FNS: &[(i32, &str)]` and runtime's `BwdSlot`), the same dual-definition + drift-test pattern already used for `OpTag`. `tape.rs::backward`'s reverse-walk `match` transmutes each registered pointer to the slot's known `extern "C" fn(...) -> i64` signature and calls it directly.
+
+This means **no `bwd_kernel_id` field on `TapeNode`** and no `builtin_to_kernel_id` map threaded into `runtime_init`: kernel-id resolution happens *inside* the malus host fn (exactly like forward), so the tape only ever needs a raw fn pointer, not a kernel id.
+
+**Reused ops:** several VJPs don't need new malus kernels at all — they're calls into *existing* forward kernels under a different name: `ExpBwd`/`LogBwd` reuse `__broadcast_mul_fwd`/`__broadcast_div_fwd` (same-shape multiply/divide); `NegBwd` reuses `__scale_fwd(x, -1.0)`; `GradAcc` (both within-backward accumulation and the cross-step `.grad` fold) reuses `__broadcast_add_fwd`. `matmul`'s VJP composes the existing MPS `matmul` builtin with `transpose`/`permute` (ADR-0028 — matmul itself stays the vendor primitive). `Reshape`'s VJP stays the existing Rust `reshape_to` helper (zero-copy, no compute — ADR-0031 doesn't count it).
+
+**Test-only CPU fallback:** malus-runtime's own isolated unit tests (`tests.rs`) call `backward()` directly without going through `compile_and_run`/malus-stdlib. A `#[cfg(feature = "cpu_fallback")]` module in `tape.rs` self-registers the legacy V3 Rust VJP closures into the *same* `BwdSlot` table, lazily, the first time `bwd_slot()` finds slot 0 (unregistered) — checking the slot's *value*, not a separate "have I registered" flag, is load-bearing: it guarantees this path can never fire after production registration has already populated every slot, even on the very first `backward()` call in a thread. `cpu_fallback` is on by default (`cargo test --workspace` exercises it); the canonical V4 gate test binary is built with `--no-default-features`, making every CPU-arithmetic symbol structurally absent — a compile/link error, not a silent pass (ADR-0031).
+
+## `embedding_bwd`: per-row gather, not atomics
+
+Embedding's backward is a scatter-add (`dweight[indices[t]] += dout[t]`) with write collisions when an index repeats. The kernel language has no atomics. Rather than adding them, `__embedding_bwd_kernel` inverts the loop: one thread per `(vocab_row, dim)` sums `dout` over every token whose index matches that row. Deterministic, exact, pure existing kernel language — `O(vocab × seq × embed_dim)`, trivial at nanoGPT's char-level vocab scale. **Deferred:** `atomic<f32>`/`atomic_fetch_add_explicit` for large-vocab efficiency — a genuine kernel-language feature addition, not a hack to route around. See CLAUDE.md Known Limitations.
+
+## Reduction cap inherited from forward
+
+Backward reductions reuse the same single-threadgroup, `Array<f32, 1024>`-scratch reduce kernels as forward (M25), so they inherit forward's existing `≤1024` reduced-axis cap. nanoGPT's gate config (`B=4,T=16,C=32,V=128`) never approaches this. **Deferred:** grid-stride reduction to lift the cap (a pre-existing M25 limitation, not introduced here) — see CLAUDE.md Known Limitations.
+
+## A discovered gap: `gpu_barrier()` is barrier-before-*drop*, not barrier-before-*read*
+
+CTMM's `insert_barriers` pass (`malus-sema/src/ctmm.rs`) only emits a `GpuBarrier` statement before a *drop* of a pending (GPU-dispatch-result) tensor — never before a plain read (`t[i]`, `.data[i]`, `print(t)`). In practice this is usually masked: most malus programs interleave enough CTMM-static-dropped `Tensor` locals that *some* drop's barrier flushes the command buffer before a later read needs the data. `Variable<f32>` values are RC-managed, not CTMM-static-dropped, so a tight sequence of `variable(...)`-wrapped forward calls (gradient_check.ml's finite-difference loops) can read a `.grad`/`.data` value before its GPU computation is visible — the read silently returns the buffer's last state (often zero-initialized). Worked around in `examples/gradient_check.ml` via a `__flush()` helper (a throwaway static-drop `Tensor` read) called after `backward()` and after each loop iteration's Variable-typed forward calls. Not fixed at the CTMM level — that's a real, separate piece of work (extending `insert_barriers` to track Variable/RC pending state, or barrier-before-read generally) outside M26's scope. Documented here so the next person debugging a "reads zero right after computing it" symptom doesn't re-derive this from scratch.
+
+## Consequences
+
+- `tape.rs`'s ~25 `match` arms shrink to thin dispatch: fetch slot, transmute, call, accumulate. No CPU tensor arithmetic in the production build.
+- `crates/malus-stdlib/stdlib/backward/` (5 files, ~30 kernels/host-fns) is new; `crates/malus-stdlib/stdlib/reduce_all.ml` replaces the legacy CPU `sum(t)` builtin (`rt_tensor_sum` removed from `RuntimeSymbols` entirely — `sum()` now routes through `__reduce_all_sum_fwd` like every other builtin).
+- `malus-runtime/src/metal.rs`'s legacy CPU forward fns (`tensor_transpose`, `tensor_reduce_*_axis`, `tensor_softmax_axis`, `tensor_layernorm_axis`, `tensor_gelu`, `tensor_cross_entropy`, `tensor_embedding`, `tensor_broadcast_*`) and VJP helpers (`broadcast_to_shape`, `sum_to_shape`, `tensor_scatter_add`) are `#[cfg(feature = "cpu_fallback")]`-gated. `permute_by_perm` stays ungated — still load-bearing for `tensor_permute`'s general N-D path outside the M25/M24 fast-path coverage (an acknowledged, pre-existing residual CPU path, not on nanoGPT's hot path).
+- Found and fixed in passing (pre-existing, not M26-introduced): `cross_entropy.ml`'s `__cross_entropy_nll_kernel` launch was missing an explicit `out=` shape, so its output silently inherited `probs`' `[n_tokens, vocab]` shape instead of `[n_tokens]` — corrupting the downstream mean reduction whenever `backward()` was called directly on `cross_entropy(...)`'s result (every prior caller wrapped it in an extra reduction, masking the bug).
