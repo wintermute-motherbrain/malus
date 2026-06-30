@@ -18,8 +18,9 @@ The dataset is ~1 MB of text. Embedding it as a literal would produce a source f
 
 ## Consequences
 
-- `RuntimeSymbols` gains `malus_read_file` (and the three string primitives).
-- `ResolvedTy::Str` is used for string return types; codegen represents strings as `(ptr: i64, len: i64)` in Cranelift SSA. String types are not first-class in the broader language — they appear only as return values of `read_file` and as arguments to `println` (which already handles `Str`).
+- `RuntimeSymbols` gains `malus_read_file` and the three string primitives (`malus_str_len`, `malus_str_char_at`, `malus_str_from_char`), plus `malus_str_box` for lowering `Lit::Str` to a StrBox handle.
+- `ResolvedTy::Str` is a new type; codegen represents strings as an `i64` handle to a heap-allocated `StrBox { ptr, len }` (uniform with tensor/buffer handles). `make_drop_stmt_for_ty` returns `None` for `Str` — string handles are intentionally leaked for the whole-program lifetime.
 - The leaking read (`std::fs::read_to_string`, then leaked) is intentional: the buffer lives for the program's duration, consistent with the single-pass JIT execution model where `fn main()` runs once.
 - String escape / UTF-8 handling is best-effort: `str_char_at` returns Unicode scalar values; multi-byte char iteration is user responsibility.
+- **Also added in M22** (extending this ADR's I/O scope): `Buffer<i32>` mutable staging container (`malus_buffer_i32`, `malus_buffer_get_i32`, `malus_buffer_set_i32`, `malus_buffer_free`, `malus_buffer_freeze_i32`); `freeze(buf) -> Tensor<i32>` (non-destructive copy); `tensor.data[i]` flat element read (`malus_tensor_get_f32`); `rand_uniform() -> f32` via Philox (ADR-0024 counter domain 1); `rand_int(n: i64) -> i64` uniform integer [0, n).
 - Post-V3, a proper string type with ownership, a `File` type with seek/close, and SafeTensors I/O would be separate milestones.

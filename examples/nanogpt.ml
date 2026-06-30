@@ -1,154 +1,3 @@
-#![cfg(target_os = "macos")]
-
-use malus_codegen_cpu::{compile_and_run, RuntimeSymbols};
-use malus_sema::check;
-use malus_syntax::parse;
-use std::collections::HashMap;
-use std::sync::Mutex;
-
-static METAL_TEST_LOCK: Mutex<()> = Mutex::new(());
-
-fn real_symbols() -> RuntimeSymbols {
-    RuntimeSymbols {
-        tensor_alloc_gpu:       malus_runtime::tensor_alloc_gpu,
-        tensor_free:            malus_runtime::tensor_free,
-        tensor_print:           malus_runtime::tensor_print,
-        kernel_dispatch:        malus_runtime::kernel_dispatch,
-        gpu_barrier:            malus_runtime::gpu_barrier,
-        tensor_alloc_zeros_gpu: malus_runtime::tensor_alloc_zeros_gpu,
-        tensor_alloc_ones_gpu:  malus_runtime::tensor_alloc_ones_gpu,
-        tensor_matmul:          malus_runtime::tensor_matmul,
-        tensor_transpose:       malus_runtime::tensor_transpose,
-        tensor_sum:             malus_runtime::tensor_sum,
-        tensor_len:             malus_runtime::tensor_len,
-        tensor_retain:          malus_runtime::tensor_retain,
-        tensor_release:         malus_runtime::tensor_release,
-        tape_record_binop:      malus_runtime::tape_record_binop,
-        tape_record_unary:      malus_runtime::tape_record_unary,
-        tape_register_leaf:     malus_runtime::tape_register_leaf,
-        tape_pause:             malus_runtime::tape_pause,
-        tape_resume:            malus_runtime::tape_resume,
-        tape_clear:             malus_runtime::tape_clear,
-        tape_get_grad:          malus_runtime::tape_get_grad,
-        backward:               malus_runtime::backward,
-        tape_zero_grad:         malus_runtime::tape_zero_grad,
-        tensor_broadcast_add:   malus_runtime::tensor_broadcast_add,
-        tensor_broadcast_sub:   malus_runtime::tensor_broadcast_sub,
-        tensor_broadcast_mul:   malus_runtime::tensor_broadcast_mul,
-        tensor_broadcast_div:   malus_runtime::tensor_broadcast_div,
-        tensor_reduce_sum_axis:  malus_runtime::tensor_reduce_sum_axis,
-        tensor_reduce_mean_axis: malus_runtime::tensor_reduce_mean_axis,
-        tensor_reduce_max_axis:  malus_runtime::tensor_reduce_max_axis,
-        tensor_reduce_var_axis:  malus_runtime::tensor_reduce_var_axis,
-        tape_record_reduce:     malus_runtime::tape_record_reduce,
-        tensor_reshape:         malus_runtime::tensor_reshape,
-        tensor_permute:         malus_runtime::tensor_permute,
-        tape_record_perm:       malus_runtime::tape_record_perm,
-        // M18 transformer stdlib.
-        tensor_softmax_axis:       malus_runtime::tensor_softmax_axis,
-        tensor_layernorm_axis:     malus_runtime::tensor_layernorm_axis,
-        tensor_gelu:               malus_runtime::tensor_gelu,
-        tensor_cross_entropy:      malus_runtime::tensor_cross_entropy,
-        tensor_causal_mask:        malus_runtime::tensor_causal_mask,
-        tape_record_layernorm:     malus_runtime::tape_record_layernorm,
-        tape_record_cross_entropy: malus_runtime::tape_record_cross_entropy,
-        // M19 embeddings + randn.
-        tensor_embedding:          malus_runtime::tensor_embedding,
-        tensor_randn:              malus_runtime::tensor_randn,
-        tape_record_embedding:     malus_runtime::tape_record_embedding,
-        // M22 string I/O.
-        malus_str_box:             malus_runtime::malus_str_box,
-        malus_read_file:           malus_runtime::malus_read_file,
-        malus_str_len:             malus_runtime::malus_str_len,
-        malus_str_char_at:         malus_runtime::malus_str_char_at,
-        malus_str_from_char:       malus_runtime::malus_str_from_char,
-        // M22 rand_uniform.
-        malus_rand_uniform:        malus_runtime::malus_rand_uniform,
-        // M22 Buffer<i32>.
-        malus_buffer_i32:          malus_runtime::malus_buffer_i32,
-        malus_buffer_get_i32:      malus_runtime::malus_buffer_get_i32,
-        malus_buffer_set_i32:      malus_runtime::malus_buffer_set_i32,
-        malus_buffer_free:         malus_runtime::malus_buffer_free,
-        malus_buffer_freeze_i32:   malus_runtime::malus_buffer_freeze_i32,
-        // M22 rand_int + tensor_get_f32.
-        malus_rand_int:            malus_runtime::malus_rand_int,
-        malus_tensor_get_f32:      malus_runtime::malus_tensor_get_f32,
-    }
-}
-
-fn run_metal_src(src: &str) {
-    let _guard = METAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let program = parse(malus_syntax::FileId(0), src).expect("parse failed");
-    let aliases = HashMap::new();
-    let typed = check(&program, &aliases).expect("type check failed");
-    let (registry, kernel_ids) =
-        malus_codegen_gpu::compile_kernels(&typed).expect("kernel compilation failed");
-    malus_runtime::runtime_init(&registry.into_hashmap());
-    let symbols = real_symbols();
-    compile_and_run(&typed, &symbols, &kernel_ids).expect("JIT compile and run failed");
-}
-
-#[test]
-fn test_fn_body_tensor_add_correct_on_metal() {
-    let src = r#"
-fn add(a: Tensor<f32>, b: Tensor<f32>) -> Tensor<f32>:
-    return a + b
-
-fn main():
-    let a = Tensor.gpu<f32>([1.0, 2.0, 3.0, 4.0])
-    let b = Tensor.gpu<f32>([5.0, 6.0, 7.0, 8.0])
-    let c = add(a, b)
-    println(c)
-"#;
-    run_metal_src(src);
-}
-
-#[test]
-fn test_fn_body_binop_direct_correct_on_metal() {
-    let src = r#"
-fn main():
-    let a = Tensor.gpu<f32>([1.0, 2.0, 3.0, 4.0])
-    let b = Tensor.gpu<f32>([5.0, 6.0, 7.0, 8.0])
-    let c = a + b
-    println(c)
-"#;
-    run_metal_src(src);
-}
-
-#[test]
-fn test_chained_fn_body_binops_correct_on_metal() {
-    let src = r#"
-fn main():
-    let a = Tensor.gpu<f32>([1.0, 2.0])
-    let b = Tensor.gpu<f32>([3.0, 4.0])
-    let c = Tensor.gpu<f32>([5.0, 6.0])
-    let r = a + b * c
-    println(r)
-"#;
-    run_metal_src(src);
-}
-
-#[test]
-fn test_golden_example_still_runs_on_metal() {
-    let src = r#"
-fn main():
-    let a = Tensor.gpu<f32>([1.0, 2.0, 3.0, 4.0])
-    let b = Tensor.gpu<f32>([5.0, 6.0, 7.0, 8.0])
-    let c = add(a, b)
-    println(c)
-
-kernel add(a: Tensor<f32>, b: Tensor<f32>) -> Tensor<f32>:
-    return a + b
-"#;
-    run_metal_src(src);
-}
-
-// Mini-GPT training loop: n_embd=8, n_head=1, block_size=4, batch=2, vocab=8, 20 steps.
-// Fixed token sequences so no read_file/rand_int needed. Asserts no panic (shape errors,
-// NaN propagation, and RC bugs all manifest as panics/segfaults in this configuration).
-#[test]
-fn test_nanogpt_mini_trains_without_panic() {
-    let src = r#"
 struct AdamW:
     lr: f32
     beta1: f32
@@ -214,7 +63,7 @@ fn forward(gpt: GPT, blk: Block, toks: Tensor<i32>, B: i64, T: i64, C: i64) -> V
     let K = reshape(xn1 @ blk.wk, B, T, C)
     let V = reshape(xn1 @ blk.wv, B, T, C)
     let Kt = permute(K, 0, 2, 1)
-    let scale = variable(ones(1, 1) * 0.35355)
+    let scale = variable(ones(1, 1) * 0.17678)
     let scores = (Q @ Kt) * scale
     let mask = causal_mask(T)
     let vmask = variable(mask)
@@ -310,13 +159,52 @@ fn adamw_gpt_params(opt: AdamW, mut gpt: GPT, mut st: GPTState, t: i64):
     let v_hat_lm = st.vs_lm_head / bc2
     gpt.lm_head = variable(gpt.lm_head.data - opt.lr * m_hat_lm / (sqrt(v_hat_lm) + opt.eps))
 
+fn generate(gpt: GPT, blk: Block, seed: Buffer<i32>, n_gen: i64, vocab: i64, T: i64, C: i64):
+    let mut ctx = buffer_i32(T)
+    for i in range(T):
+        ctx[i] = seed[i]
+    let mut step = 0
+    let mut next_tok = 0
+    while step < n_gen:
+        with no_grad:
+            let mut copy = buffer_i32(T)
+            for i in range(T):
+                copy[i] = ctx[i]
+            let ctx_toks = freeze(copy)
+            let logits = forward(gpt, blk, ctx_toks, 1, T, C)
+            let probs = softmax(logits, axis=1)
+            let offset = (T - 1) * vocab
+            let thresh = rand_uniform()
+            let mut cum = 0.0
+            let mut j = 0
+            while j < vocab:
+                let p = probs.data[offset + j]
+                cum = cum + p
+                if cum > thresh:
+                    next_tok = j
+                    break
+                j = j + 1
+        print(str_from_char(next_tok))
+        for i in range(T - 1):
+            ctx[i] = ctx[i + 1]
+        ctx[T - 1] = next_tok
+        step = step + 1
+    println("")
+
 fn main():
-    let C = 8
-    let T = 4
-    let B = 2
-    let V = 8
-    let C4 = 32
-    let max_steps = 20
+    let C = 32
+    let T = 16
+    let B = 4
+    let V = 128
+    let C4 = 128
+    let max_steps = 300
+
+    let text = read_file("data/tiny_shakespeare.txt")
+    let data_len = str_len(text)
+    let mut data_buf = buffer_i32(data_len)
+    for i in range(data_len):
+        data_buf[i] = str_char_at(text, i)
+
     let init_scale = ones(1, 1) * 0.02
     let ln1_w = variable(ones(C))
     let wq = variable(randn(C, C) * init_scale)
@@ -326,48 +214,49 @@ fn main():
     let ln2_w = variable(ones(C))
     let w1 = variable(randn(C, C4) * init_scale)
     let w2 = variable(randn(C4, C) * init_scale)
-    let blk = Block(ln1_w=ln1_w, wq=wq, wk=wk, wv=wv, wo=wo, ln2_w=ln2_w, w1=w1, w2=w2)
+    let blk = Block(
+        ln1_w=ln1_w,
+        wq=wq,
+        wk=wk,
+        wv=wv,
+        wo=wo,
+        ln2_w=ln2_w,
+        w1=w1,
+        w2=w2,
+    )
     let wte = variable(randn(V, C) * init_scale)
     let wpe = variable(randn(T, C) * init_scale)
     let ln_f = variable(ones(C))
     let lm_head = variable(randn(C, V) * init_scale)
     let gpt = GPT(wte=wte, wpe=wpe, ln_f=ln_f, lm_head=lm_head)
+
     let blk_st = BlockState(
-        ms_ln1=zeros(C), vs_ln1=zeros(C),
-        ms_wq=zeros(C, C), vs_wq=zeros(C, C),
-        ms_wk=zeros(C, C), vs_wk=zeros(C, C),
-        ms_wv=zeros(C, C), vs_wv=zeros(C, C),
-        ms_wo=zeros(C, C), vs_wo=zeros(C, C),
-        ms_ln2=zeros(C), vs_ln2=zeros(C),
+        ms_ln1=zeros(C),    vs_ln1=zeros(C),
+        ms_wq=zeros(C, C),  vs_wq=zeros(C, C),
+        ms_wk=zeros(C, C),  vs_wk=zeros(C, C),
+        ms_wv=zeros(C, C),  vs_wv=zeros(C, C),
+        ms_wo=zeros(C, C),  vs_wo=zeros(C, C),
+        ms_ln2=zeros(C),    vs_ln2=zeros(C),
         ms_w1=zeros(C, C4), vs_w1=zeros(C, C4),
         ms_w2=zeros(C4, C), vs_w2=zeros(C4, C),
     )
     let gpt_st = GPTState(
-        ms_wte=zeros(V, C), vs_wte=zeros(V, C),
-        ms_wpe=zeros(T, C), vs_wpe=zeros(T, C),
-        ms_ln_f=zeros(C), vs_ln_f=zeros(C),
+        ms_wte=zeros(V, C),  vs_wte=zeros(V, C),
+        ms_wpe=zeros(T, C),  vs_wpe=zeros(T, C),
+        ms_ln_f=zeros(C),    vs_ln_f=zeros(C),
         ms_lm_head=zeros(C, V), vs_lm_head=zeros(C, V),
     )
-    let opt = AdamW(lr=0.01, beta1=0.9, beta2=0.999, eps=1e-8, wd=0.01)
+    let opt = AdamW(lr=0.001, beta1=0.9, beta2=0.999, eps=1e-8, wd=0.01)
+
+    let mut print_at = 1
     for step in range(1, max_steps + 1):
         let mut x_buf = buffer_i32(B * T)
         let mut y_buf = buffer_i32(B * T)
-        x_buf[0] = 0
-        x_buf[1] = 1
-        x_buf[2] = 2
-        x_buf[3] = 3
-        y_buf[0] = 1
-        y_buf[1] = 2
-        y_buf[2] = 3
-        y_buf[3] = 4
-        x_buf[4] = 4
-        x_buf[5] = 5
-        x_buf[6] = 6
-        x_buf[7] = 7
-        y_buf[4] = 5
-        y_buf[5] = 6
-        y_buf[6] = 7
-        y_buf[7] = 0
+        for b in range(B):
+            let start = rand_int(data_len - T - 1)
+            for t in range(T):
+                x_buf[b * T + t] = data_buf[start + t]
+                y_buf[b * T + t] = data_buf[start + t + 1]
         let x_toks = freeze(x_buf)
         let y_toks = freeze(y_buf)
         zero_grad(gpt.wte, gpt.wpe, gpt.ln_f, gpt.lm_head,
@@ -378,6 +267,12 @@ fn main():
         backward(loss)
         adamw_block(opt, blk, blk_st, step)
         adamw_gpt_params(opt, gpt, gpt_st, step)
-"#;
-    run_metal_src(src);
-}
+        if step == print_at:
+            println("step {}: loss = {}", step, loss.data)
+            print_at = print_at + 20
+
+    println("\n--- sample ---")
+    let mut seed_buf = buffer_i32(T)
+    for i in range(T):
+        seed_buf[i] = str_char_at(text, i)
+    generate(gpt, blk, seed_buf, 200, V, T, C)

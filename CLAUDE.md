@@ -4,7 +4,7 @@
 
 malus is a compiled ML DSL for Apple Silicon. Python-like syntax, dual compilation pipeline: `fn` bodies → Cranelift JIT (CPU), `kernel` bodies → Metal Shading Language (GPU). The CTMM memory model inserts static `free`/barrier calls at compile time, falling back to reference counting only when lifetimes are structurally ambiguous.
 
-## Current state: **M21 done — MPS matmul (objc2-metal port + MPSMatrixMultiplication, eager); M22 (Data I/O + nanoGPT Capstone) next**
+## Current state: **V3 complete — M22 done (Data I/O + nanoGPT char-GPT capstone); all milestones through V3 finished**
 
 | Milestone | Status | Crate |
 |---|---|---|
@@ -33,7 +33,7 @@ malus is a compiled ML DSL for Apple Silicon. Python-like syntax, dual compilati
 | M19 — Embeddings + Index Tensors (i32/i64 tensors, `embedding`, `randn`/Philox) | ✅ done | all crates |
 | M20 — Lvalue Assignment + AdamW (`a[i]=e`, `s.f=e`, `mut` params, `**` op, AdamW example) | ✅ done | `malus-syntax`, `malus-sema`, `malus-codegen-cpu` |
 | M21 — MPS Migration (objc2-metal port + `matmul` → MPS, eager) | ✅ done | `malus-runtime` |
-| M22 — Data I/O + nanoGPT Capstone (`read_file`, char tokenization, transformer) | 🔲 planned | all crates |
+| M22 — Data I/O + nanoGPT Capstone (`read_file`, char tokenization, transformer) | ✅ done | all crates |
 
 Full milestone specs: `docs/milestones/`. V1 plan: `docs/milestones/v1-plan.md`. V2 plan: `docs/milestones/v2-plan.md`. V3 plan: `docs/milestones/v3-plan.md`. Architecture decisions: `docs/adr/`. Domain vocabulary: `CONTEXT.md`.
 
@@ -188,9 +188,9 @@ The `i64` handle is a raw pointer to a heap-allocated `TensorBuffer { buffer: me
 | `reshape`/`transpose`/`permute`, batched/3-D matmul | ✅ M17 | Done; `view` reserved for strided non-contiguous post-V3 |
 | Transformer stdlib (softmax, layernorm, GELU, cross-entropy) | ✅ M18 | Done; `gelu` uses tanh approx; `layernorm` has no affine (additive post-V3) |
 | Index tensors, `embedding`, `randn` (Philox4x32-10) | ✅ M19 | Done; `gather` reserved (different PyTorch contract); user seed post-V3 |
-| Lvalue assignment (`a[i]=e`, `s.f=e`) | ✅ M20 | Done; `mut` params for interior-only borrows; `**` power op; `Variable` field assign post-V3 (ADR-0016/ADR-0025) |
+| Lvalue assignment (`a[i]=e`, `s.f=e`) | ✅ M20 | Done; `mut` params for interior-only borrows; `**` power op; `Variable` field assign post-V3 (ADR-0016) |
 | `transpose`/`sum`/axis reductions are CPU loops | Post-V3 | `tensor_matmul` migrated to MPS in M21; others not on critical path |
-| File I/O / data loading | M22 (ADR-0018) | No `read_file` yet |
+| File I/O / data loading | ✅ M22 | `read_file`, `str_len`, `str_char_at`, `str_from_char`, `Buffer<i32>`, `freeze`, `rand_int`, `rand_uniform`, `tensor.data[i]` — all done |
 | Non-f32 compute dtypes (f16, bf16) | Post-V3 | Only i32/i64 for index tensors added in M19 |
 | Cross-module structs/enums unsupported (loader `exported_names` gap) | Required post-V3 milestone | See `docs/milestones/cross-module-types.md`; fix needed before M22 import story works |
 | ScalarBroadcast IR node | Post-V3 | Inline scalar-broadcast BinOps work; dedicated IR node deferred |
