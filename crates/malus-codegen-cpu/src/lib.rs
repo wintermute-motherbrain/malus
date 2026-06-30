@@ -98,7 +98,6 @@ pub struct RuntimeSymbols {
     pub tensor_alloc_zeros_gpu: extern "C" fn(*const usize, usize) -> i64,
     pub tensor_alloc_ones_gpu:  extern "C" fn(*const usize, usize) -> i64,
     pub tensor_matmul:          extern "C" fn(i64, i64) -> i64,
-    pub tensor_transpose:       extern "C" fn(i64) -> i64,
     pub tensor_sum:             extern "C" fn(i64) -> i64,
     pub tensor_len:             extern "C" fn(i64) -> i64,
     // M9 RC ABI — wired now, unused by M9 CTMM, consumed by M10.
@@ -115,30 +114,16 @@ pub struct RuntimeSymbols {
     pub backward:               extern "C" fn(i64),
     // M15 tape ABI.
     pub tape_zero_grad:         extern "C" fn(*const i64, usize),
-    // M16 broadcast + axis reductions.
-    pub tensor_broadcast_add:      extern "C" fn(u64, i64, i64) -> i64,
-    pub tensor_broadcast_sub:      extern "C" fn(u64, i64, i64) -> i64,
-    pub tensor_broadcast_mul:      extern "C" fn(u64, i64, i64) -> i64,
-    pub tensor_broadcast_div:      extern "C" fn(u64, i64, i64) -> i64,
-    pub tensor_reduce_sum_axis:    extern "C" fn(i64, i64, i64) -> i64,
-    pub tensor_reduce_mean_axis:   extern "C" fn(i64, i64, i64) -> i64,
-    pub tensor_reduce_max_axis:    extern "C" fn(i64, i64, i64) -> i64,
-    pub tensor_reduce_var_axis:    extern "C" fn(i64, i64, i64) -> i64,
     pub tape_record_reduce:        extern "C" fn(i32, i64, i64, i64, i64),
     // M17 shapes + batched matmul.
     pub tensor_reshape:            extern "C" fn(i64, *const usize, usize) -> i64,
     pub tensor_permute:            extern "C" fn(i64, *const usize, usize) -> i64,
     pub tape_record_perm:          extern "C" fn(i32, i64, i64, *const usize, usize),
     // M18 transformer stdlib.
-    pub tensor_softmax_axis:       extern "C" fn(i64, i64) -> i64,
-    pub tensor_layernorm_axis:     extern "C" fn(i64, i64, *mut i64) -> i64,
-    pub tensor_gelu:               extern "C" fn(i64) -> i64,
-    pub tensor_cross_entropy:      extern "C" fn(i64, i64, *mut i64) -> i64,
     pub tensor_causal_mask:        extern "C" fn(i64) -> i64,
     pub tape_record_layernorm:     extern "C" fn(i32, i64, i64, i64, i64),
     pub tape_record_cross_entropy: extern "C" fn(i32, i64, i64, i64, i64),
-    // M19 embeddings + randn.
-    pub tensor_embedding:          extern "C" fn(i64, i64) -> i64,
+    // M19 randn.
     pub tensor_randn:              extern "C" fn(*const usize, usize) -> i64,
     pub tape_record_embedding:     extern "C" fn(i32, i64, i64, i64),
     // M22 string I/O.
@@ -363,7 +348,6 @@ struct Codegen<'m> {
     rt_tensor_alloc_zeros_gpu: FuncId,
     rt_tensor_alloc_ones_gpu: FuncId,
     rt_tensor_matmul: FuncId,
-    rt_tensor_transpose: FuncId,
     rt_tensor_sum: FuncId,
     rt_tensor_len: FuncId,
     rt_print_cstr: FuncId,
@@ -391,30 +375,16 @@ struct Codegen<'m> {
     rt_backward:           FuncId,
     // M15: tape ABI.
     rt_tape_zero_grad:     FuncId,
-    // M16: broadcast + axis reductions.
-    rt_tensor_broadcast_add:    FuncId,
-    rt_tensor_broadcast_sub:    FuncId,
-    rt_tensor_broadcast_mul:    FuncId,
-    rt_tensor_broadcast_div:    FuncId,
-    rt_tensor_reduce_sum_axis:  FuncId,
-    rt_tensor_reduce_mean_axis: FuncId,
-    rt_tensor_reduce_max_axis:  FuncId,
-    rt_tensor_reduce_var_axis:  FuncId,
     rt_tape_record_reduce:      FuncId,
     // M17: shapes + batched matmul.
     rt_tensor_reshape:          FuncId,
     rt_tensor_permute:          FuncId,
     rt_tape_record_perm:        FuncId,
     // M18: transformer stdlib.
-    rt_tensor_softmax_axis:        FuncId,
-    rt_tensor_layernorm_axis:      FuncId,
-    rt_tensor_gelu:                FuncId,
-    rt_tensor_cross_entropy:       FuncId,
     rt_tensor_causal_mask:         FuncId,
     rt_tape_record_layernorm:      FuncId,
     rt_tape_record_cross_entropy:  FuncId,
-    // M19: embeddings + randn.
-    rt_tensor_embedding:           FuncId,
+    // M19: randn.
     rt_tensor_randn:               FuncId,
     rt_tape_record_embedding:      FuncId,
     // M20: scalar power operator (**).
@@ -1570,9 +1540,11 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                 } else if callee == "layernorm" {
                     self.lower_layernorm(expr.ty.is_variable(), args)
                 } else if callee == "gelu" {
-                    // Unary eager-CPU builtin (like relu/sigmoid but not a GPU kernel).
                     let x = self.lower_expr(&args[0])?;
-                    let func_ref = self.import_func(self.codegen.rt_tensor_gelu);
+                    let func_id = self.codegen.func_ids.get("__gelu_fwd")
+                        .copied()
+                        .ok_or_else(|| CodegenError::UnsupportedExpr("stdlib __gelu_fwd not found".into()))?;
+                    let func_ref = self.import_func(func_id);
                     let call = self.builder.ins().call(func_ref, &[x]);
                     let out  = self.builder.inst_results(call).to_vec()[0];
                     if expr.ty.is_variable() {
@@ -2388,11 +2360,7 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
         name: &str,
         handle: cranelift_codegen::ir::Value,
     ) -> Result<cranelift_codegen::ir::Value, CodegenError> {
-        let func_ref = if name == "transpose" {
-            self.import_func(self.codegen.rt_tensor_transpose)
-        } else {
-            self.import_func(self.codegen.rt_tensor_sum)
-        };
+        let func_ref = self.import_func(self.codegen.rt_tensor_sum);
         let call = self.builder.ins().call(func_ref, &[handle]);
         Ok(self.builder.inst_results(call).to_vec()[0])
     }
@@ -2540,7 +2508,7 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
 
     // M16 helpers.
 
-    /// Call tensor_broadcast_add/sub/mul/div(kernel_id, a, b) -> out.
+    /// Call __broadcast_{add,sub,mul,div}_fwd(a, b) -> out.
     /// kernel_name is the MSL kernel name like "malus_add".
     fn lower_broadcast_binop(
         &mut self,
@@ -2548,18 +2516,18 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
         a: cranelift_codegen::ir::Value,
         b: cranelift_codegen::ir::Value,
     ) -> Result<cranelift_codegen::ir::Value, CodegenError> {
-        let kernel_id = *self.codegen.kernel_ids.get(kernel_name)
-            .ok_or_else(|| CodegenError::UnknownKernel { name: kernel_name.to_string() })?;
-        let id_val = self.builder.ins().iconst(I64, kernel_id as i64);
-        let func_id = match kernel_name {
-            "malus_add" => self.codegen.rt_tensor_broadcast_add,
-            "malus_sub" => self.codegen.rt_tensor_broadcast_sub,
-            "malus_mul" => self.codegen.rt_tensor_broadcast_mul,
-            "malus_div" => self.codegen.rt_tensor_broadcast_div,
+        let fwd_name = match kernel_name {
+            "malus_add" => "__broadcast_add_fwd",
+            "malus_sub" => "__broadcast_sub_fwd",
+            "malus_mul" => "__broadcast_mul_fwd",
+            "malus_div" => "__broadcast_div_fwd",
             _ => return Err(CodegenError::UnsupportedExpr(format!("no broadcast fn for kernel '{kernel_name}'"))),
         };
+        let func_id = self.codegen.func_ids.get(fwd_name)
+            .copied()
+            .ok_or_else(|| CodegenError::UnsupportedExpr(format!("stdlib {fwd_name} not found")))?;
         let func_ref = self.import_func(func_id);
-        let call = self.builder.ins().call(func_ref, &[id_val, a, b]);
+        let call = self.builder.ins().call(func_ref, &[a, b]);
         Ok(self.builder.inst_results(call).to_vec()[0])
     }
 
@@ -2572,21 +2540,23 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
         args: &[malus_sema::TypedExpr],
     ) -> Result<cranelift_codegen::ir::Value, CodegenError> {
         let x = self.lower_expr(&args[0])?;
-        // Sema normalizes axis and keepdim to Scalar(I32); lower_expr returns an I32 Cranelift value.
-        let axis_i32 = self.lower_expr(&args[1])?;
-        let keepdim_i32 = self.lower_expr(&args[2])?;
-        let func_id = match op_tag {
-            OPTAG_REDUCE_SUM_AXIS  => self.codegen.rt_tensor_reduce_sum_axis,
-            OPTAG_REDUCE_MEAN_AXIS => self.codegen.rt_tensor_reduce_mean_axis,
-            OPTAG_REDUCE_MAX_AXIS  => self.codegen.rt_tensor_reduce_max_axis,
-            OPTAG_REDUCE_VAR_AXIS  => self.codegen.rt_tensor_reduce_var_axis,
+        let axis = self.lower_expr(&args[1])?;
+        let keepdim = self.lower_expr(&args[2])?;
+        let fwd_name = match op_tag {
+            OPTAG_REDUCE_SUM_AXIS  => "__reduce_sum_fwd",
+            OPTAG_REDUCE_MEAN_AXIS => "__reduce_mean_fwd",
+            OPTAG_REDUCE_MAX_AXIS  => "__reduce_max_fwd",
+            OPTAG_REDUCE_VAR_AXIS  => "__reduce_var_fwd",
             _ => unreachable!("invalid axis reduction op_tag {}", op_tag),
         };
+        let func_id = self.codegen.func_ids.get(fwd_name)
+            .copied()
+            .ok_or_else(|| CodegenError::UnsupportedExpr(format!("stdlib {fwd_name} not found")))?;
         let func_ref = self.import_func(func_id);
-        let call = self.builder.ins().call(func_ref, &[x, axis_i32, keepdim_i32]);
+        let call = self.builder.ins().call(func_ref, &[x, axis, keepdim]);
         let out = self.builder.inst_results(call).to_vec()[0];
         if is_variable {
-            self.call_tape_record_reduce(op_tag, x, out, axis_i32, keepdim_i32);
+            self.call_tape_record_reduce(op_tag, x, out, axis, keepdim);
         }
         Ok(out)
     }
@@ -2658,13 +2628,14 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
         args: &[malus_sema::TypedExpr],
     ) -> Result<cranelift_codegen::ir::Value, CodegenError> {
         let x    = self.lower_expr(&args[0])?;
-        // axis_expr lowers to I64 (malus integer literals are always I64).
         let axis = self.lower_expr(&args[1])?;
-        let func_ref = self.import_func(self.codegen.rt_tensor_softmax_axis);
+        let func_id = self.codegen.func_ids.get("__softmax_fwd")
+            .copied()
+            .ok_or_else(|| CodegenError::UnsupportedExpr("stdlib __softmax_fwd not found".into()))?;
+        let func_ref = self.import_func(func_id);
         let call = self.builder.ins().call(func_ref, &[x, axis]);
         let out  = self.builder.inst_results(call).to_vec()[0];
         if is_variable {
-            // Reuse tape_record_reduce: saved=[x], output=out, meta=[axis,0].
             let keepdim_zero = self.builder.ins().iconst(I64, 0);
             self.call_tape_record_reduce(OPTAG_SOFTMAX, x, out, axis, keepdim_zero);
         }
@@ -2677,28 +2648,22 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
         is_variable: bool,
         args: &[malus_sema::TypedExpr],
     ) -> Result<cranelift_codegen::ir::Value, CodegenError> {
-        let x      = self.lower_expr(&args[0])?;
-        let axis   = self.lower_expr(&args[1])?;
-        let ptr_ty = self.codegen.ptr_type();
+        let x    = self.lower_expr(&args[0])?;
+        let axis = self.lower_expr(&args[1])?;
+        let func_id = self.codegen.func_ids.get("__layernorm_fwd")
+            .copied()
+            .ok_or_else(|| CodegenError::UnsupportedExpr("stdlib __layernorm_fwd not found".into()))?;
+        let func_ref = self.import_func(func_id);
+        let call      = self.builder.ins().call(func_ref, &[x, axis]);
+        let tuple_ptr = self.builder.inst_results(call).to_vec()[0];
+        let mem      = cranelift_codegen::ir::MemFlags::trusted();
+        let normed   = self.builder.ins().load(I64, mem, tuple_ptr, 8);
+        let variance = self.builder.ins().load(I64, mem, tuple_ptr, 16);
+        self.call_aggregate_release(tuple_ptr);
         if is_variable {
-            // Allocate 8-byte stack slot to receive the var tensor handle back.
-            let slot = self.builder.create_sized_stack_slot(
-                cranelift_codegen::ir::StackSlotData::new(
-                    cranelift_codegen::ir::StackSlotKind::ExplicitSlot, 8, 3));
-            let var_ptr = self.builder.ins().stack_addr(ptr_ty, slot, 0);
-            let func_ref = self.import_func(self.codegen.rt_tensor_layernorm_axis);
-            let call  = self.builder.ins().call(func_ref, &[x, axis, var_ptr]);
-            let out   = self.builder.inst_results(call).to_vec()[0];
-            let var_h = self.builder.ins().stack_load(I64, slot, 0);
-            self.call_tape_record_layernorm(OPTAG_LAYERNORM, x, out, var_h, axis);
-            Ok(out)
-        } else {
-            // Pass null var_out — runtime skips the var allocation.
-            let null = self.builder.ins().iconst(ptr_ty, 0);
-            let func_ref = self.import_func(self.codegen.rt_tensor_layernorm_axis);
-            let call = self.builder.ins().call(func_ref, &[x, axis, null]);
-            Ok(self.builder.inst_results(call).to_vec()[0])
+            self.call_tape_record_layernorm(OPTAG_LAYERNORM, x, normed, variance, axis);
         }
+        Ok(normed)
     }
 
     /// embedding(weight: Variable<f32>, indices: Tensor<i32|i64>) -> Variable<f32>
@@ -2708,7 +2673,10 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
     ) -> Result<cranelift_codegen::ir::Value, CodegenError> {
         let weight  = self.lower_expr(&args[0])?;
         let indices = self.lower_expr(&args[1])?;
-        let func_ref = self.import_func(self.codegen.rt_tensor_embedding);
+        let func_id = self.codegen.func_ids.get("__embedding_fwd")
+            .copied()
+            .ok_or_else(|| CodegenError::UnsupportedExpr("stdlib __embedding_fwd not found".into()))?;
+        let func_ref = self.import_func(func_id);
         let call = self.builder.ins().call(func_ref, &[weight, indices]);
         let out  = self.builder.inst_results(call).to_vec()[0];
         let tag  = self.builder.ins().iconst(I32, OPTAG_EMBEDDING as i64);
@@ -2724,18 +2692,18 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
     ) -> Result<cranelift_codegen::ir::Value, CodegenError> {
         let logits  = self.lower_expr(&args[0])?;
         let targets = self.lower_expr(&args[1])?;
-        let ptr_ty  = self.codegen.ptr_type();
-        // Allocate 8-byte slot to receive the softmax handle.
-        let slot = self.builder.create_sized_stack_slot(
-            cranelift_codegen::ir::StackSlotData::new(
-                cranelift_codegen::ir::StackSlotKind::ExplicitSlot, 8, 3));
-        let sm_ptr  = self.builder.ins().stack_addr(ptr_ty, slot, 0);
-        let func_ref = self.import_func(self.codegen.rt_tensor_cross_entropy);
-        let call    = self.builder.ins().call(func_ref, &[logits, targets, sm_ptr]);
-        let out     = self.builder.inst_results(call).to_vec()[0];
-        let sm_h    = self.builder.ins().stack_load(I64, slot, 0);
-        self.call_tape_record_cross_entropy(OPTAG_CROSS_ENTROPY, logits, out, sm_h, targets);
-        Ok(out)
+        let func_id = self.codegen.func_ids.get("__cross_entropy_fwd")
+            .copied()
+            .ok_or_else(|| CodegenError::UnsupportedExpr("stdlib __cross_entropy_fwd not found".into()))?;
+        let func_ref  = self.import_func(func_id);
+        let call      = self.builder.ins().call(func_ref, &[logits, targets]);
+        let tuple_ptr = self.builder.inst_results(call).to_vec()[0];
+        let mem   = cranelift_codegen::ir::MemFlags::trusted();
+        let loss  = self.builder.ins().load(I64, mem, tuple_ptr, 8);
+        let probs = self.builder.ins().load(I64, mem, tuple_ptr, 16);
+        self.call_aggregate_release(tuple_ptr);
+        self.call_tape_record_cross_entropy(OPTAG_CROSS_ENTROPY, logits, loss, probs, targets);
+        Ok(loss)
     }
 
     /// causal_mask(T: i64) -> Tensor<f32>
@@ -2760,6 +2728,47 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
         let handle = self.lower_expr(&args[0])?;
         let dim_args = &args[1..];
         let n = dim_args.len() as u32;
+
+        // Stdlib fast path: 2-D transpose (no dim args).
+        if callee == "transpose" && n == 0 {
+            let func_id = self.codegen.func_ids.get("__transpose_2d_fwd")
+                .copied()
+                .ok_or_else(|| CodegenError::UnsupportedExpr("stdlib __transpose_2d_fwd not found".into()))?;
+            let func_ref = self.import_func(func_id);
+            let call = self.builder.ins().call(func_ref, &[handle]);
+            let out  = self.builder.inst_results(call).to_vec()[0];
+            if is_variable {
+                let null_ptr  = self.builder.ins().iconst(self.codegen.ptr_type(), 0);
+                let zero      = self.builder.ins().iconst(self.codegen.ptr_type(), 0);
+                self.call_tape_record_perm(OPTAG_TRANSPOSE, handle, out, null_ptr, zero);
+            }
+            return Ok(out);
+        }
+
+        // Stdlib fast path: 3-D permute.
+        if callee == "permute" && n == 3 {
+            let p0 = self.lower_expr(&dim_args[0])?;
+            let p1 = self.lower_expr(&dim_args[1])?;
+            let p2 = self.lower_expr(&dim_args[2])?;
+            let func_id = self.codegen.func_ids.get("__permute_3d_fwd")
+                .copied()
+                .ok_or_else(|| CodegenError::UnsupportedExpr("stdlib __permute_3d_fwd not found".into()))?;
+            let func_ref = self.import_func(func_id);
+            let call = self.builder.ins().call(func_ref, &[handle, p0, p1, p2]);
+            let out  = self.builder.inst_results(call).to_vec()[0];
+            if is_variable {
+                let slot = self.builder.create_sized_stack_slot(
+                    cranelift_codegen::ir::StackSlotData::new(
+                        cranelift_codegen::ir::StackSlotKind::ExplicitSlot, 24, 3));
+                self.builder.ins().stack_store(p0, slot, 0);
+                self.builder.ins().stack_store(p1, slot, 8);
+                self.builder.ins().stack_store(p2, slot, 16);
+                let dims_ptr  = self.builder.ins().stack_addr(self.codegen.ptr_type(), slot, 0);
+                let ndims_val = self.builder.ins().iconst(self.codegen.ptr_type(), 3);
+                self.call_tape_record_perm(OPTAG_TRANSPOSE, handle, out, dims_ptr, ndims_val);
+            }
+            return Ok(out);
+        }
 
         // Build stack slot for variadic dim args (identical idiom to lower_zeros_ones).
         let (dims_ptr, ndims_val) = if n == 0 {
@@ -2790,7 +2799,7 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
             let call = self.builder.ins().call(func_ref, &[handle, dims_ptr, ndims_val]);
             self.builder.inst_results(call).to_vec()[0]
         } else {
-            // "transpose" or "permute" — both lower to tensor_permute.
+            // Fallback: transpose(t, i, j) or other permute forms — use rt_tensor_permute.
             let func_ref = self.import_func(self.codegen.rt_tensor_permute);
             let call = self.builder.ins().call(func_ref, &[handle, dims_ptr, ndims_val]);
             self.builder.inst_results(call).to_vec()[0]
@@ -2838,7 +2847,6 @@ pub fn compile_and_run(
     jit_builder.symbol("tensor_alloc_zeros_gpu", symbols.tensor_alloc_zeros_gpu as *const u8);
     jit_builder.symbol("tensor_alloc_ones_gpu",  symbols.tensor_alloc_ones_gpu  as *const u8);
     jit_builder.symbol("tensor_matmul",          symbols.tensor_matmul          as *const u8);
-    jit_builder.symbol("tensor_transpose",       symbols.tensor_transpose       as *const u8);
     jit_builder.symbol("tensor_sum",             symbols.tensor_sum             as *const u8);
     jit_builder.symbol("tensor_len",             symbols.tensor_len             as *const u8);
     jit_builder.symbol("tensor_retain",          symbols.tensor_retain          as *const u8);
@@ -2865,30 +2873,16 @@ pub fn compile_and_run(
     jit_builder.symbol("backward",               symbols.backward               as *const u8);
     // M15 tape ABI.
     jit_builder.symbol("tape_zero_grad",         symbols.tape_zero_grad         as *const u8);
-    // M16 broadcast + axis reductions.
-    jit_builder.symbol("tensor_broadcast_add",   symbols.tensor_broadcast_add   as *const u8);
-    jit_builder.symbol("tensor_broadcast_sub",   symbols.tensor_broadcast_sub   as *const u8);
-    jit_builder.symbol("tensor_broadcast_mul",   symbols.tensor_broadcast_mul   as *const u8);
-    jit_builder.symbol("tensor_broadcast_div",   symbols.tensor_broadcast_div   as *const u8);
-    jit_builder.symbol("tensor_reduce_sum_axis",  symbols.tensor_reduce_sum_axis  as *const u8);
-    jit_builder.symbol("tensor_reduce_mean_axis", symbols.tensor_reduce_mean_axis as *const u8);
-    jit_builder.symbol("tensor_reduce_max_axis",  symbols.tensor_reduce_max_axis  as *const u8);
-    jit_builder.symbol("tensor_reduce_var_axis",  symbols.tensor_reduce_var_axis  as *const u8);
     jit_builder.symbol("tape_record_reduce",     symbols.tape_record_reduce     as *const u8);
     // M17 shapes + batched matmul.
     jit_builder.symbol("tensor_reshape",         symbols.tensor_reshape         as *const u8);
     jit_builder.symbol("tensor_permute",         symbols.tensor_permute         as *const u8);
     jit_builder.symbol("tape_record_perm",       symbols.tape_record_perm       as *const u8);
     // M18 transformer stdlib.
-    jit_builder.symbol("tensor_softmax_axis",       symbols.tensor_softmax_axis       as *const u8);
-    jit_builder.symbol("tensor_layernorm_axis",     symbols.tensor_layernorm_axis     as *const u8);
-    jit_builder.symbol("tensor_gelu",               symbols.tensor_gelu               as *const u8);
-    jit_builder.symbol("tensor_cross_entropy",      symbols.tensor_cross_entropy      as *const u8);
     jit_builder.symbol("tensor_causal_mask",        symbols.tensor_causal_mask        as *const u8);
     jit_builder.symbol("tape_record_layernorm",     symbols.tape_record_layernorm     as *const u8);
     jit_builder.symbol("tape_record_cross_entropy", symbols.tape_record_cross_entropy as *const u8);
-    // M19 embeddings + randn.
-    jit_builder.symbol("tensor_embedding",          symbols.tensor_embedding          as *const u8);
+    // M19 randn.
     jit_builder.symbol("tensor_randn",              symbols.tensor_randn              as *const u8);
     jit_builder.symbol("tape_record_embedding",     symbols.tape_record_embedding     as *const u8);
     // M20 scalar power operator.
@@ -3010,8 +3004,6 @@ pub fn compile_and_run(
         .map_err(|e| CodegenError::JitError(e.to_string()))?;
     let rt_tensor_matmul = module.declare_function("tensor_matmul", Linkage::Import, &sig_binop_tensor)
         .map_err(|e| CodegenError::JitError(e.to_string()))?;
-    let rt_tensor_transpose = module.declare_function("tensor_transpose", Linkage::Import, &sig_unary_tensor_ret)
-        .map_err(|e| CodegenError::JitError(e.to_string()))?;
     let rt_tensor_sum = module.declare_function("tensor_sum", Linkage::Import, &sig_unary_tensor_ret)
         .map_err(|e| CodegenError::JitError(e.to_string()))?;
     let rt_tensor_len = module.declare_function("tensor_len", Linkage::Import, &sig_unary_tensor_ret)
@@ -3113,41 +3105,6 @@ pub fn compile_and_run(
     let rt_tape_zero_grad = module.declare_function("tape_zero_grad", Linkage::Import, &sig_tape_zero_grad)
         .map_err(|e| CodegenError::JitError(e.to_string()))?;
 
-    // M16: tensor_broadcast_add/sub/mul/div(kernel_id: u64, a: i64, b: i64) -> i64
-    let sig_broadcast_binop = {
-        let mut s = Signature::new(call_conv);
-        s.params.push(AbiParam::new(I64)); // kernel_id (u64 → I64)
-        s.params.push(AbiParam::new(I64)); // a
-        s.params.push(AbiParam::new(I64)); // b
-        s.returns.push(AbiParam::new(I64));
-        s
-    };
-    let rt_tensor_broadcast_add = module.declare_function("tensor_broadcast_add", Linkage::Import, &sig_broadcast_binop)
-        .map_err(|e| CodegenError::JitError(e.to_string()))?;
-    let rt_tensor_broadcast_sub = module.declare_function("tensor_broadcast_sub", Linkage::Import, &sig_broadcast_binop)
-        .map_err(|e| CodegenError::JitError(e.to_string()))?;
-    let rt_tensor_broadcast_mul = module.declare_function("tensor_broadcast_mul", Linkage::Import, &sig_broadcast_binop)
-        .map_err(|e| CodegenError::JitError(e.to_string()))?;
-    let rt_tensor_broadcast_div = module.declare_function("tensor_broadcast_div", Linkage::Import, &sig_broadcast_binop)
-        .map_err(|e| CodegenError::JitError(e.to_string()))?;
-    // M16: tensor_reduce_*_axis(h: i64, axis: i64, keepdim: i64) -> i64
-    // axis/keepdim are I64 because malus integer literals always lower to I64.
-    let sig_reduce_axis = {
-        let mut s = Signature::new(call_conv);
-        s.params.push(AbiParam::new(I64)); // h
-        s.params.push(AbiParam::new(I64)); // axis
-        s.params.push(AbiParam::new(I64)); // keepdim
-        s.returns.push(AbiParam::new(I64));
-        s
-    };
-    let rt_tensor_reduce_sum_axis = module.declare_function("tensor_reduce_sum_axis", Linkage::Import, &sig_reduce_axis)
-        .map_err(|e| CodegenError::JitError(e.to_string()))?;
-    let rt_tensor_reduce_mean_axis = module.declare_function("tensor_reduce_mean_axis", Linkage::Import, &sig_reduce_axis)
-        .map_err(|e| CodegenError::JitError(e.to_string()))?;
-    let rt_tensor_reduce_max_axis = module.declare_function("tensor_reduce_max_axis", Linkage::Import, &sig_reduce_axis)
-        .map_err(|e| CodegenError::JitError(e.to_string()))?;
-    let rt_tensor_reduce_var_axis = module.declare_function("tensor_reduce_var_axis", Linkage::Import, &sig_reduce_axis)
-        .map_err(|e| CodegenError::JitError(e.to_string()))?;
     // M16: tape_record_reduce(op: i32, x: i64, out: i64, axis: i64, keepdim: i64)
     let sig_tape_record_reduce = {
         let mut s = Signature::new(call_conv);
@@ -3187,48 +3144,13 @@ pub fn compile_and_run(
     let rt_tape_record_perm = module.declare_function("tape_record_perm", Linkage::Import, &sig_tape_record_perm)
         .map_err(|e| CodegenError::JitError(e.to_string()))?;
 
-    // M18: tensor_softmax_axis(h: i64, axis: i64) -> i64
-    let sig_axis_op = {
-        let mut s = Signature::new(call_conv);
-        s.params.push(AbiParam::new(I64)); // h
-        s.params.push(AbiParam::new(I64)); // axis
-        s.returns.push(AbiParam::new(I64));
-        s
-    };
-    let rt_tensor_softmax_axis = module.declare_function("tensor_softmax_axis", Linkage::Import, &sig_axis_op)
-        .map_err(|e| CodegenError::JitError(e.to_string()))?;
-    // M18: tensor_layernorm_axis(h: i64, axis: i64, var_out: *mut i64) -> i64
-    let sig_layernorm = {
-        let mut s = Signature::new(call_conv);
-        s.params.push(AbiParam::new(I64)); // h
-        s.params.push(AbiParam::new(I64)); // axis
-        s.params.push(AbiParam::new(ptr)); // var_out (*mut i64)
-        s.returns.push(AbiParam::new(I64));
-        s
-    };
-    let rt_tensor_layernorm_axis = module.declare_function("tensor_layernorm_axis", Linkage::Import, &sig_layernorm)
-        .map_err(|e| CodegenError::JitError(e.to_string()))?;
-    // M18: tensor_gelu(h: i64) -> i64
+    // M18: tensor_causal_mask(t_size: i64) -> i64
     let sig_unary_cpu = {
         let mut s = Signature::new(call_conv);
         s.params.push(AbiParam::new(I64));
         s.returns.push(AbiParam::new(I64));
         s
     };
-    let rt_tensor_gelu = module.declare_function("tensor_gelu", Linkage::Import, &sig_unary_cpu)
-        .map_err(|e| CodegenError::JitError(e.to_string()))?;
-    // M18: tensor_cross_entropy(logits: i64, targets: i64, softmax_out: *mut i64) -> i64
-    let sig_cross_entropy = {
-        let mut s = Signature::new(call_conv);
-        s.params.push(AbiParam::new(I64)); // logits
-        s.params.push(AbiParam::new(I64)); // targets
-        s.params.push(AbiParam::new(ptr)); // softmax_out (*mut i64)
-        s.returns.push(AbiParam::new(I64));
-        s
-    };
-    let rt_tensor_cross_entropy = module.declare_function("tensor_cross_entropy", Linkage::Import, &sig_cross_entropy)
-        .map_err(|e| CodegenError::JitError(e.to_string()))?;
-    // M18: tensor_causal_mask(t_size: i64) -> i64
     let rt_tensor_causal_mask = module.declare_function("tensor_causal_mask", Linkage::Import, &sig_unary_cpu)
         .map_err(|e| CodegenError::JitError(e.to_string()))?;
     // M18: tape_record_layernorm(op: i32, x: i64, out: i64, var_h: i64, axis: i64)
@@ -3247,9 +3169,6 @@ pub fn compile_and_run(
     let rt_tape_record_cross_entropy = module.declare_function("tape_record_cross_entropy", Linkage::Import, &sig_tape_saved_axis)
         .map_err(|e| CodegenError::JitError(e.to_string()))?;
 
-    // M19: tensor_embedding(weight: i64, indices: i64) -> i64  (same shape as sig_binop_tensor)
-    let rt_tensor_embedding = module.declare_function("tensor_embedding", Linkage::Import, &sig_binop_tensor)
-        .map_err(|e| CodegenError::JitError(e.to_string()))?;
     // M19: tensor_randn(shape_ptr, ndims) -> i64  (same shape as sig_alloc_shape)
     let rt_tensor_randn = module.declare_function("tensor_randn", Linkage::Import, &sig_alloc_shape)
         .map_err(|e| CodegenError::JitError(e.to_string()))?;
@@ -3443,7 +3362,6 @@ pub fn compile_and_run(
         rt_tensor_alloc_zeros_gpu,
         rt_tensor_alloc_ones_gpu,
         rt_tensor_matmul,
-        rt_tensor_transpose,
         rt_tensor_sum,
         rt_tensor_len,
         rt_print_cstr,
@@ -3466,26 +3384,13 @@ pub fn compile_and_run(
         rt_tape_get_grad,
         rt_backward,
         rt_tape_zero_grad,
-        rt_tensor_broadcast_add,
-        rt_tensor_broadcast_sub,
-        rt_tensor_broadcast_mul,
-        rt_tensor_broadcast_div,
-        rt_tensor_reduce_sum_axis,
-        rt_tensor_reduce_mean_axis,
-        rt_tensor_reduce_max_axis,
-        rt_tensor_reduce_var_axis,
         rt_tape_record_reduce,
         rt_tensor_reshape,
         rt_tensor_permute,
         rt_tape_record_perm,
-        rt_tensor_softmax_axis,
-        rt_tensor_layernorm_axis,
-        rt_tensor_gelu,
-        rt_tensor_cross_entropy,
         rt_tensor_causal_mask,
         rt_tape_record_layernorm,
         rt_tape_record_cross_entropy,
-        rt_tensor_embedding,
         rt_tensor_randn,
         rt_tape_record_embedding,
         rt_powf,

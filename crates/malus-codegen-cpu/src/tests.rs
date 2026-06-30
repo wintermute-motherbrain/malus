@@ -141,22 +141,6 @@ extern "C" fn mock_tensor_matmul(handle_a: i64, handle_b: i64) -> i64 {
     }
 }
 
-extern "C" fn mock_tensor_transpose(handle: i64) -> i64 {
-    let (data, shape) = with_store(|s| (s.get_data(handle), s.get_shape(handle)));
-    if shape.len() == 2 {
-        let (m, n) = (shape[0], shape[1]);
-        let mut out = vec![0.0f32; m * n];
-        for i in 0..m {
-            for j in 0..n {
-                out[j * m + i] = data[i * n + j];
-            }
-        }
-        with_store(|s| s.insert(out, vec![n, m]))
-    } else {
-        with_store(|s| s.insert(data, shape))
-    }
-}
-
 extern "C" fn mock_tensor_sum(handle: i64) -> i64 {
     let data = with_store(|s| s.get_data(handle));
     let total: f32 = data.iter().sum();
@@ -185,46 +169,6 @@ extern "C" fn mock_tape_get_grad(_handle: i64) -> i64 { 0 }
 extern "C" fn mock_backward(_loss: i64) {}
 // M15 tape ABI.
 extern "C" fn mock_tape_zero_grad(_handles: *const i64, _count: usize) {}
-// M16 broadcast + axis reductions — delegates to the mock forward ops for testing.
-extern "C" fn mock_tensor_broadcast_add(_kernel_id: u64, a: i64, b: i64) -> i64 {
-    MOCK_DISPATCH_COUNT.fetch_add(1, Ordering::SeqCst);
-    mock_binary_tensor_op(a, b, |x, y| x + y)
-}
-extern "C" fn mock_tensor_broadcast_sub(_kernel_id: u64, a: i64, b: i64) -> i64 {
-    MOCK_DISPATCH_COUNT.fetch_add(1, Ordering::SeqCst);
-    mock_binary_tensor_op(a, b, |x, y| x - y)
-}
-extern "C" fn mock_tensor_broadcast_mul(_kernel_id: u64, a: i64, b: i64) -> i64 {
-    MOCK_DISPATCH_COUNT.fetch_add(1, Ordering::SeqCst);
-    mock_binary_tensor_op(a, b, |x, y| x * y)
-}
-extern "C" fn mock_tensor_broadcast_div(_kernel_id: u64, a: i64, b: i64) -> i64 {
-    MOCK_DISPATCH_COUNT.fetch_add(1, Ordering::SeqCst);
-    mock_binary_tensor_op(a, b, |x, y| x / y)
-}
-extern "C" fn mock_tensor_reduce_sum_axis(h: i64, _axis: i64, _keepdim: i64) -> i64 {
-    let data = with_store(|s| s.get_data(h));
-    let sum: f32 = data.iter().sum();
-    with_store(|s| s.insert(vec![sum], vec![1]))
-}
-extern "C" fn mock_tensor_reduce_mean_axis(h: i64, _axis: i64, _keepdim: i64) -> i64 {
-    let data = with_store(|s| s.get_data(h));
-    let n = data.len() as f32;
-    let mean: f32 = data.iter().sum::<f32>() / n;
-    with_store(|s| s.insert(vec![mean], vec![1]))
-}
-extern "C" fn mock_tensor_reduce_max_axis(h: i64, _axis: i64, _keepdim: i64) -> i64 {
-    let data = with_store(|s| s.get_data(h));
-    let max: f32 = data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    with_store(|s| s.insert(vec![max], vec![1]))
-}
-extern "C" fn mock_tensor_reduce_var_axis(h: i64, _axis: i64, _keepdim: i64) -> i64 {
-    let data = with_store(|s| s.get_data(h));
-    let n = data.len() as f32;
-    let mean: f32 = data.iter().sum::<f32>() / n;
-    let var: f32 = data.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / n;
-    with_store(|s| s.insert(vec![var], vec![1]))
-}
 extern "C" fn mock_tape_record_reduce(_op: i32, _x: i64, _out: i64, _axis: i64, _keepdim: i64) {}
 
 // M17 mocks.
@@ -240,59 +184,6 @@ extern "C" fn mock_tape_record_perm(
 ) {}
 
 // M18 mocks.
-extern "C" fn mock_tensor_softmax_axis(h: i64, _axis: i64) -> i64 {
-    let data = with_store(|s| s.get_data(h));
-    let exp_data: Vec<f32> = data.iter().map(|x| x.exp()).collect();
-    let sum: f32 = exp_data.iter().sum();
-    let sm: Vec<f32> = exp_data.iter().map(|x| x / sum).collect();
-    let n = sm.len();
-    with_store(|s| s.insert(sm, vec![n]))
-}
-extern "C" fn mock_tensor_layernorm_axis(h: i64, _axis: i64, var_out: *mut i64) -> i64 {
-    let data = with_store(|s| s.get_data(h));
-    let n = data.len() as f32;
-    let mean: f32 = data.iter().sum::<f32>() / n;
-    let var: f32 = data.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / n;
-    let sigma = (var + 1e-5).sqrt();
-    let norm: Vec<f32> = data.iter().map(|x| (x - mean) / sigma).collect();
-    let len = norm.len();
-    if !var_out.is_null() {
-        let v = with_store(|s| s.insert(vec![var], vec![1]));
-        unsafe { *var_out = v; }
-    }
-    with_store(|s| s.insert(norm, vec![len]))
-}
-extern "C" fn mock_tensor_gelu(h: i64) -> i64 {
-    const C0: f32 = 0.7978845608;
-    const C1: f32 = 0.044715;
-    let data = with_store(|s| s.get_data(h));
-    let out: Vec<f32> = data.iter().map(|&x| {
-        let g = C0 * (x + C1 * x * x * x);
-        0.5 * x * (1.0 + g.tanh())
-    }).collect();
-    let n = out.len();
-    with_store(|s| s.insert(out, vec![n]))
-}
-extern "C" fn mock_tensor_cross_entropy(logits: i64, targets: i64, softmax_out: *mut i64) -> i64 {
-    let log_data = with_store(|s| s.get_data(logits));
-    let tgt_data = with_store(|s| s.get_data(targets));
-    let n = tgt_data.len();
-    let c = log_data.len() / n;
-    let mut sm = Vec::with_capacity(n * c);
-    for i in 0..n {
-        let row = &log_data[i*c..(i+1)*c];
-        let max: f32 = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let exps: Vec<f32> = row.iter().map(|x| (x - max).exp()).collect();
-        let s: f32 = exps.iter().sum();
-        sm.extend(exps.iter().map(|x| x / s));
-    }
-    if !softmax_out.is_null() {
-        let sh = with_store(|s| s.insert(sm.clone(), vec![n, c]));
-        unsafe { *softmax_out = sh; }
-    }
-    let loss: f32 = (0..n).map(|i| -sm[i*c + tgt_data[i] as usize].ln()).sum::<f32>() / n as f32;
-    with_store(|s| s.insert(vec![loss], vec![1]))
-}
 extern "C" fn mock_tensor_causal_mask(t_size: i64) -> i64 {
     let t = t_size as usize;
     let data: Vec<f32> = (0..t*t).map(|i| {
@@ -307,7 +198,6 @@ extern "C" fn mock_tape_record_layernorm(
 extern "C" fn mock_tape_record_cross_entropy(
     _op: i32, _logits: i64, _out: i64, _sm_h: i64, _targets: i64,
 ) {}
-extern "C" fn mock_tensor_embedding(_weight: i64, _indices: i64) -> i64 { 0 }
 extern "C" fn mock_tensor_randn(_shape_ptr: *const usize, _ndims: usize) -> i64 { 0 }
 extern "C" fn mock_tape_record_embedding(_op: i32, _weight: i64, _indices: i64, _out: i64) {}
 // M22 string I/O mocks.
@@ -378,17 +268,31 @@ extern "C" fn mock_tensor_dim(handle: i64, i: i64) -> i64 {
 // M25 kernel_dispatch_v2 — not exercised in CPU-mock tests; returns 0.
 extern "C" fn mock_kernel_dispatch_v2(
     _kernel_id: u64,
-    _handles: *const i64,
-    _handle_count: usize,
+    handles: *const i64,
+    handle_count: usize,
     _grid: *const usize,
     _tg: *const usize,
-    _out_shape: *const usize,
-    _out_ndim: usize,
+    out_shape: *const usize,
+    out_ndim: usize,
     _out_dtype_tag: i32,
     _uniforms: *const std::ffi::c_void,
     _uniforms_bytes: usize,
 ) -> i64 {
-    0
+    MOCK_DISPATCH_COUNT.fetch_add(1, Ordering::SeqCst);
+    let shape = if out_ndim > 0 && !out_shape.is_null() {
+        let raw = unsafe { std::slice::from_raw_parts(out_shape, out_ndim) };
+        raw.iter().copied().filter(|&d| d > 0).collect::<Vec<_>>()
+    } else if handle_count > 0 && !handles.is_null() {
+        let first = unsafe { *handles };
+        with_store(|s| {
+            let sh = s.get_shape(first);
+            if sh.is_empty() { vec![s.get_len(first).max(1)] } else { sh }
+        })
+    } else {
+        vec![1usize]
+    };
+    let n: usize = shape.iter().product::<usize>().max(1);
+    with_store(|s| s.insert(vec![1.0f32; n], shape))
 }
 
 fn mock_symbols() -> RuntimeSymbols {
@@ -401,7 +305,6 @@ fn mock_symbols() -> RuntimeSymbols {
         tensor_alloc_zeros_gpu: mock_tensor_alloc_zeros_gpu,
         tensor_alloc_ones_gpu:  mock_tensor_alloc_ones_gpu,
         tensor_matmul:          mock_tensor_matmul,
-        tensor_transpose:       mock_tensor_transpose,
         tensor_sum:             mock_tensor_sum,
         tensor_len:             mock_tensor_len,
         tensor_retain:          mock_tensor_retain,
@@ -415,28 +318,15 @@ fn mock_symbols() -> RuntimeSymbols {
         tape_get_grad:          mock_tape_get_grad,
         backward:               mock_backward,
         tape_zero_grad:         mock_tape_zero_grad,
-        tensor_broadcast_add:   mock_tensor_broadcast_add,
-        tensor_broadcast_sub:   mock_tensor_broadcast_sub,
-        tensor_broadcast_mul:   mock_tensor_broadcast_mul,
-        tensor_broadcast_div:   mock_tensor_broadcast_div,
-        tensor_reduce_sum_axis:  mock_tensor_reduce_sum_axis,
-        tensor_reduce_mean_axis: mock_tensor_reduce_mean_axis,
-        tensor_reduce_max_axis:  mock_tensor_reduce_max_axis,
-        tensor_reduce_var_axis:  mock_tensor_reduce_var_axis,
         tape_record_reduce:     mock_tape_record_reduce,
         tensor_reshape:         mock_tensor_reshape,
         tensor_permute:         mock_tensor_permute,
         tape_record_perm:       mock_tape_record_perm,
         // M18 mocks.
-        tensor_softmax_axis:       mock_tensor_softmax_axis,
-        tensor_layernorm_axis:     mock_tensor_layernorm_axis,
-        tensor_gelu:               mock_tensor_gelu,
-        tensor_cross_entropy:      mock_tensor_cross_entropy,
         tensor_causal_mask:        mock_tensor_causal_mask,
         tape_record_layernorm:     mock_tape_record_layernorm,
         tape_record_cross_entropy: mock_tape_record_cross_entropy,
         // M19 mocks.
-        tensor_embedding:          mock_tensor_embedding,
         tensor_randn:              mock_tensor_randn,
         tape_record_embedding:     mock_tape_record_embedding,
         // M22 string I/O mocks.
@@ -472,9 +362,12 @@ fn run_src(src: &str) -> Result<(), CodegenError> {
     let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     *MOCK_STORE.lock().unwrap() = Some(MockStore::new());
     MOCK_DISPATCH_COUNT.store(0, Ordering::SeqCst);
-    let program = parse(malus_syntax::FileId(0), src).expect("parse failed");
+    let user_program = parse(malus_syntax::FileId(0), src).expect("parse failed");
+    let mut all_items = malus_stdlib::stdlib_items();
+    all_items.extend(user_program.items.into_iter());
+    let full_program = malus_syntax::ast::Program { items: all_items };
     let aliases = HashMap::new();
-    let typed = check(&program, &aliases).expect("type check failed");
+    let typed = check(&full_program, &aliases).expect("type check failed");
     let (_registry, kernel_ids) =
         malus_codegen_gpu::compile_kernels(&typed).expect("kernel compilation failed");
     let symbols = mock_symbols();

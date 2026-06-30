@@ -37,7 +37,7 @@ malus is a compiled ML DSL for Apple Silicon. Python-like syntax, dual compilati
 | **V4 — Reclaiming the Vision** (roadmap approved 2026-06-29; see `docs/adr/0026–0031`, plan file) | | |
 | M23 — De-risk spike (extended `kernel_dispatch` ABI + CPU-compute counter CI gate) | ✅ done | `malus-runtime` |
 | M24 — Kernel language v2 (thread hierarchy, flat indexing, `let shared`, `barrier()`, control flow, scalar uniforms) | ✅ done | `malus-codegen-gpu`, `malus-syntax`, `malus-sema`, `malus-runtime` |
-| M25 — Stdlib forward kernels (all CPU-loop ops → malus `.ml` kernels; forward-hot-path CPU-counter==0) | 🔲 todo | all crates |
+| M25 — Stdlib forward kernels (all CPU-loop ops → malus `.ml` kernels; forward-hot-path CPU-counter==0) | ✅ done | all crates |
 | M26 — Backward kernels (GPU autograd; full-step CPU-counter==0 canonical gate) | 🔲 todo | `malus-runtime` |
 | M27 — Kill `Variable` (static grad-inference; one `Tensor` type) | 🔲 todo | `malus-sema`, `malus-codegen-cpu` |
 | M28 — Module trait + generic optimizer (generics, `impl`, `List<T>`; no-unroll lint gate) | 🔲 todo | all crates |

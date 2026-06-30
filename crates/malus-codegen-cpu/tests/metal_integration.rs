@@ -18,7 +18,6 @@ fn real_symbols() -> RuntimeSymbols {
         tensor_alloc_zeros_gpu: malus_runtime::tensor_alloc_zeros_gpu,
         tensor_alloc_ones_gpu:  malus_runtime::tensor_alloc_ones_gpu,
         tensor_matmul:          malus_runtime::tensor_matmul,
-        tensor_transpose:       malus_runtime::tensor_transpose,
         tensor_sum:             malus_runtime::tensor_sum,
         tensor_len:             malus_runtime::tensor_len,
         tensor_retain:          malus_runtime::tensor_retain,
@@ -32,28 +31,15 @@ fn real_symbols() -> RuntimeSymbols {
         tape_get_grad:          malus_runtime::tape_get_grad,
         backward:               malus_runtime::backward,
         tape_zero_grad:         malus_runtime::tape_zero_grad,
-        tensor_broadcast_add:   malus_runtime::tensor_broadcast_add,
-        tensor_broadcast_sub:   malus_runtime::tensor_broadcast_sub,
-        tensor_broadcast_mul:   malus_runtime::tensor_broadcast_mul,
-        tensor_broadcast_div:   malus_runtime::tensor_broadcast_div,
-        tensor_reduce_sum_axis:  malus_runtime::tensor_reduce_sum_axis,
-        tensor_reduce_mean_axis: malus_runtime::tensor_reduce_mean_axis,
-        tensor_reduce_max_axis:  malus_runtime::tensor_reduce_max_axis,
-        tensor_reduce_var_axis:  malus_runtime::tensor_reduce_var_axis,
         tape_record_reduce:     malus_runtime::tape_record_reduce,
         tensor_reshape:         malus_runtime::tensor_reshape,
         tensor_permute:         malus_runtime::tensor_permute,
         tape_record_perm:       malus_runtime::tape_record_perm,
         // M18 transformer stdlib.
-        tensor_softmax_axis:       malus_runtime::tensor_softmax_axis,
-        tensor_layernorm_axis:     malus_runtime::tensor_layernorm_axis,
-        tensor_gelu:               malus_runtime::tensor_gelu,
-        tensor_cross_entropy:      malus_runtime::tensor_cross_entropy,
         tensor_causal_mask:        malus_runtime::tensor_causal_mask,
         tape_record_layernorm:     malus_runtime::tape_record_layernorm,
         tape_record_cross_entropy: malus_runtime::tape_record_cross_entropy,
-        // M19 embeddings + randn.
-        tensor_embedding:          malus_runtime::tensor_embedding,
+        // M19 randn.
         tensor_randn:              malus_runtime::tensor_randn,
         tape_record_embedding:     malus_runtime::tape_record_embedding,
         // M22 string I/O.
@@ -669,4 +655,115 @@ fn main():
         adamw_gpt_params(opt, gpt, gpt_st, step)
 "#;
     run_metal_src(src);
+}
+
+/// M25 Done-When gate: nanoGPT forward pass must not increment the CPU compute counter.
+/// Covers: embedding, layernorm, softmax, gelu, cross_entropy, permute, broadcast +/*, matmul.
+#[test]
+fn test_nanogpt_forward_zero_cpu_compute() {
+    let src = r#"
+struct Block:
+    ln1_w: Variable<f32>
+    wq: Variable<f32>
+    wk: Variable<f32>
+    wv: Variable<f32>
+    wo: Variable<f32>
+    ln2_w: Variable<f32>
+    w1: Variable<f32>
+    w2: Variable<f32>
+
+struct GPT:
+    wte: Variable<f32>
+    wpe: Variable<f32>
+    ln_f: Variable<f32>
+    lm_head: Variable<f32>
+
+fn forward(gpt: GPT, blk: Block, toks: Tensor<i32>, B: i64, T: i64, C: i64) -> Variable<f32>:
+    let mut pos_buf = buffer_i32(B * T)
+    for b in range(B):
+        for t in range(T):
+            pos_buf[b * T + t] = t
+    let pos_toks = freeze(pos_buf)
+    let te = embedding(gpt.wte, toks)
+    let pe = embedding(gpt.wpe, pos_toks)
+    let x = te + pe
+    let xn1 = layernorm(x, axis=1) * blk.ln1_w
+    let Q = reshape(xn1 @ blk.wq, B, T, C)
+    let K = reshape(xn1 @ blk.wk, B, T, C)
+    let V = reshape(xn1 @ blk.wv, B, T, C)
+    let Kt = permute(K, 0, 2, 1)
+    let scale = variable(ones(1, 1) * 0.35355)
+    let scores = (Q @ Kt) * scale
+    let mask = causal_mask(T)
+    let vmask = variable(mask)
+    let masked = scores + vmask
+    let attn = softmax(masked, axis=2)
+    let att_out = reshape(attn @ V, B * T, C)
+    let proj = att_out @ blk.wo
+    let x2 = x + proj
+    let xn2 = layernorm(x2, axis=1) * blk.ln2_w
+    let hidden = gelu(xn2 @ blk.w1)
+    let mlp_out = hidden @ blk.w2
+    let x3 = x2 + mlp_out
+    let xf = layernorm(x3, axis=1) * gpt.ln_f
+    return xf @ gpt.lm_head
+
+fn main():
+    let B = 2
+    let T = 4
+    let C = 8
+    let V = 10
+    let init_scale = 0.02
+    let ln1_w = variable(ones(C))
+    let wq = variable(randn(C, C) * init_scale)
+    let wk = variable(randn(C, C) * init_scale)
+    let wv = variable(randn(C, C) * init_scale)
+    let wo = variable(randn(C, C) * init_scale)
+    let ln2_w = variable(ones(C))
+    let w1 = variable(randn(C, C) * init_scale)
+    let w2 = variable(randn(C, C) * init_scale)
+    let blk = Block(ln1_w=ln1_w, wq=wq, wk=wk, wv=wv, wo=wo, ln2_w=ln2_w, w1=w1, w2=w2)
+    let wte = variable(randn(V, C) * init_scale)
+    let wpe = variable(randn(T, C) * init_scale)
+    let ln_f = variable(ones(C))
+    let lm_head = variable(randn(C, V) * init_scale)
+    let gpt = GPT(wte=wte, wpe=wpe, ln_f=ln_f, lm_head=lm_head)
+    let mut x_buf = buffer_i32(B * T)
+    x_buf[0] = 0
+    x_buf[1] = 1
+    x_buf[2] = 2
+    x_buf[3] = 3
+    x_buf[4] = 4
+    x_buf[5] = 5
+    x_buf[6] = 6
+    x_buf[7] = 7
+    let mut y_buf = buffer_i32(B * T)
+    y_buf[0] = 1
+    y_buf[1] = 2
+    y_buf[2] = 3
+    y_buf[3] = 4
+    y_buf[4] = 5
+    y_buf[5] = 6
+    y_buf[6] = 7
+    y_buf[7] = 0
+    let x_toks = freeze(x_buf)
+    let y_toks = freeze(y_buf)
+    let logits = forward(gpt, blk, x_toks, B, T, C)
+    let _loss = cross_entropy(logits, y_toks)
+"#;
+    let _guard = METAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut user_program = parse(malus_syntax::FileId(0), src).expect("parse failed");
+    let mut stdlib = malus_stdlib::stdlib_items();
+    stdlib.extend(user_program.items.drain(..));
+    let program = malus_syntax::ast::Program { items: stdlib };
+    let aliases = std::collections::HashMap::new();
+    let typed = check(&program, &aliases).expect("type check failed");
+    let (registry, kernel_ids) =
+        malus_codegen_gpu::compile_kernels(&typed).expect("kernel compilation failed");
+    malus_runtime::runtime_init(&registry.into_hashmap());
+    let symbols = real_symbols();
+    malus_runtime::malus_cpu_compute_reset();
+    compile_and_run(&typed, &symbols, &kernel_ids).expect("JIT compile and run failed");
+    let cpu_count = malus_runtime::malus_cpu_compute_count();
+    assert_eq!(cpu_count, 0, "M25: nanoGPT forward pass must use 0 CPU compute ops, got {}", cpu_count);
 }
