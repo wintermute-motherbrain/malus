@@ -1,3 +1,25 @@
+// M23 — CPU-compute counter. Platform-independent; always compiled.
+use std::sync::atomic::{AtomicI64, Ordering};
+
+static CPU_COMPUTE_CALLS: AtomicI64 = AtomicI64::new(0);
+
+/// Increment the CPU-compute counter.  Called at the entry of every Rust
+/// function that loops over tensor element values.  The V4 CI gate asserts
+/// this count is 0 over any hot-path dispatch that should run on the GPU.
+pub fn cpu_compute_inc() {
+    CPU_COMPUTE_CALLS.fetch_add(1, Ordering::Relaxed);
+}
+
+#[no_mangle]
+pub extern "C" fn malus_cpu_compute_count() -> i64 {
+    CPU_COMPUTE_CALLS.load(Ordering::SeqCst)
+}
+
+#[no_mangle]
+pub extern "C" fn malus_cpu_compute_reset() {
+    CPU_COMPUTE_CALLS.store(0, Ordering::SeqCst);
+}
+
 // M22 string I/O — platform-independent.
 mod strio;
 pub use strio::{
@@ -34,6 +56,8 @@ pub use metal::{
     // M22 rand_uniform + rand_int + tensor_get_f32
     malus_rand_uniform, malus_rand_int, malus_tensor_get_f32,
     kernel_dispatch, gpu_barrier, Dtype, TensorBuffer,
+    // M23 — extended dispatch ABI + softmax de-risk kernel
+    kernel_dispatch_v2, register_m23_softmax_row_kernel, M23_SOFTMAX_ROW_KERNEL_ID,
 };
 
 #[cfg(target_os = "macos")]

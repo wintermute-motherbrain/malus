@@ -143,6 +143,84 @@ kernel add(a: Tensor<f32>, b: Tensor<f32>) -> Tensor<f32>:
     run_metal_src(src);
 }
 
+// V4 M23 CI gate: softmax_row dispatched via kernel_dispatch_v2 produces
+// numerically correct output and triggers zero CPU-compute counter increments.
+#[test]
+fn test_v4_m23_softmax_row_gpu_counter_zero() {
+    // Pure-Rust reference — no malus_runtime calls, so no counter pollution.
+    fn softmax_ref(input: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+        let mut out = vec![0.0f32; rows * cols];
+        for r in 0..rows {
+            let row = &input[r * cols..(r + 1) * cols];
+            let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let exps: Vec<f32> = row.iter().map(|&x| (x - max).exp()).collect();
+            let sum: f32 = exps.iter().sum();
+            for c in 0..cols {
+                out[r * cols + c] = exps[c] / sum;
+            }
+        }
+        out
+    }
+
+    let _guard = METAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let rows: usize = 4;
+    let cols: usize = 8;
+    let input_data: [f32; 32] = [
+        1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0,
+        8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0,
+        1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+        0.1, 0.9, 0.2, 0.8, 0.3, 0.7, 0.4, 0.6,
+    ];
+    let reference = softmax_ref(&input_data, rows, cols);
+
+    malus_runtime::register_m23_softmax_row_kernel();
+    malus_runtime::malus_cpu_compute_reset();
+
+    let in_shape = [rows, cols];
+    let in_handle = unsafe {
+        malus_runtime::tensor_alloc_gpu(0, in_shape.as_ptr(), 2, input_data.as_ptr())
+    };
+
+    let out_shape = [rows, cols];
+    let grid: [usize; 3] = [rows, 1, 1];
+    let tg: [usize; 3]   = [cols, 1, 1];
+    let uniforms: u32 = cols as u32;
+
+    let out_handle = unsafe {
+        malus_runtime::kernel_dispatch_v2(
+            malus_runtime::M23_SOFTMAX_ROW_KERNEL_ID,
+            &in_handle as *const i64,
+            1,
+            grid.as_ptr(),
+            tg.as_ptr(),
+            out_shape.as_ptr(),
+            2,
+            0, // f32 dtype_tag
+            &uniforms as *const u32 as *const std::ffi::c_void,
+            std::mem::size_of::<u32>(),
+        )
+    };
+    malus_runtime::gpu_barrier();
+
+    // Snapshot the count before element reads so the assertion is logically tight.
+    let cpu_count = malus_runtime::malus_cpu_compute_count();
+
+    for i in 0..(rows * cols) {
+        let got = unsafe { malus_runtime::malus_tensor_get_f32(out_handle, i as i64) };
+        assert!(
+            (got - reference[i]).abs() < 1e-5,
+            "output[{i}]: got {got:.6}, expected {:.6}",
+            reference[i]
+        );
+    }
+
+    assert_eq!(cpu_count, 0, "CPU compute was invoked during GPU softmax dispatch");
+
+    malus_runtime::tensor_free(in_handle);
+    malus_runtime::tensor_free(out_handle);
+}
+
 // Mini-GPT training loop: n_embd=8, n_head=1, block_size=4, batch=2, vocab=8, 20 steps.
 // Fixed token sequences so no read_file/rand_int needed. Asserts no panic (shape errors,
 // NaN propagation, and RC bugs all manifest as panics/segfaults in this configuration).

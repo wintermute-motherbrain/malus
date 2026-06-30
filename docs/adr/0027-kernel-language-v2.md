@@ -30,10 +30,45 @@ V4-M1 rewrites the `kernel` codegen to a real GPU programming model. The kernel 
 
 **Reductions:** threadgroup/tree reductions expressed as explicit loops using the above primitives.
 
-**Extended dispatch ABI:** `kernel_dispatch` is extended (starting in M0) to accept:
-- Grid/threadgroup configuration (not inferred from input[0] shape alone).
-- Per-tensor uniforms: `{data_ptr, shape_ptr, ndim, strides_ptr}`.
-- Scalar uniforms (f32, i32) for parameters like `axis`, `eps`, `T`.
+**Extended dispatch ABI:** `kernel_dispatch_v2` (new symbol added in M23, distinct from the
+existing `kernel_dispatch`) has the following signature:
+
+```c
+i64 kernel_dispatch_v2(
+    u64 kernel_id,
+    const i64*   handles,        // input tensor handles [0..handle_count-1]
+    usize        handle_count,
+    const usize* grid_dims,      // [gx,gy,gz] = threadgroup counts → dispatchThreadgroups
+    const usize* tg_dims,        // [tx,ty,tz] = threads per threadgroup
+    const usize* out_shape,      // output shape (not inferred from inputs[0])
+    usize        out_ndim,
+    i32          out_dtype_tag,
+    const void*  uniforms,       // opaque scalar blob; bound at buffer index handle_count+1
+    usize        uniforms_bytes
+) -> i64;                        // output tensor handle
+```
+
+Buffer binding convention: inputs at `0..handle_count-1`, output at `handle_count`, uniforms
+blob at `handle_count+1`. Uses `dispatchThreadgroups_threadsPerThreadgroup` so `grid_dims`
+are threadgroup counts (not total thread counts). This is required for shared-memory
+reductions where one threadgroup must own exactly one row.
+
+Compared to `kernel_dispatch` (which infers output shape from `inputs[0]` and uses
+`dispatchThreads`), `kernel_dispatch_v2` is fully explicit. Old elementwise kernels continue
+to use `kernel_dispatch` unchanged — no backward-compat break.
+
+**Static shared memory:** ADR-0027 mandates `threadgroup float scratch[N]` with `N` a
+compile-time literal in the MSL source. The host never calls `setThreadgroupMemoryLength`.
+No `tg_mem_bytes` in the ABI.
+
+**Per-tensor shape/stride uniform descriptors:** `{data_ptr, shape_ptr, ndim, strides_ptr}`
+for arbitrary `a[i,j]` indexing are deferred to M24. M23's softmax kernel needs only a
+scalar `cols` uniform, so building stride infra now would ship un-exercised ABI.
+
+**Scalar uniforms (f32, i32):** Passed as an opaque `const void* uniforms` blob bound as
+one buffer at `buffer(handle_count+1)`. Each kernel MSL function declares the relevant
+fields as a `constant uint&`, `constant float&`, or similar at that index. M24 will formalize
+a struct layout for multi-field uniform blobs.
 
 ## Why this is the M1 rewrite
 
@@ -45,4 +80,10 @@ This is not additive — `lower_kernel_body` and `lower_expr` must be rewritten,
 - `malus-codegen-gpu/src/lib.rs`: `lower_kernel_body` rewrite; `lower_expr` extended for index expressions and intrinsics.
 - `malus-runtime/src/metal.rs`: `kernel_dispatch` ABI extended (shape/stride/scalar uniforms). The `RuntimeSymbols` struct gains new fields for the extended dispatch.
 - All existing elementwise kernels (built-in `malus_add`, etc.) continue to work unchanged.
-- M0 de-risk spike: one hand-written MSL softmax kernel is dispatched through the extended ABI to validate the design before the full M1 rewrite.
+- M23 de-risk spike: one hand-written MSL `softmax_row` kernel is dispatched through
+  `kernel_dispatch_v2` to validate the ABI and CPU-compute counter before the M24 rewrite.
+  The kernel is registered under `M23_SOFTMAX_ROW_KERNEL_ID = 0x8000_0000_0000_0001`
+  (high-bit reserved; cannot collide with sequential IDs from `compile_kernels`). Retired
+  in M24 when the malus compiler generates the equivalent MSL from a `.ml` kernel source.
+  `kernel_dispatch_v2` is NOT added to `RuntimeSymbols` in M23 — that happens in M24
+  when codegen first emits a call to it.

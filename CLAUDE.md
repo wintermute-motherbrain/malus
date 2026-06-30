@@ -35,7 +35,7 @@ malus is a compiled ML DSL for Apple Silicon. Python-like syntax, dual compilati
 | M21 — MPS Migration (objc2-metal port + `matmul` → MPS, eager) | ✅ done | `malus-runtime` |
 | M22 — Data I/O + nanoGPT Capstone (`read_file`, char tokenization, transformer) | ✅ done | all crates |
 | **V4 — Reclaiming the Vision** (roadmap approved 2026-06-29; see `docs/adr/0026–0031`, plan file) | | |
-| M23 — De-risk spike (extended `kernel_dispatch` ABI + CPU-compute counter CI gate) | 🔲 todo | `malus-runtime` |
+| M23 — De-risk spike (extended `kernel_dispatch` ABI + CPU-compute counter CI gate) | ✅ done | `malus-runtime` |
 | M24 — Kernel language v2 (thread hierarchy, shared memory, barrier, arbitrary indexing, control flow) | 🔲 todo | `malus-codegen-gpu`, `malus-syntax`, `malus-sema`, `malus-runtime` |
 | M25 — Stdlib forward kernels (all CPU-loop ops → malus `.ml` kernels; forward-hot-path CPU-counter==0) | 🔲 todo | all crates |
 | M26 — Backward kernels (GPU autograd; full-step CPU-counter==0 canonical gate) | 🔲 todo | `malus-runtime` |
@@ -197,7 +197,7 @@ The `i64` handle is a raw pointer to a heap-allocated `TensorBuffer { buffer: me
 | Transformer stdlib (softmax, layernorm, GELU, cross-entropy) | ✅ M18 | Done; `gelu` uses tanh approx; `layernorm` has no affine (additive post-V3) |
 | Index tensors, `embedding`, `randn` (Philox4x32-10) | ✅ M19 | Done; `gather` reserved (different PyTorch contract); user seed post-V3 |
 | Lvalue assignment (`a[i]=e`, `s.f=e`) | ✅ M20 | Done; `mut` params for interior-only borrows; `**` power op |
-| `transpose`/`sum`/axis reductions are CPU loops | **M25** | Will be replaced by malus `.ml` kernels (ADR-0027/0028); CPU-counter CI gate enforces this |
+| `transpose`/`sum`/axis reductions are CPU loops | **M25** | Will be replaced by malus `.ml` kernels (ADR-0027/0028); CPU-counter CI gate enforces this; counter instrumented in M23 |
 | File I/O / data loading | ✅ M22 | `read_file`, `str_len`, `str_char_at`, `str_from_char`, `Buffer<i32>`, `freeze`, `rand_int`, `rand_uniform`, `tensor.data[i]` — all done |
 | Non-f32 compute dtypes (f16, bf16) | Post-V4 | Only i32/i64 for index tensors; f16/bf16 mixed-precision deferred (D10) |
 | Cross-module structs/enums unsupported (loader `exported_names` gap) | Post-V4 | See `docs/milestones/cross-module-types.md` |

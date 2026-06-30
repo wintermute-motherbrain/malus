@@ -124,8 +124,20 @@ A kernel parameter that is mutated in place rather than borrowed immutably. Avoi
 _Avoid_: Mutable parameter, write parameter
 
 **Dispatch uniforms**:
-Per-kernel metadata passed alongside tensor data handles in `kernel_dispatch`: shape, strides, ndim, and scalar parameters (e.g. `axis`, `eps`). Required in V4 for kernels that index tensors with multi-dimensional coordinates. See ADR-0027.
+Per-kernel metadata passed alongside tensor data handles in `kernel_dispatch_v2`: shape, strides, ndim, and scalar parameters (e.g. `axis`, `eps`, `cols`). Required in V4 for kernels that index tensors with multi-dimensional coordinates. In M23, a scalar uniforms blob (opaque `const void*`) is bound as one `MTLBuffer` at index `handle_count+1`. Per-tensor `{shape, strides, ndim}` descriptors are deferred to M24. See ADR-0027.
 _Avoid_: kernel arguments (overloaded)
+
+**`kernel_dispatch_v2`**:
+The extended GPU dispatch function added in M23 (alongside the original `kernel_dispatch`). Unlike `kernel_dispatch`, which infers output shape from `inputs[0]` and uses `dispatchThreads`, `kernel_dispatch_v2` takes explicit grid/threadgroup configuration, an independent output shape/dtype, and a scalar uniforms blob. Uses `dispatchThreadgroups_threadsPerThreadgroup` so `grid_dims` are threadgroup counts. Required for reductions and any kernel that needs one threadgroup per row/slice. The `kernel_dispatch` symbol is retained unchanged for backward-compat with existing elementwise kernels.
+_Avoid_: extended dispatch, v2 dispatch (fine informally; the C symbol name is canonical)
+
+**CPU-compute counter**:
+A process-global `AtomicI64 CPU_COMPUTE_CALLS` in `malus-runtime/src/lib.rs`, incremented (via `cpu_compute_inc()`) at the entry of every Rust function that loops over tensor element values. Exposed via `malus_cpu_compute_count() -> i64` and `malus_cpu_compute_reset()`. The V4 milestone CI gate: after a hot-path dispatch (forward pass, full step), `count == 0` proves every arithmetic op ran on the GPU. Double-counting (a CPU fn calling another CPU fn) is harmless — gates assert `== 0`, not exact counts. Orchestration ops (alloc, free, barrier, matmul-MPS, zero-copy reshape) do not increment. See ADR-0031.
+_Avoid_: CPU op counter, CPU fallback counter (the term in the codebase is "cpu_compute")
+
+**Threadgroup-per-row reduction**:
+A GPU reduction pattern where each row (or slice) of a 2-D tensor maps to exactly one threadgroup, and threads within the threadgroup cooperate using shared memory and `threadgroup_barrier`. Requires `dispatchThreadgroups` semantics (not `dispatchThreads`) so the grid dimension equals the number of rows. Thread count per threadgroup must be a power of 2 to enable stride-halving tree reduction. The M23 `softmax_row` kernel is the canonical example: `grid=[rows,1,1]`, `tg=[cols,1,1]`, static `threadgroup float scratch[1024]`.
+_Avoid_: row-wise reduction (fine informally), parallel reduction (too generic)
 
 **Vendor primitive**:
 A runtime op whose optimal implementation requires hardware resources not reachable from custom MSL compute kernels. Currently: `matmul` (→ MPS/AMX coprocessor on M-series). Implemented as a C-ABI Rust function in `malus-runtime`, not in the malus kernel language. Everything else is a kernel-language op. See ADR-0028.

@@ -881,42 +881,49 @@ fn alloc_like(template: i64, data: &[f32]) -> i64 {
 }
 
 fn elem_add(a: i64, b: i64) -> i64 {
+    crate::cpu_compute_inc();
     let (ad, bd) = (read(a), read(b));
     let out: Vec<f32> = ad.iter().zip(bd.iter()).map(|(x, y)| x + y).collect();
     alloc_like(a, &out)
 }
 
 fn elem_sub(a: i64, b: i64) -> i64 {
+    crate::cpu_compute_inc();
     let (ad, bd) = (read(a), read(b));
     let out: Vec<f32> = ad.iter().zip(bd.iter()).map(|(x, y)| x - y).collect();
     alloc_like(a, &out)
 }
 
 fn elem_cmp_eq(a: i64, b: i64) -> i64 {
+    crate::cpu_compute_inc();
     let (ad, bd) = (read(a), read(b));
     let out: Vec<f32> = ad.iter().zip(bd.iter()).map(|(x, y)| if x == y { 1.0 } else { 0.0 }).collect();
     alloc_like(a, &out)
 }
 
 fn elem_mul(a: i64, b: i64) -> i64 {
+    crate::cpu_compute_inc();
     let (ad, bd) = (read(a), read(b));
     let out: Vec<f32> = ad.iter().zip(bd.iter()).map(|(x, y)| x * y).collect();
     alloc_like(a, &out)
 }
 
 fn elem_div(a: i64, b: i64) -> i64 {
+    crate::cpu_compute_inc();
     let (ad, bd) = (read(a), read(b));
     let out: Vec<f32> = ad.iter().zip(bd.iter()).map(|(x, y)| x / y).collect();
     alloc_like(a, &out)
 }
 
 fn scalar_mul(a: i64, s: f32) -> i64 {
+    crate::cpu_compute_inc();
     let ad = read(a);
     let out: Vec<f32> = ad.iter().map(|x| x * s).collect();
     alloc_like(a, &out)
 }
 
 fn elem_apply(a: i64, f: impl Fn(f32) -> f32) -> i64 {
+    crate::cpu_compute_inc();
     let ad = read(a);
     let out: Vec<f32> = ad.iter().map(|&v| f(v)).collect();
     alloc_like(a, &out)

@@ -572,6 +572,7 @@ pub extern "C" fn tensor_matmul(handle_a: i64, handle_b: i64) -> i64 {
 #[no_mangle]
 pub extern "C" fn tensor_transpose(handle: i64) -> i64 {
     gpu_barrier();
+    crate::cpu_compute_inc();
     let tb = unsafe { &*(handle as *const TensorBuffer) };
 
     if tb.shape.len() != 2 {
@@ -595,6 +596,7 @@ pub extern "C" fn tensor_transpose(handle: i64) -> i64 {
 #[no_mangle]
 pub extern "C" fn tensor_sum(handle: i64) -> i64 {
     gpu_barrier();
+    crate::cpu_compute_inc();
     let tb = unsafe { &*(handle as *const TensorBuffer) };
     let data = unsafe { std::slice::from_raw_parts(tb.buffer.contents().as_ptr() as *const f32, tb.len) };
     let total: f32 = data.iter().sum();
@@ -636,6 +638,7 @@ fn broadcast_cpu_loop(
     out_data: &mut [f32], out_shape: &[usize],
     op: impl Fn(f32, f32) -> f32,
 ) {
+    crate::cpu_compute_inc();
     let n = out_shape.len();
     let mut pa = vec![1usize; n];
     let mut pb = vec![1usize; n];
@@ -763,6 +766,7 @@ fn reduce_elements(
 #[no_mangle]
 pub extern "C" fn tensor_reduce_sum_axis(h: i64, axis: i64, keepdim: i64) -> i64 {
     gpu_barrier();
+    crate::cpu_compute_inc();
     let tb = unsafe { &*(h as *const TensorBuffer) };
     let axis_u = normalize_axis(axis as i32, tb.shape.len());
     let keepdim_b = keepdim != 0;
@@ -777,6 +781,7 @@ pub extern "C" fn tensor_reduce_sum_axis(h: i64, axis: i64, keepdim: i64) -> i64
 #[no_mangle]
 pub extern "C" fn tensor_reduce_mean_axis(h: i64, axis: i64, keepdim: i64) -> i64 {
     gpu_barrier();
+    crate::cpu_compute_inc();
     let tb = unsafe { &*(h as *const TensorBuffer) };
     let axis_u = normalize_axis(axis as i32, tb.shape.len());
     let keepdim_b = keepdim != 0;
@@ -793,6 +798,7 @@ pub extern "C" fn tensor_reduce_mean_axis(h: i64, axis: i64, keepdim: i64) -> i6
 #[no_mangle]
 pub extern "C" fn tensor_reduce_max_axis(h: i64, axis: i64, keepdim: i64) -> i64 {
     gpu_barrier();
+    crate::cpu_compute_inc();
     let tb = unsafe { &*(h as *const TensorBuffer) };
     let axis_u = normalize_axis(axis as i32, tb.shape.len());
     let keepdim_b = keepdim != 0;
@@ -807,6 +813,7 @@ pub extern "C" fn tensor_reduce_max_axis(h: i64, axis: i64, keepdim: i64) -> i64
 #[no_mangle]
 pub extern "C" fn tensor_reduce_var_axis(h: i64, axis: i64, keepdim: i64) -> i64 {
     gpu_barrier();
+    crate::cpu_compute_inc();
     let tb = unsafe { &*(h as *const TensorBuffer) };
     let axis_u = normalize_axis(axis as i32, tb.shape.len());
     let keepdim_b = keepdim != 0;
@@ -895,6 +902,7 @@ pub(crate) fn invert_perm(perm: &[usize]) -> Vec<usize> {
 /// Apply a fully-normalized permutation to a tensor.  No barrier — callers
 /// that read GPU data must have already called gpu_barrier().
 pub(crate) fn permute_by_perm(handle: i64, perm: &[usize]) -> i64 {
+    crate::cpu_compute_inc();
     let tb_in = unsafe { &*(handle as *const TensorBuffer) };
     let rank = tb_in.shape.len();
     assert_eq!(perm.len(), rank, "permute_by_perm: perm len {} != rank {}", perm.len(), rank);
@@ -982,6 +990,7 @@ pub extern "C" fn tensor_reshape(handle: i64, dims_ptr: *const usize, ndims: usi
 /// Numerically stable softmax over one axis.  Called by tensor_softmax_axis
 /// and tensor_cross_entropy (which shares this helper).
 pub(crate) fn softmax_axis_cpu(in_data: &[f32], in_shape: &[usize], axis: usize) -> Vec<f32> {
+    crate::cpu_compute_inc();
     let axis_size = in_shape[axis];
     let outer: usize = in_shape[..axis].iter().product::<usize>().max(1);
     let inner: usize = in_shape[axis + 1..].iter().product::<usize>().max(1);
@@ -1026,6 +1035,7 @@ pub extern "C" fn tensor_softmax_axis(h: i64, axis: i64) -> i64 {
 #[no_mangle]
 pub extern "C" fn tensor_layernorm_axis(h: i64, axis: i64, var_out: *mut i64) -> i64 {
     gpu_barrier();
+    crate::cpu_compute_inc();
     let tb = unsafe { &*(h as *const TensorBuffer) };
     let axis_u = normalize_axis(axis as i32, tb.shape.len());
     let axis_size = tb.shape[axis_u];
@@ -1073,6 +1083,7 @@ pub extern "C" fn tensor_layernorm_axis(h: i64, axis: i64, var_out: *mut i64) ->
 #[no_mangle]
 pub extern "C" fn tensor_gelu(h: i64) -> i64 {
     gpu_barrier();
+    crate::cpu_compute_inc();
     let tb = unsafe { &*(h as *const TensorBuffer) };
     let in_data = unsafe { std::slice::from_raw_parts(tb.buffer.contents().as_ptr() as *const f32, tb.len) };
     const C0: f32 = 0.7978845608;
@@ -1091,6 +1102,7 @@ pub extern "C" fn tensor_gelu(h: i64) -> i64 {
 #[no_mangle]
 pub extern "C" fn tensor_cross_entropy(logits: i64, targets: i64, softmax_out: *mut i64) -> i64 {
     gpu_barrier();
+    crate::cpu_compute_inc();
     let logits_tb = unsafe { &*(logits as *const TensorBuffer) };
     let targets_tb = unsafe { &*(targets as *const TensorBuffer) };
     if logits_tb.shape.len() != 2 {
@@ -1134,6 +1146,7 @@ pub extern "C" fn tensor_cross_entropy(logits: i64, targets: i64, softmax_out: *
 /// Returns a [T, T] causal mask: 0.0 on and below the diagonal, -1e9 above.
 #[no_mangle]
 pub extern "C" fn tensor_causal_mask(t_size: i64) -> i64 {
+    crate::cpu_compute_inc();
     let t = t_size as usize;
     let mut data = vec![0.0f32; t * t];
     for i in 0..t {
@@ -1162,6 +1175,7 @@ fn read_int_index(buf: *const u8, i: usize, dtype: Dtype) -> usize {
 #[no_mangle]
 pub extern "C" fn tensor_embedding(weight: i64, indices: i64) -> i64 {
     gpu_barrier();
+    crate::cpu_compute_inc();
     let w = unsafe { &*(weight as *const TensorBuffer) };
     let idx = unsafe { &*(indices as *const TensorBuffer) };
     if w.shape.len() != 2 {
@@ -1194,6 +1208,7 @@ pub extern "C" fn tensor_embedding(weight: i64, indices: i64) -> i64 {
 /// dout is [T, D], indices is [T] (i32/i64), vocab_size is V.
 /// Returns a [V, D] tensor.
 pub(crate) fn tensor_scatter_add(dout: i64, indices: i64, vocab_size: i64) -> i64 {
+    crate::cpu_compute_inc();
     let dout_tb = unsafe { &*(dout as *const TensorBuffer) };
     let idx_tb  = unsafe { &*(indices as *const TensorBuffer) };
     let seq_len   = dout_tb.shape[0];
@@ -1246,6 +1261,7 @@ thread_local! {
 /// Box-Muller transform. Fixed default seed (counter starts at 0 per thread).
 #[no_mangle]
 pub extern "C" fn tensor_randn(shape_ptr: *const usize, ndims: usize) -> i64 {
+    crate::cpu_compute_inc();
     let shape = unsafe { std::slice::from_raw_parts(shape_ptr, ndims).to_vec() };
     let n: usize = shape.iter().product();
     let call_idx = RANDN_CALL_COUNTER.with(|c| { let v = c.get(); c.set(v + 1); v });
@@ -1303,6 +1319,7 @@ pub(crate) fn broadcast_to_shape(h: i64, out_shape: &[usize]) -> i64 {
         tensor_retain(h);
         return h;
     }
+    crate::cpu_compute_inc();
     let n = out_shape.len();
     let mut padded = vec![1usize; n - t.shape.len()];
     padded.extend_from_slice(&t.shape);
@@ -1333,6 +1350,7 @@ pub(crate) fn sum_to_shape(grad: i64, target_shape: &[usize]) -> i64 {
         tensor_retain(grad);
         return grad;
     }
+    crate::cpu_compute_inc();
     let n = t.shape.len();
     let n_target = target_shape.len();
     let mut padded = vec![1usize; n - n_target];
@@ -1436,4 +1454,184 @@ pub extern "C" fn kernel_dispatch(kernel_id: u64, handles: *const i64, count: us
     encoder.endEncoding();
 
     output_handle
+}
+
+// ── M23: Extended dispatch ABI ────────────────────────────────────────────────
+
+/// Extended kernel dispatch for V4-M1+ kernels.  Unlike `kernel_dispatch`:
+/// - Grid/threadgroup config is caller-supplied (not inferred).
+/// - Output shape and dtype are explicitly specified.
+/// - A scalar-uniforms blob is bound as one buffer at index `handle_count+1`.
+/// - Uses `dispatchThreadgroups_threadsPerThreadgroup` so `grid_dims` means
+///   threadgroup counts, not total thread counts.  Required for shared-memory
+///   reductions where one threadgroup must own exactly one row.
+///
+/// Backward-compatible: does not affect `kernel_dispatch`.
+#[no_mangle]
+pub extern "C" fn kernel_dispatch_v2(
+    kernel_id: u64,
+    handles: *const i64,
+    handle_count: usize,
+    grid_dims: *const usize,
+    tg_dims: *const usize,
+    out_shape: *const usize,
+    out_ndim: usize,
+    out_dtype_tag: i32,
+    uniforms: *const std::ffi::c_void,
+    uniforms_bytes: usize,
+) -> i64 {
+    assert!(!grid_dims.is_null(), "malus: kernel_dispatch_v2 grid_dims must not be null");
+    assert!(!tg_dims.is_null(), "malus: kernel_dispatch_v2 tg_dims must not be null");
+
+    let ctx = context();
+
+    let pipeline = {
+        let pipelines = ctx.pipelines.lock().unwrap();
+        pipelines.get(&kernel_id)
+            .unwrap_or_else(|| panic!("malus: kernel_dispatch_v2: kernel_id {} not registered", kernel_id))
+            .clone()
+    };
+
+    let inputs: Vec<&TensorBuffer> = (0..handle_count)
+        .map(|i| unsafe { &*(handles.add(i).read() as *const TensorBuffer) })
+        .collect();
+
+    let output_handle = tensor_alloc_gpu(out_dtype_tag, out_shape, out_ndim, std::ptr::null());
+    let output_tb = unsafe { &*(output_handle as *const TensorBuffer) };
+
+    if output_tb.len == 0 {
+        return output_handle;
+    }
+
+    let grid = unsafe { std::slice::from_raw_parts(grid_dims, 3) };
+    let tg   = unsafe { std::slice::from_raw_parts(tg_dims, 3) };
+
+    let mut guard = ctx.current_command_buffer.lock().unwrap();
+    if guard.is_none() {
+        let cmd_buf = ctx.command_queue
+            .commandBuffer()
+            .expect("malus: kernel_dispatch_v2 failed to create MTLCommandBuffer");
+        *guard = Some(cmd_buf);
+    }
+    let cmd_buf = guard.as_ref().unwrap();
+
+    let encoder = cmd_buf
+        .computeCommandEncoder()
+        .expect("malus: kernel_dispatch_v2 failed to create MTLComputeCommandEncoder");
+    encoder.setComputePipelineState(&*pipeline);
+
+    for (i, input) in inputs.iter().enumerate() {
+        unsafe { encoder.setBuffer_offset_atIndex(Some(&*input.buffer), 0, i) };
+    }
+    unsafe { encoder.setBuffer_offset_atIndex(Some(&*output_tb.buffer), 0, handle_count) };
+
+    if uniforms_bytes > 0 && !uniforms.is_null() {
+        let uniform_buf = ctx.device
+            .newBufferWithLength_options(uniforms_bytes, MTLResourceOptions::StorageModeShared)
+            .expect("malus: kernel_dispatch_v2 failed to allocate uniform buffer");
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                uniforms as *const u8,
+                uniform_buf.contents().as_ptr() as *mut u8,
+                uniforms_bytes,
+            );
+        }
+        unsafe { encoder.setBuffer_offset_atIndex(Some(&*uniform_buf), 0, handle_count + 1) };
+        // uniform_buf drops here; the Metal encoder retains it until command buffer completion.
+    }
+
+    let grid_size = MTLSize { width: grid[0], height: grid[1], depth: grid[2] };
+    let tg_size   = MTLSize { width: tg[0],   height: tg[1],   depth: tg[2] };
+    encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_size, tg_size);
+    encoder.endEncoding();
+
+    output_handle
+}
+
+// ── M23: Softmax de-risk kernel (throwaway; retired in M24) ──────────────────
+//
+// One hand-written MSL kernel that exercises the entire M23 stack:
+// - Static threadgroup shared memory (`threadgroup float scratch[1024]`)
+// - `threadgroup_barrier` for the max and sum reductions
+// - 2-D `dispatchThreadgroups` (one threadgroup per row, cols threads per group)
+// - Scalar uniform passed via `kernel_dispatch_v2` uniforms blob
+//
+// Replaced by a malus-authored kernel compiled by `codegen-gpu` in M24.
+
+/// Reserved ID range for hand-written M23 spike kernels.
+/// High bit set → cannot collide with `compile_kernels`-assigned sequential IDs.
+pub const M23_SOFTMAX_ROW_KERNEL_ID: u64 = 0x8000_0000_0000_0001;
+
+const SOFTMAX_ROW_MSL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+// Row-wise softmax: one threadgroup per row, one thread per column.
+// Buffer layout: buffer(0)=input, buffer(1)=output, buffer(2)=uniform {cols}.
+// Requires tg_size (threads per threadgroup) to be a power of 2.
+kernel void softmax_row(
+    device const float* input  [[buffer(0)]],
+    device float*       output [[buffer(1)]],
+    constant uint&      cols   [[buffer(2)]],
+    uint row     [[threadgroup_position_in_grid]],
+    uint lid     [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    threadgroup float scratch[1024];
+
+    // Load; padding lanes get -inf so they don't affect the max reduction.
+    float val = (lid < cols) ? input[row * cols + lid] : -INFINITY;
+    scratch[lid] = val;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Parallel tree reduction: find row max.
+    for (uint stride = tg_size >> 1; stride >= 1; stride >>= 1) {
+        if (lid < stride) {
+            scratch[lid] = max(scratch[lid], scratch[lid + stride]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float row_max = scratch[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Compute exp(x - max); padding lanes contribute 0 to the sum reduction.
+    float exp_val = (lid < cols) ? exp(val - row_max) : 0.0f;
+    scratch[lid] = exp_val;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Parallel tree reduction: sum of exp values.
+    for (uint stride = tg_size >> 1; stride >= 1; stride >>= 1) {
+        if (lid < stride) {
+            scratch[lid] += scratch[lid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float row_sum = scratch[0];
+
+    // Write normalized output (only active lanes write).
+    if (lid < cols) {
+        output[row * cols + lid] = exp_val / row_sum;
+    }
+}
+"#;
+
+/// Register the M23 softmax_row kernel under `M23_SOFTMAX_ROW_KERNEL_ID`.
+/// Call once before `kernel_dispatch_v2` uses it.
+/// Bypasses `runtime_init`'s `malus_kernel_{id}` naming convention — the MSL
+/// function is addressed by its literal name `"softmax_row"`.
+pub fn register_m23_softmax_row_kernel() {
+    let ctx = context();
+    let mut pipelines = ctx.pipelines.lock().unwrap();
+    let source_ns = NSString::from_str(SOFTMAX_ROW_MSL);
+    let library = ctx.device
+        .newLibraryWithSource_options_error(&source_ns, None)
+        .unwrap_or_else(|e| panic!("malus M23: MSL compilation failed: {e}"));
+    let fn_ns = NSString::from_str("softmax_row");
+    let function = library
+        .newFunctionWithName(&fn_ns)
+        .expect("malus M23: function 'softmax_row' not found in MSL source");
+    let pipeline = ctx.device
+        .newComputePipelineStateWithFunction_error(&*function)
+        .unwrap_or_else(|e| panic!("malus M23: pipeline creation failed: {e}"));
+    pipelines.insert(M23_SOFTMAX_ROW_KERNEL_ID, pipeline);
 }

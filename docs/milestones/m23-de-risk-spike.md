@@ -2,114 +2,94 @@
 
 **Crates:** `malus-runtime`  
 **Track:** GPU (first)  
-**Depends on:** V3 complete (M22 done)
+**Depends on:** V3 complete (M22 done)  
+**Status:** ✅ done
 
-Validate the two V4-critical infrastructure pieces before committing to the M24 full rewrite: (1) the extended `kernel_dispatch` ABI that can pass shape/stride/scalar uniforms, and (2) the CPU-compute counter CI gate. Do this with one hand-written MSL kernel — a row-softmax — to prove the target architecture is sound.
+Validate the two V4-critical infrastructure pieces before committing to the M24 kernel-language rewrite:
+(1) the extended `kernel_dispatch_v2` ABI that can carry explicit grid/threadgroup configuration,
+an independent output shape/dtype, and scalar uniforms; and (2) the CPU-compute counter CI gate
+(ADR-0031) that all subsequent V4 milestone gates rely on.
 
-## Done-When
+Proof vehicle: one hand-written MSL `softmax_row` kernel — a genuine threadgroup-per-row reduction
+— that exercises shared memory, barriers, and `dispatchThreadgroups`, showing the architecture is
+sound. The kernel and all glue are throwaway scaffolding, retired in M24 when the malus compiler
+starts generating MSL from `.ml` kernel source.
 
-1. `examples/m23-softmax.ml` calls a kernel named `softmax_row` on a `[4, 8]` tensor; the output matches `softmax_axis_cpu` within 1e-5.
-2. `malus_cpu_compute_count() == 0` over that dispatch (verified in a test).
+## Done-When (as built)
+
+1. A Rust integration test dispatches `softmax_row` via `kernel_dispatch_v2` on a `[4, 8]`
+   tensor and asserts the output matches a pure-Rust softmax reference within `1e-5`.
+2. `malus_cpu_compute_count() == 0` over that dispatch (verified in the same test).
 3. `cargo test --workspace` passes.
 
-## Scope
+## Locked Decisions
 
-### 1. CPU-compute counter (`malus-runtime/src/lib.rs`)
+| # | Decision | Choice |
+|---|---|---|
+| D1 | Kernel architecture | Real threadgroup reduction — one threadgroup per row, static `threadgroup float scratch[1024]`, `threadgroup_barrier` for max + sum reductions. Serial per-thread loop (from original spec) discarded. |
+| D2 | ABI scope | Minimal-but-real: `kernel_dispatch_v2` carries grid/tg config, output shape/dtype, and a scalar uniforms blob. Per-tensor `{shape, strides, ndim}` descriptors deferred to M24. No `tg_mem_bytes` (ADR-0027 mandates static shared-mem). |
+| D3 | Validation approach | Option B (runtime-only): Rust integration test calls runtime functions directly. No `.ml` example, no `builtins.rs` entry, no codegen changes, no `RuntimeSymbols` change. |
+| D4 | Dispatch semantics | `dispatchThreadgroups_threadsPerThreadgroup`; `grid_dims` = threadgroup counts. Required so one row maps to exactly one threadgroup. Old `kernel_dispatch` keeps `dispatchThreads` (backward-compat). |
+| D5 | Benchmark | Deferred to M25. No PyTorch-MPS number exists to race until the forward pass runs entirely on GPU. |
+| D6 | Counter completeness | Complete principled set — every Rust function that loops over tensor element values. Spec's subset omitted `tensor_transpose`, `tensor_sum`, `permute_by_perm`, `broadcast_cpu_loop`, `tensor_randn`, `tensor_causal_mask`, `tensor_scatter_add`, `broadcast_to_shape`/`sum_to_shape` (non-identity), `scalar_mul`. Incomplete counter produces false `count()==0` — the exact failure ADR-0031 prevents. |
 
-Add a process-global counter:
+## Scope (as implemented)
+
+### CPU-compute counter — `crates/malus-runtime/src/lib.rs`
 
 ```rust
 static CPU_COMPUTE_CALLS: AtomicI64 = AtomicI64::new(0);
-
 pub fn cpu_compute_inc() { CPU_COMPUTE_CALLS.fetch_add(1, Ordering::Relaxed); }
-
-#[no_mangle] pub extern "C" fn malus_cpu_compute_count() -> i64 { CPU_COMPUTE_CALLS.load(Ordering::SeqCst) }
-#[no_mangle] pub extern "C" fn malus_cpu_compute_reset() { CPU_COMPUTE_CALLS.store(0, Ordering::SeqCst) }
+#[no_mangle] pub extern "C" fn malus_cpu_compute_count() -> i64 { ... }
+#[no_mangle] pub extern "C" fn malus_cpu_compute_reset() { ... }
 ```
 
-Call `cpu_compute_inc()` at the entry of each CPU arithmetic function: `softmax_axis_cpu`, `tensor_layernorm_axis`, `tensor_gelu`, `tensor_cross_entropy`, `tensor_embedding`, `reduce_sum_axis`, `reduce_mean_axis`, `reduce_max_axis`, `reduce_var_axis`, and all backward `elem_*` functions in `tape.rs`. **Does not increment for:** tensor_alloc*, tensor_free, tensor_retain, tensor_release, gpu_barrier, kernel_dispatch, tensor_print, matmul (MPS), read_file. Those are orchestration, not compute.
+`cpu_compute_inc()` called at entry of the complete instrumented set in `metal.rs`:
+`tensor_transpose`, `tensor_sum`, `broadcast_cpu_loop`, `tensor_reduce_sum/mean/max/var_axis`,
+`permute_by_perm`, `softmax_axis_cpu`, `tensor_layernorm_axis`, `tensor_gelu`,
+`tensor_cross_entropy`, `tensor_causal_mask`, `tensor_embedding`, `tensor_scatter_add`,
+`tensor_randn`, `broadcast_to_shape` (non-identity), `sum_to_shape` (non-identity).
 
-Add to `RuntimeSymbols`: function pointers for `malus_cpu_compute_count` and `malus_cpu_compute_reset` so the JIT can call them from malus source (useful for test assertions).
+`cpu_compute_inc()` called at entry of all VJP element-loop helpers in `tape.rs`:
+`elem_add`, `elem_sub`, `elem_cmp_eq`, `elem_mul`, `elem_div`, `scalar_mul`, `elem_apply`.
 
-### 2. Extended `kernel_dispatch` ABI (`malus-runtime/src/metal.rs`)
+**Excluded (orchestration / zero-copy):** `tensor_alloc*`, `tensor_free`, `tensor_retain/release`,
+`gpu_barrier`, `kernel_dispatch`, `kernel_dispatch_v2`, `tensor_print`, `tensor_matmul` (MPS),
+`tensor_reshape` (zero-copy, ADR-0023), identity-path `broadcast_to_shape`/`sum_to_shape`.
 
-Current signature (effectively):
-```c
-i64 kernel_dispatch(u64 kernel_id, const i64* handles, usize count)
-```
-Output buffer shape is inferred from `inputs[0]` shape. No way to pass grid/threadgroup config, multi-dimensional shapes, strides, or scalar parameters. This blocks any real GPU algorithm.
+### `kernel_dispatch_v2` — `crates/malus-runtime/src/metal.rs`
 
-New signature:
-```c
-i64 kernel_dispatch_v2(
-    u64 kernel_id,
-    const i64* handles,           // tensor handles (input[0..n-1], output slot = n)
-    usize handle_count,
-    const usize* grid_dims,       // [grid_x, grid_y, grid_z]
-    const usize* tg_dims,         // [tg_x, tg_y, tg_z]
-    const usize* out_shape,       // shape of the output tensor to allocate
-    usize out_ndim,
-    i32 out_dtype_tag,
-    const void* uniforms,         // opaque blob of scalar uniforms (f32/i32 values)
-    usize uniforms_bytes
-)
-```
+New `#[no_mangle] pub extern "C"` symbol after `kernel_dispatch`. Uses
+`dispatchThreadgroups_threadsPerThreadgroup`. Allocates output via the existing
+`tensor_alloc_gpu(out_dtype_tag, out_shape, out_ndim, null)`. Copies the uniforms blob into
+a freshly allocated `MTLBuffer` and binds it at index `handle_count+1`; the buffer drops at
+end of the function (Metal encoder retains it until command-buffer completion). Follows the
+deferred-commit invariant (encodes but does not commit; `gpu_barrier` flushes).
 
-Keep the old `kernel_dispatch` working for existing elementwise kernels (backward compat). Add `kernel_dispatch_v2` as a new C-ABI symbol in `RuntimeSymbols`.
+Full signature: see ADR-0027.
 
-The implementation allocates the output tensor from `out_shape`/`out_dtype_tag`, encodes a compute pass with the extended uniform buffer, and dispatches with the provided grid/threadgroup config.
+### Hand-written `softmax_row` MSL — `crates/malus-runtime/src/metal.rs`
 
-### 3. Hand-written MSL softmax kernel (inline in `malus-runtime/src/metal.rs`)
+- `pub const M23_SOFTMAX_ROW_KERNEL_ID: u64 = 0x8000_0000_0000_0001` (high-bit reserved).
+- `const SOFTMAX_ROW_MSL: &str` — inline MSL with static `threadgroup float scratch[1024]`.
+- `pub fn register_m23_softmax_row_kernel()` — compiles the MSL string, looks up
+  `"softmax_row"` by name, creates a `MTLComputePipelineState`, inserts under the reserved id.
+  Bypasses `runtime_init`'s `malus_kernel_{id}` naming convention — registered separately.
 
-Write one hard-coded MSL source string for `softmax_row`:
+### CI test — `crates/malus-codegen-cpu/tests/metal_integration.rs`
 
-```metal
-kernel void softmax_row(
-    device const float* input  [[buffer(0)]],
-    device float*       output [[buffer(1)]],
-    constant uint&      cols   [[buffer(2)]],   // uniform: number of columns
-    uint row [[thread_position_in_grid]]
-) {
-    uint base = row * cols;
-    float m = input[base];
-    for (uint j = 1; j < cols; j++) m = max(m, input[base + j]);
-    float s = 0.0;
-    for (uint j = 0; j < cols; j++) s += exp(input[base + j] - m);
-    for (uint j = 0; j < cols; j++) output[base + j] = exp(input[base + j] - m) / s;
-}
-```
-
-Register this kernel in `runtime_init` under name `"softmax_row"`. Expose its `kernel_id` in the `name_to_id` map returned by `compile_kernels`.
-
-### 4. `examples/m23-softmax.ml`
-
-```malus
-fn main():
-    let x = Tensor.gpu<f32>([[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
-                               [8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0],
-                               [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
-                               [0.1, 0.9, 0.2, 0.8, 0.3, 0.7, 0.4, 0.6]])
-    let y = softmax_row_kernel(x)
-    println(y)
-```
-
-This calls `kernel_dispatch_v2` under the hood (grid = [4,1,1], tg = [1,1,1], uniforms = cols=8).
-
-### 5. CI test (`crates/malus-codegen-cpu/tests/metal_integration.rs`)
-
-```rust
-#[test]
-fn test_v4_m0_cpu_counter_zero() {
-    // run the m0 softmax example, assert CPU compute counter is 0
-    malus_cpu_compute_reset();
-    run_metal_src(include_str!("../../../examples/m23-softmax.ml"));
-    assert_eq!(malus_cpu_compute_count(), 0, "CPU compute was invoked on the hot path");
-}
-```
+`test_v4_m23_softmax_row_gpu_counter_zero`:
+1. Compute reference via pure-Rust `softmax_ref` (no counter increment).
+2. `register_m23_softmax_row_kernel()` + `malus_cpu_compute_reset()`.
+3. Allocate `[4,8]` input tensor, dispatch with `grid=[4,1,1]`, `tg=[8,1,1]`, `uniforms={cols=8u32}`.
+4. `gpu_barrier()`, snapshot `malus_cpu_compute_count()`.
+5. Per-element assertion within `1e-5`; `assert_eq!(cpu_count, 0)`.
 
 ## Out of Scope
 
-- Malus syntax changes (the softmax kernel is registered by hand, not compiled from `.ml` kernel source).
-- Shape/stride uniform structs in codegen-gpu (that's M24).
-- Any other kernel.
-- The `cpu_fallback` feature gate (add that at M25 when retiring the CPU fns).
+- Any malus syntax / sema / codegen change.
+- `builtins.rs` entry, `RuntimeSymbols` change (those come in M24).
+- Per-tensor `{shape, strides, ndim}` uniform descriptors (M24).
+- `cpu_fallback` feature gate (M25).
+- PyTorch-MPS benchmark baseline (M25).
+- Any kernel other than `softmax_row`.
