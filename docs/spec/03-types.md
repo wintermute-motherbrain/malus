@@ -77,7 +77,7 @@ let lr = cfg.lr
 
 Structs are nominal types. Two structs with identical fields are distinct types.
 
-Structs cannot contain tensors directly in v1 — a struct field of type `Tensor<f32>` triggers the CTMM RC fallback (see section 04). This is correct and expected; model weight containers will naturally use RC.
+Struct fields of type `Tensor<f32>` are supported. CTMM performs escape analysis: if the struct escapes its creation scope (returned, stored in the tape, etc.) the tensor fields use RC; otherwise static-free applies. See section 04.
 
 ### Enum `[v1]`
 
@@ -92,21 +92,11 @@ enum Optimizer:
 let opt = Optimizer.Adam(AdamConfig(lr=0.001, beta1=0.9, beta2=0.999, eps=1e-8))
 ```
 
-Pattern matching on enums uses `if`/`else` with variant checks in v1. A `match` expression is a future addition.
+Pattern matching on enums uses `match`. All variants must be covered.
 
-### Option `[v1]`
+### Option `[post-V4]`
 
-`Option<T>` is the canonical enum for nullable values. It is defined in the stdlib as:
-
-```malus
-enum Option<T>:
-    Some(T)
-    None
-```
-
-`Option` is the recommended way to handle recoverable absence — malus has no exceptions and no null. This composes with the panic-only error model: functions that might not have a result return `Option<T>`; functions that must succeed or die panic.
-
-Note: `Option` requires generics, which land in v1 alongside enums. In v0.1 MVP, there is no `Option`.
+`Option<T>` is deferred. Use explicit enum variants or panic-on-absence patterns in V4.
 
 ## Type inference
 
@@ -137,6 +127,50 @@ dtype mixing in binary ops is a compile-time error. Explicit casting is required
 let c = a + b.to<f32>()   # cast b from f16 to f32 before adding
 ```
 
-## Generics `[future]`
+## Generics `[V4-M5]`
 
-Generics (type parameters on `fn`, `kernel`, `struct`, `enum`) are deferred beyond v1. They are required for `Module` trait abstractions and generic optimizers. The type system is designed so generics can be added without breaking existing code.
+Generics (type parameters on `fn`, `kernel`, `struct`, `enum`) land in V4. The fenced scope: one trait mechanism, methods via `impl` blocks, `List<T>` (growable), no inheritance. Required for the `Module` trait and generic optimizers.
+
+```malus
+trait Module:
+    fn parameters(self) -> List<Tensor<f32>>
+
+impl Module for GPT:
+    fn parameters(self) -> List<Tensor<f32>>:
+        return [self.wte, self.wpe, ...]   # List<Tensor<f32>>
+
+fn adamw<M: Module>(model: M, lr: f32, ...):
+    for p in model.parameters():
+        ...
+```
+
+### `List<T>` `[V4-M5]`
+
+A growable sequence type. Unlike `Array<T, N>`, the length is not statically known. Supports indexing and `for x in list` iteration.
+
+```malus
+let params: List<Tensor<f32>> = [w1, w2, b1, b2]
+for p in params:
+    ...
+```
+
+Tensor elements use the same escape-analysis RC rules as struct fields (section 04). `Dict` is post-V4.
+
+## Autograd types
+
+**There is one tensor type: `Tensor<dtype>`.** There is no `Variable` type in V4. See ADR-0030.
+
+Grad-tracking is a **statically-inferred property**, not a distinct type. A tensor binding is grad-tracked if it derives from a `variable(...)` leaf and is not inside a `no_grad` scope.
+
+```malus
+let w = variable(randn(128, 64))   # marks w as a grad leaf; type is still Tensor<f32>
+let loss = cross_entropy(forward(w, x), y)
+backward(loss)
+
+println(w.grad)   # .grad is available on leaf tensors
+```
+
+- `variable(x: Tensor<f32>) -> Tensor<f32>` — leaf-marker; registers x with the tape.
+- `.data` — identity accessor (no-op in V4; kept for backward compat).
+- `.grad` — returns `Tensor<f32>` for leaf tensors; error for non-leaves.
+- `zero_grad(t: Tensor<f32>)` — resets `.grad` to zeros.

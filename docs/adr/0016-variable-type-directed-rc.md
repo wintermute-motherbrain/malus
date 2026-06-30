@@ -1,5 +1,9 @@
 # Distinct `Variable` type with type-directed RC
 
+**⚠ Status: Superseded by ADR-0030 (V4-M4).**  
+`Variable<f32>` is eliminated. Grad-tracking becomes a statically-inferred sema property (derives-from-a-leaf). RC emission is driven by escape analysis (ADR-0026) rather than by type. The type-directed RC shortcut here was correct but unnecessarily conservative; ADR-0030 achieves the same result with precision.
+
+
 Amends ADR-0002 (CTMM RC fallback) for the autograd use case.
 
 ## Decision

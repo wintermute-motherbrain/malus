@@ -1,5 +1,9 @@
 # Eager CPU loops for V1 stdlib matmul / transpose / sum
 
+**⚠ Status: Retired in V4 (see ADR-0027, ADR-0028).**  
+`tensor_matmul` was already migrated to MPS in M21 (ADR-0017). In V4, all remaining CPU-loop stdlib ops (transpose, axis reductions, softmax, layernorm, gelu, cross_entropy, embedding, broadcasting, backward elem ops) are retired in favor of malus kernels in the stdlib `.ml`. The "eager CPU" model is abandoned. CPU arithmetic fns are gated behind `#[cfg(feature = "cpu_fallback")]` for correctness testing only.
+
+
 In V1, `tensor_matmul`, `tensor_transpose`, and `tensor_sum` are implemented as eager
 C-ABI functions that commit any pending GPU work (via `gpu_barrier`), read the
 `StorageModeShared` buffers directly on the CPU, compute in plain Rust, and return a

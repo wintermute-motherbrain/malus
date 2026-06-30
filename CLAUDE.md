@@ -2,9 +2,9 @@
 
 ## What this is
 
-malus is a compiled ML DSL for Apple Silicon. Python-like syntax, dual compilation pipeline: `fn` bodies → Cranelift JIT (CPU), `kernel` bodies → Metal Shading Language (GPU). The CTMM memory model inserts static `free`/barrier calls at compile time, falling back to reference counting only when lifetimes are structurally ambiguous.
+malus is a compiled ML DSL for Apple Silicon. Python-like syntax, dual compilation pipeline: `fn` bodies → Cranelift JIT (CPU), `kernel` bodies → Metal Shading Language (GPU). The CTMM memory model uses escape analysis + Lobster-style borrow-inference to insert static `free` calls at compile time, falling back to reference counting only for tensors that genuinely escape their creation scope (primarily tape-saved tensors for autograd). There is one tensor type: `Tensor<dtype>`.
 
-## Current state: **V3 complete — M22 done (Data I/O + nanoGPT char-GPT capstone); all milestones through V3 finished**
+## Current state: **V3 complete — V4 roadmap approved (2026-06-29)**
 
 | Milestone | Status | Crate |
 |---|---|---|
@@ -34,8 +34,16 @@ malus is a compiled ML DSL for Apple Silicon. Python-like syntax, dual compilati
 | M20 — Lvalue Assignment + AdamW (`a[i]=e`, `s.f=e`, `mut` params, `**` op, AdamW example) | ✅ done | `malus-syntax`, `malus-sema`, `malus-codegen-cpu` |
 | M21 — MPS Migration (objc2-metal port + `matmul` → MPS, eager) | ✅ done | `malus-runtime` |
 | M22 — Data I/O + nanoGPT Capstone (`read_file`, char tokenization, transformer) | ✅ done | all crates |
+| **V4 — Reclaiming the Vision** (roadmap approved 2026-06-29; see `docs/adr/0026–0031`, plan file) | | |
+| M23 — De-risk spike (extended `kernel_dispatch` ABI + CPU-compute counter CI gate) | 🔲 todo | `malus-runtime` |
+| M24 — Kernel language v2 (thread hierarchy, shared memory, barrier, arbitrary indexing, control flow) | 🔲 todo | `malus-codegen-gpu`, `malus-syntax`, `malus-sema`, `malus-runtime` |
+| M25 — Stdlib forward kernels (all CPU-loop ops → malus `.ml` kernels; forward-hot-path CPU-counter==0) | 🔲 todo | all crates |
+| M26 — Backward kernels (GPU autograd; full-step CPU-counter==0 canonical gate) | 🔲 todo | `malus-runtime` |
+| M27 — Kill `Variable` (static grad-inference; one `Tensor` type) | 🔲 todo | `malus-sema`, `malus-codegen-cpu` |
+| M28 — Module trait + generic optimizer (generics, `impl`, `List<T>`; no-unroll lint gate) | 🔲 todo | all crates |
+| M29 — Borrow-inference RC + benchmark (Lobster single-owner/borrow pass; ≤~5% RC ops; Nx PyTorch-MPS) | 🔲 todo | `malus-sema` |
 
-Full milestone specs: `docs/milestones/`. V1 plan: `docs/milestones/v1-plan.md`. V2 plan: `docs/milestones/v2-plan.md`. V3 plan: `docs/milestones/v3-plan.md`. Architecture decisions: `docs/adr/`. Domain vocabulary: `CONTEXT.md`.
+Full milestone specs: `docs/milestones/`. V1 plan: `docs/milestones/v1-plan.md`. V2 plan: `docs/milestones/v2-plan.md`. V3 plan: `docs/milestones/v3-plan.md`. V4 plan: `docs/milestones/v4-plan.md` + individual specs `m23` through `m29`. Architecture decisions: `docs/adr/` (V4 ADRs: 0026–0031). Domain vocabulary: `CONTEXT.md`.
 
 ## V2 Design Decisions
 
@@ -188,14 +196,20 @@ The `i64` handle is a raw pointer to a heap-allocated `TensorBuffer { buffer: me
 | `reshape`/`transpose`/`permute`, batched/3-D matmul | ✅ M17 | Done; `view` reserved for strided non-contiguous post-V3 |
 | Transformer stdlib (softmax, layernorm, GELU, cross-entropy) | ✅ M18 | Done; `gelu` uses tanh approx; `layernorm` has no affine (additive post-V3) |
 | Index tensors, `embedding`, `randn` (Philox4x32-10) | ✅ M19 | Done; `gather` reserved (different PyTorch contract); user seed post-V3 |
-| Lvalue assignment (`a[i]=e`, `s.f=e`) | ✅ M20 | Done; `mut` params for interior-only borrows; `**` power op; `Variable` field assign post-V3 (ADR-0016) |
-| `transpose`/`sum`/axis reductions are CPU loops | Post-V3 | `tensor_matmul` migrated to MPS in M21; others not on critical path |
+| Lvalue assignment (`a[i]=e`, `s.f=e`) | ✅ M20 | Done; `mut` params for interior-only borrows; `**` power op |
+| `transpose`/`sum`/axis reductions are CPU loops | **M25** | Will be replaced by malus `.ml` kernels (ADR-0027/0028); CPU-counter CI gate enforces this |
 | File I/O / data loading | ✅ M22 | `read_file`, `str_len`, `str_char_at`, `str_from_char`, `Buffer<i32>`, `freeze`, `rand_int`, `rand_uniform`, `tensor.data[i]` — all done |
-| Non-f32 compute dtypes (f16, bf16) | Post-V3 | Only i32/i64 for index tensors added in M19 |
-| Cross-module structs/enums unsupported (loader `exported_names` gap) | Required post-V3 milestone | See `docs/milestones/cross-module-types.md`; fix needed before M22 import story works |
-| ScalarBroadcast IR node | Post-V3 | Inline scalar-broadcast BinOps work; dedicated IR node deferred |
-| CTMM barrier coalescing is conservative | Post-V3 | ADR-0009 "Consequences" |
-| General dataflow-liveness RC fallback | Post-V3 | Type-directed RC on `Variable` supersedes this for autograd; true dataflow RC remains deferred |
+| Non-f32 compute dtypes (f16, bf16) | Post-V4 | Only i32/i64 for index tensors; f16/bf16 mixed-precision deferred (D10) |
+| Cross-module structs/enums unsupported (loader `exported_names` gap) | Post-V4 | See `docs/milestones/cross-module-types.md` |
+| ScalarBroadcast IR node | Post-V4 | Inline scalar-broadcast BinOps work; dedicated IR node deferred |
+| CTMM barrier coalescing is conservative | Post-V4 | ADR-0009 "Consequences" |
+| `Variable` type (type-directed RC) | **M27** | To be eliminated; replaced by single `Tensor` type + static grad-inference (ADR-0030) |
+| Generics / `impl` / `Module` trait / `List<T>` | **M28** | ADR-0007 fenced scope; required for generic optimizer |
+| Lobster borrow-inference RC elimination | **M29** | The founding CTMM differentiator; ADR-0026 |
+| Kernel language beyond elementwise maps | **M24** | Thread hierarchy, shared memory, barrier, arbitrary indexing (ADR-0027) |
+| Stdlib ops as malus kernels (dogfooding) | **M25** | Currently Rust CPU loops; will move to kernel language (ADR-0028) |
+| Backward kernels on GPU | **M26** | Currently Rust CPU VJPs in tape.rs; will become GPU kernel dispatches (ADR-0031 gate) |
+| Flash attention | Post-V4 | Composed attention ships V4 (ADR-0029); flash requires simdgroup_matrix + mixed precision |
 
 ## Coding conventions
 

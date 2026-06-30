@@ -21,18 +21,22 @@ _Avoid_: Split compilation, two-stage compilation
 ### Memory
 
 **CTMM** (Compile-Time Memory Management):
-malus's automatic compile-time memory management system. Uses escape analysis to insert static `free` calls for tensors. Falls back to reference counting only when lifetimes are structurally ambiguous (heap-stored tensors — struct fields, array elements). Inspired by the Lobster language's ownership model.
-_Avoid_: GC, garbage collector, allocator, Lobster
+malus's automatic compile-time memory management system. Uses escape analysis and borrow-inference to insert static `free` calls for tensors. Falls back to reference counting only for tensors that genuinely escape their creation scope (primarily tensors saved onto the autograd tape). The compiler picks a single owner per allocation; all other uses are zero-cost borrows. Inspired by the Lobster language's ownership model (https://aardappel.github.io/lobster/memory_management.html). See ADR-0026.
+_Avoid_: GC, garbage collector, allocator
 
 **Escape analysis**:
 The compiler pass that determines whether a tensor's lifetime can be fully resolved at compile time by tracking where it is created, used, and last referenced.
 
-**Structurally ambiguous**:
-A tensor lifetime that cannot be resolved at compile time — specifically, when a tensor is stored in a heap-allocated container (struct field, fixed-length array). Triggers the RC fallback.
-_Avoid_: dynamic lifetime, heap lifetime
+**Owner**:
+The single binding, struct field, or array element assigned a tensor allocation. Exactly one owner per allocation. The compiler emits `tensor_free` (or `tensor_release` if escaping) at the owner's last-use point.
+_Avoid_: primary reference, strong reference
+
+**Borrow**:
+Any use of a tensor allocation that is not the owner. Borrows carry zero refcount cost — `tensor_retain`/`tensor_release` are not emitted. The programmer does not annotate borrows; the compiler infers them.
+_Avoid_: reference, immutable reference, view
 
 **RC fallback**:
-When CTMM cannot statically determine the drop point — specifically when a tensor is stored in a heap-allocated container (struct field, fixed-length array element) — it falls back to reference counting. `tensor_retain` increments the refcount; `tensor_release` decrements it and frees when zero. The fast path (no RC) is preserved for all statically resolvable lifetimes, including tensors that flow through `if`/`else`/`for`/`while` bodies (handled by hierarchical scope analysis — see ADR-0014). See ADR-0002.
+When CTMM determines a tensor **escapes** its creation scope — primarily because it is saved onto the autograd tape — it falls back to reference counting. `tensor_retain` increments the refcount when the tensor is saved (e.g., for a backward VJP); `tensor_release` decrements and frees when the refcount hits zero. In the hot-path training loop, ≤ ~5% of allocations should require RC; the rest receive static-free via borrow-inference. See ADR-0026.
 _Avoid_: garbage collection, ARC
 
 **Static drop**:
@@ -58,12 +62,12 @@ A tensor produced by a kernel whose GPU work has not yet been committed. CPU rea
 _Avoid_: Pending output, uncommitted tensor
 
 **Ready tensor**:
-A tensor whose data is already materialized in the `StorageModeShared` buffer and safe to read on the CPU without a barrier. Produced by eager CPU-side stdlib ops (`tensor_matmul`, `tensor_transpose`, `tensor_sum`, `tensor_alloc_zeros_gpu`, `tensor_alloc_ones_gpu`). Counterpart to pending tensor.
+A tensor whose data is already materialized in the `StorageModeShared` buffer and safe to read on the CPU without a barrier. Produced by `tensor_alloc_zeros_gpu`, `tensor_alloc_ones_gpu`, and by MPS-backed ops (e.g. `tensor_matmul`) after they commit and wait. Counterpart to pending tensor.
 _Avoid_: CPU tensor, completed tensor
 
 **Shape metadata**:
-The `shape: Vec<usize>` field on `TensorBuffer`, recording the n-dimensional extent of a tensor (invariant: `len == shape.iter().product()`). Runtime-only — absent from the type system, which is dtype-only. Validated at runtime by ops that require specific rank (e.g. `tensor_matmul` requires 2-D). See ADR-0013.
-_Avoid_: Tensor shape, static shape
+The `shape: Vec<usize>` field on `TensorBuffer`, recording the n-dimensional extent of a tensor (invariant: `len == shape.iter().product()`). Runtime-only — absent from the type system, which is dtype-only. Validated at runtime by ops that require specific rank (e.g. `tensor_matmul` requires 2-D). Static shape inference is deferred post-V4. See ADR-0013.
+_Avoid_: Tensor shape, static shape (describing a compile-time feature not yet built)
 
 **Pending set**:
 The CTMM compile-time set of tensor bindings produced or consumed by a GPU-producing expression (`KernelCall`, tensor `BinOp`, or GPU-returning `Call`) since the last `GpuBarrier`. Any CPU-side access of a binding in the pending set triggers a barrier insertion.
@@ -94,7 +98,7 @@ A `tensor_matmul` call where both operands are 3-D with identical leading batch 
 _Avoid_: batched matrix multiply (fine informally), bmm
 
 **Index tensor**:
-A `Tensor<i32>` or `Tensor<i64>` used as an index into another tensor (e.g. for embedding lookup). Not differentiable — integer tensors are never `Variable`. Added in M19 as a narrow dtype carve-out; full non-f32 float compute generality is post-V3. Both i32 and i64 are accepted by `embedding` and `cross_entropy`; i32 is the M19 done-when dtype.
+A `Tensor<i32>` or `Tensor<i64>` used as an index into another tensor (e.g. for embedding lookup). Not grad-tracked — integer tensors carry no gradient. Added in M19 as a narrow dtype carve-out; full non-f32 float compute generality is post-V4. Both i32 and i64 are accepted by `embedding` and `cross_entropy`; i32 is the M19 done-when dtype.
 _Avoid_: integer tensor (fine informally, but "index tensor" conveys the use)
 
 ### Kernel mechanics
@@ -103,17 +107,29 @@ _Avoid_: integer tensor (fine informally, but "index tensor" conveys the use)
 Static properties of a kernel dispatch — threadgroup size, grid dimensions — set via annotations on the kernel function.
 _Avoid_: Dispatch config, thread config
 
-**Multi-statement kernel body** (V1):
-A kernel body that contains local `let` bindings and comparison/ternary expressions before the final `return`. Enables gradient kernels like `relu_backward` that need intermediate values. Full control flow inside kernels (loops, conditionals) is post-V1.
+**Kernel body (V4)**:
+A kernel body in V4 expresses a real GPU algorithm: arbitrary tensor indexing (`a[i,j]`), thread/threadgroup/grid hierarchy intrinsics, shared memory declarations, `barrier()`, `for`/`while`/`if`, and explicit reductions. The V1 restriction to elementwise maps (`out[tid] = f(inputs[tid])`) is lifted. See ADR-0027.
 _Avoid_: Complex kernel, multi-line kernel
 
-**Intrinsics**:
-Built-in functions callable inside kernel bodies that expose GPU-level concepts: thread identity (`threadgroup_id()`), shared memory (`shared_alloc()`), SIMD operations (`simd_shuffle()`). Post-V1.
-_Avoid_: Builtins, GPU functions
+**Thread hierarchy intrinsics**:
+Built-in functions inside kernel bodies that expose the Metal thread model: `thread_id()`, `threadgroup_id()`, `threads_per_threadgroup()`, `threads_per_grid()`. Map to MSL `thread_position_in_grid` etc. Added in V4-M1. See ADR-0027.
+_Avoid_: GPU intrinsics, builtins (too vague)
+
+**Shared memory**:
+Threadgroup-scoped fast memory in a kernel body, declared as `let shared x: SharedArray<f32, N>`. Size `N` is a compile-time literal. Maps to MSL `threadgroup float x[N]`. Used for reduction intermediates (e.g. partial sums in softmax). Added in V4-M1.
+_Avoid_: local memory, scratchpad
 
 **`inout` parameter**:
 A kernel parameter that is mutated in place rather than borrowed immutably. Avoids allocating a new output buffer for element-wise ops. Post-V1.
 _Avoid_: Mutable parameter, write parameter
+
+**Dispatch uniforms**:
+Per-kernel metadata passed alongside tensor data handles in `kernel_dispatch`: shape, strides, ndim, and scalar parameters (e.g. `axis`, `eps`). Required in V4 for kernels that index tensors with multi-dimensional coordinates. See ADR-0027.
+_Avoid_: kernel arguments (overloaded)
+
+**Vendor primitive**:
+A runtime op whose optimal implementation requires hardware resources not reachable from custom MSL compute kernels. Currently: `matmul` (→ MPS/AMX coprocessor on M-series). Implemented as a C-ABI Rust function in `malus-runtime`, not in the malus kernel language. Everything else is a kernel-language op. See ADR-0028.
+_Avoid_: builtin op (overloaded), MPS op
 
 **Built-in element-wise kernel**:
 An MSL kernel synthesized by `malus-codegen-gpu` for a primitive arithmetic operator (`malus_add`, `malus_sub`, `malus_mul`, `malus_div`), dispatched via `kernel_dispatch` with a sequential `kernel_id` appended after user kernels. Indistinguishable from a user kernel at runtime.
@@ -125,36 +141,36 @@ _Avoid_: Scalar-space, thread-space, per-element computation
 
 ### Autograd
 
-**Variable**:
-A grad-tracked tensor. Distinct from `Tensor` — the compiler always manages `Variable` lifetimes with reference counting (type-directed RC), while `Tensor` keeps static Drop. `Variable` values record their forward ops onto the global tape; `backward(loss)` accumulates gradients into leaf `.grad` slots. Constructed with `variable(t: Tensor<f32>)`.
-_Avoid_: program "variable" (lowercase), "Tensor.requires_grad", "Tensor with grad"
+**Grad-tracked tensor**:
+A `Tensor<f32>` whose binding is statically inferred to derive from a grad leaf (created by `variable(...)`) and is not inside a `no_grad` scope. There is no distinct `Variable` type in V4. Grad-tracking is a compiler-inferred property. See ADR-0030.
+_Avoid_: Variable (eliminated in V4), Tensor.requires_grad
 
 **Tape**:
-A global thread-local define-by-run record. Each differentiable op on `Variable` values pushes a `TapeNode` holding saved inputs and a VJP closure. `backward(loss)` walks the tape in reverse and clears it on completion. See ADR-0015.
+A global thread-local define-by-run record. Each differentiable op on grad-tracked tensors pushes a `TapeNode` holding saved inputs and a VJP closure. `backward(loss)` walks the tape in reverse and clears it on completion. See ADR-0015.
 _Avoid_: gradient graph, computation graph
 
 **VJP (Vector-Jacobian Product)**:
-The per-op backward rule used by `backward`. Given the output gradient, computes the input gradients. All VJPs for V1/V2 ops are hardcoded in `malus-runtime/src/tape.rs`.
+The per-op backward rule used by `backward`. Given the output gradient, computes the input gradients. In V3, VJPs are Rust CPU functions in `malus-runtime/src/tape.rs`. In V4-M3, each op ships a paired GPU backward kernel dispatched from `backward()`.
 _Avoid_: backward pass, gradient function
 
 **`backward`**:
-A builtin that walks the tape in reverse from a scalar-valued `Variable` (the loss), accumulates gradients into each leaf's `.grad` slot, releases saved tensors, and clears the tape.
+A builtin that walks the tape in reverse from a scalar-valued loss tensor, accumulates gradients into each leaf's `.grad` slot, releases saved tensors (RC), and clears the tape.
 _Avoid_: backpropagation (fine informally, not a technical term here)
 
 **`.grad`**:
-A field accessor on a leaf `Variable<f32>` that returns the accumulated gradient as a plain `Tensor<f32>`. Zero (or a zeros tensor) if `backward` has not yet been called. Cleared by `zero_grad`.
+A field accessor on a leaf tensor (one created with `variable(t)`) that returns the accumulated gradient as a `Tensor<f32>`. Zero (or a zeros tensor) if `backward` has not yet been called. Cleared by `zero_grad`.
 _Avoid_: gradient tensor, derivative
 
 **`no_grad`**:
-A scoped region (`with no_grad: body`) that suspends tape recording. `Variable` ops inside the body execute their forward computation but push no `TapeNode`. Used for the optimizer update step and for inference. `Variable` RC semantics are unchanged inside `no_grad`.
+A scoped region (`with no_grad: body`) that suppresses tape recording. Grad-tracked ops inside the body execute but push no `TapeNode`. A static scope — CTMM emits static-free for all tensors inside `no_grad` regardless of whether they derive from leaves. Used for inference and the optimizer update step.
 _Avoid_: detach, inference mode
 
-**Leaf Variable**:
-A `Variable` created directly by the user with `variable(t)`. Accumulates `.grad` on `backward`. Counterpart to intermediate Variables, which are produced by ops on other Variables and have no `.grad`.
-_Avoid_: parameter, weight (informal descriptions, not technical terms)
+**Leaf tensor**:
+A tensor created with `variable(t)`. The compiler marks it as a grad leaf; `.grad` accumulates from `backward`. Counterpart to intermediate tensors (produced by ops on leaves) which do not accumulate `.grad`.
+_Avoid_: leaf Variable, parameter, weight (informal)
 
 **`zero_grad`**:
-A variadic builtin that resets the accumulated `.grad` of each passed `Variable` to a zeros tensor of the same shape. Called at the start of each training step to clear gradients before the next `backward`.
+A variadic builtin that resets the `.grad` of each passed leaf tensor to a zeros tensor of the same shape. Called at the start of each training step.
 _Avoid_: clear gradients, reset gradients
 
 ### Types (V1)
@@ -176,8 +192,24 @@ An exhaustive pattern-match statement over an enum value. All variants must have
 _Avoid_: Switch, case expression
 
 **Fixed-length array** (V1):
-A compile-time-sized sequence: `[expr1, expr2, ...]`. Type is `Array<T, N>` where `N` is known statically. Supports indexing (`arr[i]`) and `for x in arr` iteration. Tensor elements trigger the RC fallback. Growable arrays (`Vec<T>`) are post-V1.
+A compile-time-sized sequence: `[expr1, expr2, ...]`. Type is `Array<T, N>` where `N` is known statically. Supports indexing (`arr[i]`) and `for x in arr` iteration. Tensor elements use escape-analysis RC.
 _Avoid_: List, dynamic array, vector
+
+**`List<T>`** (V4):
+A growable sequence type added in V4-M5. Length is not statically known. Used as the return type of `Module.parameters()`. Supports indexing and `for x in list` iteration. Tensor elements use escape-analysis RC (same as `Array`). `Dict` is post-V4.
+_Avoid_: Vec, dynamic array, vector (fine informally; List is the canonical term)
+
+**Trait**:
+A named protocol (`trait Name: fn method(self, ...) -> T`) that types can implement with `impl Name for Type`. Exactly one trait mechanism in V4; no inheritance. The primary built-in trait is `Module`. See ADR-0007 (fenced scope).
+_Avoid_: interface, protocol (fine informally), type class
+
+**`Module` trait**:
+The V4 trait for neural network components: `trait Module: fn parameters(self) -> List<Tensor<f32>>`. A type that implements `Module` can be passed to a generic optimizer. `impl Module for GPT` provides the parameters list for the capstone.
+_Avoid_: nn.Module (PyTorch name; fine as analogy, not the canonical term)
+
+**Generics**:
+Type parameters on `fn`, `struct`, `enum`, and `kernel`. Constraint syntax: `fn f<T: Trait>(x: T)`. Monomorphized at the JIT call site. V4 scope: one type parameter per item, one trait bound, no higher-kinded types, no associated types.
+_Avoid_: templates, polymorphism (fine informally)
 
 **`let mut` / reassignment** (V1):
 A mutable binding declared with `let mut x = expr`. Can be reassigned with `x = new_val`. CTMM treats reassignment as: drop the old value (if tensor, emit `tensor_free` or `tensor_release`), then bind the new value. Prevents the shadowing-in-loops problem where `let x = x + delta` inside a loop scopes the new `x` to the loop body.
@@ -190,7 +222,7 @@ Numerically stable softmax over a named required `axis=N` dimension. `softmax(t,
 _Avoid_: normalized exponential, log-softmax (different op)
 
 **layernorm** (M18):
-Layer normalization over a named required `axis=N` dimension: `y = (x − μ) / sqrt(var(x, axis) + 1e-5)`. No learnable affine parameters (γ/β) in M18 — users compose their own `y * gamma + beta` after the call using `Variable` arithmetic. Differentiable. PyTorch subset: `torch.layer_norm` additionally accepts `weight`/`bias` tensors; the malus single-axis form is additive.
+Layer normalization over a named required `axis=N` dimension: `y = (x − μ) / sqrt(var(x, axis) + 1e-5)`. No learnable affine parameters (γ/β) in M18 — users compose their own `y * gamma + beta` after the call using grad-tracked tensor arithmetic. Differentiable. PyTorch subset: `torch.layer_norm` additionally accepts `weight`/`bias` tensors; the malus single-axis form is additive.
 _Avoid_: batch norm (different algorithm), RMS norm (different normalization)
 
 **gelu** (M18):
@@ -198,15 +230,15 @@ Gaussian Error Linear Unit activation, tanh approximation: `0.5 * x * (1 + tanh(
 _Avoid_: ReLU, SiLU (different activations)
 
 **cross_entropy** (M18; tightened M19):
-Cross-entropy loss: `cross_entropy(logits: Variable<f32> [N,C], targets: Tensor<i32|i64> [N]) -> Variable<f32> [1]`. Applies softmax internally (numerically stable) and computes `-mean(log(s[i, targets[i]]))`. M19 tightened targets from f32 placeholder to integer index tensor (`Tensor<i32>` or `Tensor<i64>`). Differentiable; VJP: `d_logits[i,j] = dout/N * (s[i,j] − 1{j == targets[i]})`.
+Cross-entropy loss: `cross_entropy(logits: Tensor<f32> [N,C], targets: Tensor<i32|i64> [N]) -> Tensor<f32> [1]`. Applies softmax internally (numerically stable) and computes `-mean(log(s[i, targets[i]]))`. M19 tightened targets from f32 placeholder to integer index tensor. Differentiable when logits are grad-tracked; VJP: `d_logits[i,j] = dout/N * (s[i,j] − 1{j == targets[i]})`.
 _Avoid_: NLL loss (expects log-probabilities, not logits), softmax cross-entropy (redundant; the softmax is fused inside)
 
 **embedding** (M19):
-Differentiable token/vocabulary lookup. `embedding(weight: Variable<f32> [V,D], indices: Tensor<i32|i64> [T]) -> Variable<f32> [T,D]`. Copies row `indices[t]` of `weight` into `out[t]`. VJP: scatter-add — for each position `t`, `dweight[indices[t]] += dout[t]`; indices receive no gradient (integer, non-differentiable). Analogous to `torch.nn.Embedding.forward`. Name `gather` is reserved — `torch.gather(input, dim, index)` has a different contract (general gather over any axis, not row lookup).
+Differentiable token/vocabulary lookup. `embedding(weight: Tensor<f32> [V,D], indices: Tensor<i32|i64> [T]) -> Tensor<f32> [T,D]`. Output is grad-tracked when `weight` is grad-tracked. Copies row `indices[t]` of `weight` into `out[t]`. VJP: scatter-add — for each position `t`, `dweight[indices[t]] += dout[t]`; indices receive no gradient (integer, non-differentiable). Analogous to `torch.nn.Embedding.forward`. Name `gather` is reserved — `torch.gather(input, dim, index)` has a different contract (general gather over any axis, not row lookup).
 _Avoid_: gather (reserved, different PyTorch contract), lookup table
 
 **randn** (M19):
-`randn(d0, d1, ...) -> Tensor<f32>`. Returns a tensor of the given shape filled with independent standard-normal samples. CPU-side implementation using Philox4x32-10 counter-based RNG + Box-Muller transform. Non-differentiable (returns plain `Tensor`, not `Variable`; wrap with `variable(randn(...))` to make it a leaf). No user-settable seed in M19; the stream is determined by a thread-local call counter (incremented per `randn` call). See ADR-0024.
+`randn(d0, d1, ...) -> Tensor<f32>`. Returns a tensor of the given shape filled with independent standard-normal samples. CPU-side implementation using Philox4x32-10 counter-based RNG + Box-Muller transform. Non-differentiable (returns `Tensor<f32>` that is not grad-tracked; wrap with `variable(randn(...))` to register it as a grad leaf). No user-settable seed in M19; the stream is determined by a thread-local call counter (incremented per `randn` call). See ADR-0024.
 _Avoid_: random normal (fine informally), random init
 
 **causal_mask** (M18):
@@ -216,11 +248,11 @@ _Avoid_: attention mask (overloaded), upper-triangular mask (imprecise)
 ### Optimization
 
 **AdamW**:
-The Adam optimizer with decoupled weight decay, implemented in malus source (`examples/adamw.ml`). Uses per-parameter moment buffers (`m`, `v`) updated via lvalue assignment on `mut` array parameters. Added in M20.
+The Adam optimizer with decoupled weight decay. In V4, implemented as a generic `fn adamw<M: Module>(model: M, ...)` that loops `model.parameters()` — no hand-unrolling. Previous `examples/adamw.ml` was a hand-specialized prototype. Added in M20; made generic in V4-M5.
 _Avoid_: Adam, SGD with weight decay (different algorithms)
 
 **Lvalue assignment**:
-An assignment whose target is an indexed element (`a[i] = e`) or a struct field (`s.field = e`) rather than a bare name. Added in M20. Requires the base binding to be mutable (`let mut` local or `mut` parameter). CTMM drops the old element/field value before binding the new one (release is emitted inline at codegen time; Index/Field targets do not receive a separate CTMM drop stmt). `Variable` struct fields may not be assigned (post-V3, ADR-0016).
+An assignment whose target is an indexed element (`a[i] = e`) or a struct field (`s.field = e`) rather than a bare name. Added in M20. Requires the base binding to be mutable (`let mut` local or `mut` parameter). CTMM drops the old element/field value before binding the new one (release is emitted inline at codegen time; Index/Field targets do not receive a separate CTMM drop stmt).
 _Avoid_: in-place update, indexed assignment (fine informally)
 
 **`mut` parameter**:

@@ -1,5 +1,9 @@
 # MPS migration for matmul
 
+**⚠ Status: Partially superseded by ADR-0028 (V4).**  
+`tensor_matmul` → MPS is correct and remains in V4 (it is the canonical vendor-primitive). The V3 decision to leave `tensor_transpose` and axis reductions as CPU loops is reversed in V4 — those ops are replaced by malus kernels per ADR-0027/0028, not kept as CPU loops. The MPS matmul migration scope (matmul only) was a V3 stopgap; V4 completes the migration by kernel-language coverage rather than MPS coverage.
+
+
 Amends ADR-0012 (eager CPU loops for matmul/transpose/sum).
 
 ## Decision
