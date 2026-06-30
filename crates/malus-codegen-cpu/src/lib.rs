@@ -155,6 +155,9 @@ pub struct RuntimeSymbols {
     pub malus_buffer_set_i32:      extern "C" fn(i64, i64, i64),
     pub malus_buffer_free:         extern "C" fn(i64),
     pub malus_buffer_freeze_i32:   extern "C" fn(i64) -> i64,
+    // M22 rand_int + tensor_get_f32.
+    pub malus_rand_int:            extern "C" fn(i64) -> i64,
+    pub malus_tensor_get_f32:      extern "C" fn(i64, i64) -> f32,
 }
 
 // ── Error ─────────────────────────────────────────────────────────────────────
@@ -426,6 +429,9 @@ struct Codegen<'m> {
     rt_malus_buffer_set_i32:       FuncId,
     rt_malus_buffer_free:          FuncId,
     rt_malus_buffer_freeze_i32:    FuncId,
+    // M22: rand_int + tensor_get_f32.
+    rt_malus_rand_int:             FuncId,
+    rt_malus_tensor_get_f32:       FuncId,
 }
 
 impl<'m> Codegen<'m> {
@@ -1624,6 +1630,11 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                     let func_ref = self.import_func(self.codegen.rt_malus_rand_uniform);
                     let call = self.builder.ins().call(func_ref, &[]);
                     Ok(self.builder.inst_results(call).to_vec()[0])
+                } else if callee == "rand_int" {
+                    let n = self.lower_expr(&args[0])?;
+                    let func_ref = self.import_func(self.codegen.rt_malus_rand_int);
+                    let call = self.builder.ins().call(func_ref, &[n]);
+                    Ok(self.builder.inst_results(call).to_vec()[0])
                 } else if callee == "buffer_i32" {
                     let n = self.lower_expr(&args[0])?;
                     let func_ref = self.import_func(self.codegen.rt_malus_buffer_i32);
@@ -1735,7 +1746,15 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                         let call = self.builder.ins().call(func_ref, &[buf_handle, idx_val]);
                         Ok(self.builder.inst_results(call).to_vec()[0])
                     }
-                    _ => Err(CodegenError::UnsupportedExpr("Index: only Array or Buffer indexing is supported".into())),
+                    ResolvedTy::Tensor { .. } => {
+                        // Tensor<f32>[i] — flat row-major read; gpu_barrier injected by CTMM.
+                        let ten_handle = self.lower_expr(base)?;
+                        let idx_val = self.lower_expr(&indices[0])?;
+                        let func_ref = self.import_func(self.codegen.rt_malus_tensor_get_f32);
+                        let call = self.builder.ins().call(func_ref, &[ten_handle, idx_val]);
+                        Ok(self.builder.inst_results(call).to_vec()[0])
+                    }
+                    _ => Err(CodegenError::UnsupportedExpr("Index: only Array, Buffer, or Tensor<f32> indexing is supported".into())),
                 }
             }
 
@@ -2668,6 +2687,9 @@ pub fn compile_and_run(
     jit_builder.symbol("malus_buffer_set_i32",     symbols.malus_buffer_set_i32      as *const u8);
     jit_builder.symbol("malus_buffer_free",        symbols.malus_buffer_free         as *const u8);
     jit_builder.symbol("malus_buffer_freeze_i32",  symbols.malus_buffer_freeze_i32   as *const u8);
+    // M22 rand_int + tensor_get_f32.
+    jit_builder.symbol("malus_rand_int",            symbols.malus_rand_int            as *const u8);
+    jit_builder.symbol("malus_tensor_get_f32",      symbols.malus_tensor_get_f32      as *const u8);
 
     let mut module = JITModule::new(jit_builder);
     let ptr = module.target_config().pointer_type();
@@ -3119,6 +3141,20 @@ pub fn compile_and_run(
     let rt_malus_buffer_freeze_i32 = module.declare_function("malus_buffer_freeze_i32", Linkage::Import, &sig_buffer_i32)
         .map_err(|e| CodegenError::JitError(e.to_string()))?;
 
+    // M22 rand_int(n: i64) -> i64
+    let rt_malus_rand_int = module.declare_function("malus_rand_int", Linkage::Import, &sig_buffer_i32)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
+    // M22 malus_tensor_get_f32(handle: i64, idx: i64) -> f32
+    let sig_tensor_get_f32 = {
+        let mut s = Signature::new(call_conv);
+        s.params.push(AbiParam::new(I64));
+        s.params.push(AbiParam::new(I64));
+        s.returns.push(AbiParam::new(F32));
+        s
+    };
+    let rt_malus_tensor_get_f32 = module.declare_function("malus_tensor_get_f32", Linkage::Import, &sig_tensor_get_f32)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
+
     // First pass: declare all user fn signatures.
     let mut func_ids: HashMap<String, FuncId> = HashMap::new();
     for typed_fn in &program.fns {
@@ -3206,6 +3242,8 @@ pub fn compile_and_run(
         rt_malus_buffer_set_i32,
         rt_malus_buffer_free,
         rt_malus_buffer_freeze_i32,
+        rt_malus_rand_int,
+        rt_malus_tensor_get_f32,
     };
 
     // Second pass: compile each fn body.

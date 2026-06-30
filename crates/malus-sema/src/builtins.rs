@@ -218,6 +218,12 @@ pub fn register_builtins() -> HashMap<String, BuiltinSig> {
         return_ty: ResolvedTy::Scalar(ScalarTy::F32),
         return_placement: None,
     });
+    // M22 rand_int(n: i64) -> i64  — uniform random integer in [0, n).
+    m.insert("rand_int".to_string(), BuiltinSig {
+        kind: BuiltinKind::Fixed(vec![ResolvedTy::Scalar(ScalarTy::I64)]),
+        return_ty: ResolvedTy::Scalar(ScalarTy::I64),
+        return_placement: None,
+    });
 
     // M22 Buffer<i32> — mutable CPU-side staging buffer for tokenization.
     // buffer_i32(n: i64) -> Buffer<i32>

@@ -364,6 +364,9 @@ extern "C" fn mock_malus_buffer_freeze_i32(handle: i64) -> i64 {
     let float_data: Vec<f32> = data.iter().map(|&x| x as f32).collect();
     with_store(|s| s.insert(float_data, vec![n]))
 }
+extern "C" fn mock_malus_tensor_get_f32(handle: i64, idx: i64) -> f32 {
+    with_store(|s| s.tensors.get(&handle).map(|t| t.data[idx as usize]).unwrap_or(0.0))
+}
 
 fn mock_symbols() -> RuntimeSymbols {
     RuntimeSymbols {
@@ -427,6 +430,9 @@ fn mock_symbols() -> RuntimeSymbols {
         malus_buffer_set_i32:      mock_malus_buffer_set_i32,
         malus_buffer_free:         mock_malus_buffer_free,
         malus_buffer_freeze_i32:   mock_malus_buffer_freeze_i32,
+        // M22 rand_int + tensor_get_f32.
+        malus_rand_int:            malus_runtime::malus_rand_int,
+        malus_tensor_get_f32:      mock_malus_tensor_get_f32,
     }
 }
 

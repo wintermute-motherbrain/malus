@@ -70,6 +70,9 @@ fn real_symbols() -> RuntimeSymbols {
         malus_buffer_set_i32:      malus_runtime::malus_buffer_set_i32,
         malus_buffer_free:         malus_runtime::malus_buffer_free,
         malus_buffer_freeze_i32:   malus_runtime::malus_buffer_freeze_i32,
+        // M22 rand_int + tensor_get_f32.
+        malus_rand_int:            malus_runtime::malus_rand_int,
+        malus_tensor_get_f32:      malus_runtime::malus_tensor_get_f32,
     }
 }
 

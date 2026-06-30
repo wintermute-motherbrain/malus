@@ -1608,6 +1608,21 @@ fn check_index(
             span,
         ));
     }
+    // Tensor<f32>[i] → Scalar(F32)  (flat row-major read; gpu_barrier inserted by CTMM before use)
+    if let ResolvedTy::Tensor { dtype } = &tbase.ty.clone() {
+        if *dtype == ScalarTy::F32 {
+            let mut typed_indices: Vec<TypedExpr> = Vec::new();
+            for idx in indices {
+                typed_indices.push(check_expr(idx, Some(&ResolvedTy::Scalar(ScalarTy::I64)), ctx)?);
+            }
+            return Some(typed_expr(
+                TypedExprKind::Index { base: Box::new(tbase), indices: typed_indices },
+                ResolvedTy::Scalar(ScalarTy::F32),
+                None,
+                span,
+            ));
+        }
+    }
     let ty = tbase.ty.clone();
     let placement = tbase.placement;
     let mut typed_indices: Vec<TypedExpr> = Vec::new();

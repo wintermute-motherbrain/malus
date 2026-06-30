@@ -1275,6 +1275,24 @@ pub extern "C" fn malus_rand_uniform() -> f32 {
     (r[0] as f64 / 4_294_967_296.0) as f32
 }
 
+/// rand_int(n) → i64 in [0, n). Shares Philox4x32-10 call counter; uses counter[0]=1 to separate domain.
+#[no_mangle]
+pub extern "C" fn malus_rand_int(n: i64) -> i64 {
+    let call_idx = RANDN_CALL_COUNTER.with(|c| { let v = c.get(); c.set(v + 1); v });
+    let key = [call_idx as u32, (call_idx >> 32) as u32];
+    let r = philox4x32_10([1u32, 0u32, 0u32, 0u32], key);
+    let v = r[0] as u64;
+    (v % (n as u64)) as i64
+}
+
+/// tensor_get_f32(handle, idx) → f32. Flat row-major read after gpu_barrier; panics on OOB.
+#[no_mangle]
+pub extern "C" fn malus_tensor_get_f32(handle: i64, idx: i64) -> f32 {
+    let tb = unsafe { &*(handle as *const TensorBuffer) };
+    let data = unsafe { std::slice::from_raw_parts(tb.buffer.contents().as_ptr() as *const f32, tb.len) };
+    data[idx as usize]
+}
+
 // ── VJP helpers (pub(crate) for tape.rs) ─────────────────────────────────────
 
 /// Expand `h` to `out_shape` using NumPy broadcast semantics.
