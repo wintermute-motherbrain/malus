@@ -1595,6 +1595,19 @@ fn check_index(
             span,
         ));
     }
+    // Buffer<dtype>[i] → Scalar(I64)  (sign-extended element read)
+    if let ResolvedTy::Buffer { .. } = &tbase.ty.clone() {
+        let mut typed_indices: Vec<TypedExpr> = Vec::new();
+        for idx in indices {
+            typed_indices.push(check_expr(idx, Some(&ResolvedTy::Scalar(ScalarTy::I64)), ctx)?);
+        }
+        return Some(typed_expr(
+            TypedExprKind::Index { base: Box::new(tbase), indices: typed_indices },
+            ResolvedTy::Scalar(ScalarTy::I64),
+            None,
+            span,
+        ));
+    }
     let ty = tbase.ty.clone();
     let placement = tbase.placement;
     let mut typed_indices: Vec<TypedExpr> = Vec::new();
@@ -1875,6 +1888,7 @@ pub fn resolve_ty(
             }
             Some(ResolvedTy::Array { elem: Box::new(resolved_elem), len: *len })
         }
+        Ty::Buffer { dtype } => Some(ResolvedTy::Buffer { dtype: dtype.clone() }),
         Ty::Named(name) if name == "None" => Some(ResolvedTy::Unit),
         Ty::Named(name) if name == "str" => Some(ResolvedTy::Str),
         Ty::Named(name) => {
@@ -1974,38 +1988,57 @@ fn check_lvalue(
                 ctx.errors.push(SemaError::AssignToImmutable { name: base_name.clone(), span: stmt_span });
                 return None;
             }
-            // Base must be an array.
-            let elem_ty = match &base_ty {
-                ResolvedTy::Array { elem, .. } => *elem.clone(),
+            // Type-check indices (expect a single integer index).
+            if indices.is_empty() {
+                ctx.errors.push(SemaError::UnknownIdent { name: "[]".into(), span: target.span });
+                return None;
+            }
+            // Base must be an array or buffer.
+            match &base_ty.clone() {
+                ResolvedTy::Array { elem, .. } => {
+                    let elem_ty = *elem.clone();
+                    let tidx = check_expr(&indices[0], Some(&ResolvedTy::Scalar(ScalarTy::I64)), ctx)?;
+                    let texpr = check_expr(rhs, Some(&elem_ty), ctx)?;
+                    if texpr.ty != elem_ty {
+                        ctx.errors.push(SemaError::TypeMismatch {
+                            expected: elem_ty.clone(),
+                            found: texpr.ty.clone(),
+                            span: rhs.span,
+                        });
+                        return None;
+                    }
+                    Some(TypedStmt::Assign {
+                        target: TypedAssignTarget::Index { base: base_name, index: Box::new(tidx), elem_ty },
+                        expr: texpr,
+                    })
+                }
+                ResolvedTy::Buffer { dtype } => {
+                    let dtype = dtype.clone();
+                    let elem_ty = ResolvedTy::Scalar(ScalarTy::I64);
+                    let tidx = check_expr(&indices[0], Some(&ResolvedTy::Scalar(ScalarTy::I64)), ctx)?;
+                    let texpr = check_expr(rhs, Some(&elem_ty), ctx)?;
+                    if texpr.ty != elem_ty {
+                        ctx.errors.push(SemaError::TypeMismatch {
+                            expected: elem_ty.clone(),
+                            found: texpr.ty.clone(),
+                            span: rhs.span,
+                        });
+                        return None;
+                    }
+                    Some(TypedStmt::Assign {
+                        target: TypedAssignTarget::BufferIndex { base: base_name, index: Box::new(tidx), dtype },
+                        expr: texpr,
+                    })
+                }
                 other => {
                     ctx.errors.push(SemaError::TypeMismatch {
                         expected: ResolvedTy::Array { elem: Box::new(ResolvedTy::Unit), len: 0 },
                         found: other.clone(),
                         span: target.span,
                     });
-                    return None;
+                    None
                 }
-            };
-            // Type-check indices (expect a single integer index).
-            if indices.is_empty() {
-                ctx.errors.push(SemaError::UnknownIdent { name: "[]".into(), span: target.span });
-                return None;
             }
-            let tidx = check_expr(&indices[0], Some(&ResolvedTy::Scalar(ScalarTy::I64)), ctx)?;
-            // Type-check the RHS against the element type.
-            let texpr = check_expr(rhs, Some(&elem_ty), ctx)?;
-            if texpr.ty != elem_ty {
-                ctx.errors.push(SemaError::TypeMismatch {
-                    expected: elem_ty.clone(),
-                    found: texpr.ty.clone(),
-                    span: rhs.span,
-                });
-                return None;
-            }
-            Some(TypedStmt::Assign {
-                target: TypedAssignTarget::Index { base: base_name, index: Box::new(tidx), elem_ty },
-                expr: texpr,
-            })
         }
 
         ExprKind::FieldAccess { base, field } => {

@@ -150,6 +150,17 @@ impl Parser {
                 return Ok(Ty::Variable { dtype });
             }
 
+            if name == "Buffer" {
+                self.advance();
+                self.expect(&TokenKind::Lt)?;
+                let (dtype_name, dtype_span) = self.expect_ident()?;
+                let dtype = Self::parse_scalar_ty(&dtype_name).ok_or_else(|| {
+                    ParseError::new(format!("unknown dtype '{}'", dtype_name), dtype_span)
+                })?;
+                self.expect(&TokenKind::Gt)?;
+                return Ok(Ty::Buffer { dtype });
+            }
+
             if name == "Array" {
                 self.advance();
                 self.expect(&TokenKind::Lt)?;

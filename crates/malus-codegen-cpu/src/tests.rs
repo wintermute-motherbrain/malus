@@ -327,6 +327,44 @@ extern "C" fn mock_malus_str_from_char(c: i64) -> i64 {
     malus_runtime::malus_str_from_char(c)
 }
 
+// M22 Buffer<i32> mocks — simple heap-allocated Vec<i32> keyed by an auto-id.
+static MOCK_BUFFER_STORE: Mutex<Option<HashMap<i64, Vec<i32>>>> = Mutex::new(None);
+static MOCK_BUFFER_NEXT_ID: AtomicUsize = AtomicUsize::new(10001);
+
+fn with_buf_store<F, R>(f: F) -> R
+where F: FnOnce(&mut HashMap<i64, Vec<i32>>) -> R {
+    let mut guard = MOCK_BUFFER_STORE.lock().unwrap();
+    let store = guard.get_or_insert_with(HashMap::new);
+    f(store)
+}
+
+extern "C" fn mock_malus_buffer_i32(len: i64) -> i64 {
+    let n = len as usize;
+    let id = MOCK_BUFFER_NEXT_ID.fetch_add(1, Ordering::SeqCst) as i64;
+    with_buf_store(|s| s.insert(id, vec![0i32; n]));
+    id
+}
+extern "C" fn mock_malus_buffer_get_i32(handle: i64, idx: i64) -> i64 {
+    with_buf_store(|s| s.get(&handle).map(|v| v[idx as usize] as i64).unwrap_or(0))
+}
+extern "C" fn mock_malus_buffer_set_i32(handle: i64, idx: i64, val: i64) {
+    with_buf_store(|s| {
+        if let Some(v) = s.get_mut(&handle) {
+            v[idx as usize] = val as i32;
+        }
+    });
+}
+extern "C" fn mock_malus_buffer_free(handle: i64) {
+    with_buf_store(|s| { s.remove(&handle); });
+}
+extern "C" fn mock_malus_buffer_freeze_i32(handle: i64) -> i64 {
+    let data = with_buf_store(|s| s.get(&handle).cloned().unwrap_or_default());
+    let n = data.len();
+    // Store as f32 so the tensor mock can hold the data.
+    let float_data: Vec<f32> = data.iter().map(|&x| x as f32).collect();
+    with_store(|s| s.insert(float_data, vec![n]))
+}
+
 fn mock_symbols() -> RuntimeSymbols {
     RuntimeSymbols {
         tensor_alloc_gpu:       mock_tensor_alloc_gpu,
@@ -381,6 +419,12 @@ fn mock_symbols() -> RuntimeSymbols {
         malus_str_len:             mock_malus_str_len,
         malus_str_char_at:         mock_malus_str_char_at,
         malus_str_from_char:       mock_malus_str_from_char,
+        // M22 Buffer<i32> mocks.
+        malus_buffer_i32:          mock_malus_buffer_i32,
+        malus_buffer_get_i32:      mock_malus_buffer_get_i32,
+        malus_buffer_set_i32:      mock_malus_buffer_set_i32,
+        malus_buffer_free:         mock_malus_buffer_free,
+        malus_buffer_freeze_i32:   mock_malus_buffer_freeze_i32,
     }
 }
 
@@ -1643,4 +1687,47 @@ fn main():
         i = i + 1
 "#;
     run_src(src).expect("str iteration in while loop should compile and run");
+}
+
+// ── M22 Buffer<i32> ───────────────────────────────────────────────────────────
+
+#[test]
+fn test_buffer_i32_alloc_and_free() {
+    let src = r#"
+fn main():
+    let buf = buffer_i32(4)
+"#;
+    run_src(src).expect("buffer_i32 alloc and free should compile and run");
+}
+
+#[test]
+fn test_buffer_i32_set_and_freeze() {
+    let src = r#"
+fn main():
+    let mut buf = buffer_i32(3)
+    let mut i = 0
+    while i < 3:
+        buf[i] = i
+        i = i + 1
+    let tokens = freeze(buf)
+    print(tokens)
+"#;
+    run_src(src).expect("buffer set and freeze should compile and run");
+}
+
+#[test]
+fn test_buffer_i32_from_str() {
+    let src = r#"
+fn main():
+    let s = "abc"
+    let n = str_len(s)
+    let mut buf = buffer_i32(n)
+    let mut i = 0
+    while i < n:
+        buf[i] = str_char_at(s, i)
+        i = i + 1
+    let tokens = freeze(buf)
+    print(tokens)
+"#;
+    run_src(src).expect("buffer tokenization from string should compile and run");
 }

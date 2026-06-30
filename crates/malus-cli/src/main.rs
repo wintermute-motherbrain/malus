@@ -161,6 +161,12 @@ fn run_script(path: &str) {
             malus_str_len:             malus_runtime::malus_str_len,
             malus_str_char_at:         malus_runtime::malus_str_char_at,
             malus_str_from_char:       malus_runtime::malus_str_from_char,
+            // M22 Buffer<i32>.
+            malus_buffer_i32:          malus_runtime::malus_buffer_i32,
+            malus_buffer_get_i32:      malus_runtime::malus_buffer_get_i32,
+            malus_buffer_set_i32:      malus_runtime::malus_buffer_set_i32,
+            malus_buffer_free:         malus_runtime::malus_buffer_free,
+            malus_buffer_freeze_i32:   malus_runtime::malus_buffer_freeze_i32,
         };
         if let Err(e) = malus_codegen_cpu::compile_and_run(&typed, &symbols, &kernel_ids) {
             eprintln!("error: {e}");

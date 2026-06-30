@@ -68,6 +68,12 @@ pub enum TypedAssignTarget {
         slot_idx: usize,
         field_ty: ResolvedTy,
     },
+    /// `base[index] = e` — Buffer element assignment. Narrows i64 → i32 in runtime.
+    BufferIndex {
+        base: String,
+        index: Box<TypedExpr>,
+        dtype: malus_syntax::ast::ScalarTy,
+    },
 }
 
 // ── Statements ────────────────────────────────────────────────────────────────
@@ -171,6 +177,9 @@ pub enum TypedStmt {
     /// Variable RC (retain/release) is unchanged; only tape recording is gated.
     /// Early-exit (return/break/continue) across this boundary is rejected by sema.
     NoGrad { body: Vec<TypedStmt> },
+    // ── M22: Buffer<i32> ─────────────────────────────────────────────────────
+    /// CTMM: free a CPU-side staging buffer.
+    DropBuffer { name: String },
 }
 
 /// One arm of a `match` statement.

@@ -281,6 +281,7 @@ fn print_ty(ty: &Ty) -> String {
             format!("({})", inner)
         }
         Ty::Array { elem, len } => format!("Array<{}, {}>", print_ty(elem), len),
+        Ty::Buffer { dtype } => format!("Buffer<{}>", print_scalar_ty(dtype)),
     }
 }
 

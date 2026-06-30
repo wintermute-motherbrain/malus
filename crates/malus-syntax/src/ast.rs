@@ -29,6 +29,8 @@ pub enum Ty {
     Named(String),
     /// `Array<T, N>` — fixed-length homogeneous array.
     Array { elem: Box<Ty>, len: usize },
+    /// `Buffer<dtype>` — runtime-length mutable staging buffer.
+    Buffer { dtype: ScalarTy },
 }
 
 // ── Operators ─────────────────────────────────────────────────────────────────
