@@ -310,6 +310,22 @@ extern "C" fn mock_tape_record_cross_entropy(
 extern "C" fn mock_tensor_embedding(_weight: i64, _indices: i64) -> i64 { 0 }
 extern "C" fn mock_tensor_randn(_shape_ptr: *const usize, _ndims: usize) -> i64 { 0 }
 extern "C" fn mock_tape_record_embedding(_op: i32, _weight: i64, _indices: i64, _out: i64) {}
+// M22 string I/O mocks.
+extern "C" fn mock_malus_str_box(ptr: *const u8, len: usize) -> i64 {
+    malus_runtime::malus_str_box(ptr, len)
+}
+extern "C" fn mock_malus_read_file(_path: i64) -> i64 { 0 }
+extern "C" fn mock_malus_str_len(handle: i64) -> i64 {
+    if handle == 0 { return 0; }
+    malus_runtime::malus_str_len(handle)
+}
+extern "C" fn mock_malus_str_char_at(handle: i64, i: i64) -> i64 {
+    if handle == 0 { return -1; }
+    malus_runtime::malus_str_char_at(handle, i)
+}
+extern "C" fn mock_malus_str_from_char(c: i64) -> i64 {
+    malus_runtime::malus_str_from_char(c)
+}
 
 fn mock_symbols() -> RuntimeSymbols {
     RuntimeSymbols {
@@ -359,6 +375,12 @@ fn mock_symbols() -> RuntimeSymbols {
         tensor_embedding:          mock_tensor_embedding,
         tensor_randn:              mock_tensor_randn,
         tape_record_embedding:     mock_tape_record_embedding,
+        // M22 string I/O mocks.
+        malus_str_box:             mock_malus_str_box,
+        malus_read_file:           mock_malus_read_file,
+        malus_str_len:             mock_malus_str_len,
+        malus_str_char_at:         mock_malus_str_char_at,
+        malus_str_from_char:       mock_malus_str_from_char,
     }
 }
 
@@ -1530,4 +1552,95 @@ fn main():
 "#;
     run_src(src).expect("mut param index assign should compile and run");
     assert_eq!(live_tensor_count(), 0, "no leaks after mut param index assign");
+}
+
+// ── M22: string I/O ──────────────────────────────────────────────────────────
+
+#[test]
+fn test_str_lit_as_str_type() {
+    // str_len of a string literal.
+    let src = r#"
+fn main():
+    let n = str_len("hello")
+    println("{}", n)
+"#;
+    run_src(src).expect("str_len of literal should compile and run");
+}
+
+#[test]
+fn test_str_char_at() {
+    // str_char_at returns the Unicode codepoint of the first character.
+    // 'h' = 104 in ASCII/Unicode.
+    let src = r#"
+fn main():
+    let s = "hello"
+    let c = str_char_at(s, 0)
+    println("{}", c)
+"#;
+    run_src(src).expect("str_char_at should compile and run");
+}
+
+#[test]
+fn test_str_from_char() {
+    // str_from_char wraps a codepoint back into a str value.
+    let src = r#"
+fn main():
+    let ch = str_from_char(65)
+    println("{}", ch)
+"#;
+    run_src(src).expect("str_from_char should compile and run");
+}
+
+#[test]
+fn test_str_roundtrip_via_char() {
+    // str_char_at followed by str_from_char should round-trip the codepoint.
+    let src = r#"
+fn main():
+    let s = "Z"
+    let c = str_char_at(s, 0)
+    let s2 = str_from_char(c)
+    println("{}", s2)
+"#;
+    run_src(src).expect("str roundtrip should compile and run");
+}
+
+#[test]
+fn test_println_str_value() {
+    // println with a Str-typed variable (not a format-string literal).
+    let src = r#"
+fn main():
+    let s = str_from_char(65)
+    println(s)
+"#;
+    run_src(src).expect("println of str value should compile and run");
+}
+
+#[test]
+fn test_str_as_fn_param_and_return() {
+    // str and i64 (str_char_at return) flow through a user-defined function.
+    let src = r#"
+fn first_char(s: str) -> i64:
+    return str_char_at(s, 0)
+
+fn main():
+    let c = first_char("abc")
+    println("{}", c)
+"#;
+    run_src(src).expect("str as fn param and return should compile and run");
+}
+
+#[test]
+fn test_str_in_while_loop() {
+    // Walk each character of a string in a while loop.
+    let src = r#"
+fn main():
+    let s = "hi"
+    let n = str_len(s)
+    let mut i = 0
+    while i < n:
+        let c = str_char_at(s, i)
+        println("{}", c)
+        i = i + 1
+"#;
+    run_src(src).expect("str iteration in while loop should compile and run");
 }

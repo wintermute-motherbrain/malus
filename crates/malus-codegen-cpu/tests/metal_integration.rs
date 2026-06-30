@@ -56,6 +56,12 @@ fn real_symbols() -> RuntimeSymbols {
         tensor_embedding:          malus_runtime::tensor_embedding,
         tensor_randn:              malus_runtime::tensor_randn,
         tape_record_embedding:     malus_runtime::tape_record_embedding,
+        // M22 string I/O.
+        malus_str_box:             malus_runtime::malus_str_box,
+        malus_read_file:           malus_runtime::malus_read_file,
+        malus_str_len:             malus_runtime::malus_str_len,
+        malus_str_char_at:         malus_runtime::malus_str_char_at,
+        malus_str_from_char:       malus_runtime::malus_str_from_char,
     }
 }
 

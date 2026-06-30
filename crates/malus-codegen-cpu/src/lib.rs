@@ -141,6 +141,12 @@ pub struct RuntimeSymbols {
     pub tensor_embedding:          extern "C" fn(i64, i64) -> i64,
     pub tensor_randn:              extern "C" fn(*const usize, usize) -> i64,
     pub tape_record_embedding:     extern "C" fn(i32, i64, i64, i64),
+    // M22 string I/O.
+    pub malus_str_box:             extern "C" fn(*const u8, usize) -> i64,
+    pub malus_read_file:           extern "C" fn(i64) -> i64,
+    pub malus_str_len:             extern "C" fn(i64) -> i64,
+    pub malus_str_char_at:         extern "C" fn(i64, i64) -> i64,
+    pub malus_str_from_char:       extern "C" fn(i64) -> i64,
 }
 
 // ── Error ─────────────────────────────────────────────────────────────────────
@@ -176,6 +182,22 @@ extern "C" fn print_cstr(ptr: *const u8) {
 extern "C" fn print_f32(v: f32)  { print!("{v}"); }
 extern "C" fn print_i64(v: i64)  { print!("{v}"); }
 extern "C" fn print_bool(v: i8)  { print!("{}", if v != 0 { "true" } else { "false" }); }
+
+// Local mirror of malus_runtime::StrBox for the print_str shim.
+// Must stay layout-compatible with the runtime's repr(C) StrBox.
+#[repr(C)]
+struct StrBoxLayout { ptr: *const u8, len: usize }
+
+// M22: print_str(handle: i64) — print a runtime str value (StrBox handle).
+// Local shim — same pattern as print_cstr; does not touch Metal state.
+extern "C" fn print_str(handle: i64) {
+    if handle == 0 { return; }
+    // SAFETY: handle is a valid *const StrBox produced by malus_str_box /
+    // malus_read_file / malus_str_from_char.  All are heap-allocated and leaked.
+    let sb = unsafe { &*(handle as *const StrBoxLayout) };
+    let bytes = unsafe { std::slice::from_raw_parts(sb.ptr, sb.len) };
+    print!("{}", std::str::from_utf8(bytes).unwrap_or("<invalid utf-8>"));
+}
 
 // ── Scalar math shims ─────────────────────────────────────────────────────────
 
@@ -286,6 +308,8 @@ fn cranelift_type(ty: &ResolvedTy) -> Result<Option<cranelift_codegen::ir::Type>
         ResolvedTy::Scalar(s) => Ok(Some(scalar_cranelift_type(s))),
         ResolvedTy::Bool => Ok(Some(I8)),
         ResolvedTy::Unit => Ok(None),
+        // Str is a leaked StrBox handle — opaque i64 pointer.
+        ResolvedTy::Str => Ok(Some(I64)),
         // Tuples are heap-allocated; represented as opaque i64 pointer (same as Struct).
         ResolvedTy::Tuple(_) => Ok(Some(I64)),
         // Structs, enums, and arrays are heap-allocated; represented as opaque i64 pointer.
@@ -377,6 +401,13 @@ struct Codegen<'m> {
     rt_tape_record_embedding:      FuncId,
     // M20: scalar power operator (**).
     rt_powf:                       FuncId,
+    // M22: string I/O.
+    rt_malus_str_box:              FuncId,
+    rt_malus_read_file:            FuncId,
+    rt_malus_str_len:              FuncId,
+    rt_malus_str_char_at:          FuncId,
+    rt_malus_str_from_char:        FuncId,
+    rt_print_str:                  FuncId,
 }
 
 impl<'m> Codegen<'m> {
@@ -1534,6 +1565,27 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                     let handle = self.lower_expr(&args[0])?;
                     self.call_runtime_print(handle);
                     Ok(self.builder.ins().iconst(I64, 0))
+                } else if callee == "read_file" {
+                    let path = self.lower_expr(&args[0])?;
+                    let func_ref = self.import_func(self.codegen.rt_malus_read_file);
+                    let call = self.builder.ins().call(func_ref, &[path]);
+                    Ok(self.builder.inst_results(call).to_vec()[0])
+                } else if callee == "str_len" {
+                    let s = self.lower_expr(&args[0])?;
+                    let func_ref = self.import_func(self.codegen.rt_malus_str_len);
+                    let call = self.builder.ins().call(func_ref, &[s]);
+                    Ok(self.builder.inst_results(call).to_vec()[0])
+                } else if callee == "str_char_at" {
+                    let s = self.lower_expr(&args[0])?;
+                    let i = self.lower_expr(&args[1])?;
+                    let func_ref = self.import_func(self.codegen.rt_malus_str_char_at);
+                    let call = self.builder.ins().call(func_ref, &[s, i]);
+                    Ok(self.builder.inst_results(call).to_vec()[0])
+                } else if callee == "str_from_char" {
+                    let c = self.lower_expr(&args[0])?;
+                    let func_ref = self.import_func(self.codegen.rt_malus_str_from_char);
+                    let call = self.builder.ins().call(func_ref, &[c]);
+                    Ok(self.builder.inst_results(call).to_vec()[0])
                 } else {
                     let func_id = self.codegen.func_ids.get(callee)
                         .copied()
@@ -1770,7 +1822,17 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
             },
             Lit::Float(f) => Ok(self.builder.ins().f32const(*f as f32)),
             Lit::Bool(b) => Ok(self.builder.ins().iconst(I8, *b as i64)),
-            Lit::Str(_) => Err(CodegenError::UnsupportedExpr("string literal in codegen".into())),
+            Lit::Str(s) => {
+                // Materialise a runtime Str handle from a compile-time literal.
+                // Emit the string bytes as static anonymous data (with NUL for
+                // safety, but StrBox.len does NOT include the NUL).
+                let len = s.len();
+                let data_ptr = self.emit_static_cstr(s);
+                let len_val = self.builder.ins().iconst(I64, len as i64);
+                let func_ref = self.import_func(self.codegen.rt_malus_str_box);
+                let call = self.builder.ins().call(func_ref, &[data_ptr, len_val]);
+                Ok(self.builder.inst_results(call).to_vec()[0])
+            }
         }
     }
 
@@ -1887,6 +1949,10 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
             }
             ResolvedTy::Bool => {
                 let func_ref = self.import_func(self.codegen.rt_print_bool);
+                self.builder.ins().call(func_ref, &[val]);
+            }
+            ResolvedTy::Str => {
+                let func_ref = self.import_func(self.codegen.rt_print_str);
                 self.builder.ins().call(func_ref, &[val]);
             }
             _ => return Err(CodegenError::UnsupportedExpr(
@@ -2531,6 +2597,13 @@ pub fn compile_and_run(
     jit_builder.symbol("tape_record_embedding",     symbols.tape_record_embedding     as *const u8);
     // M20 scalar power operator.
     jit_builder.symbol("malus_powf",               malus_powf                        as *const u8);
+    // M22 string I/O.
+    jit_builder.symbol("malus_str_box",            symbols.malus_str_box             as *const u8);
+    jit_builder.symbol("malus_read_file",          symbols.malus_read_file           as *const u8);
+    jit_builder.symbol("malus_str_len",            symbols.malus_str_len             as *const u8);
+    jit_builder.symbol("malus_str_char_at",        symbols.malus_str_char_at         as *const u8);
+    jit_builder.symbol("malus_str_from_char",      symbols.malus_str_from_char       as *const u8);
+    jit_builder.symbol("print_str",                print_str                         as *const u8);
 
     let mut module = JITModule::new(jit_builder);
     let ptr = module.target_config().pointer_type();
@@ -2884,6 +2957,58 @@ pub fn compile_and_run(
     let rt_powf = module.declare_function("malus_powf", Linkage::Import, &sig_powf)
         .map_err(|e| CodegenError::JitError(e.to_string()))?;
 
+    // M22: string I/O signatures.
+    // malus_str_box(ptr: *const u8, len: usize) -> i64
+    let sig_str_box = {
+        let mut s = Signature::new(call_conv);
+        s.params.push(AbiParam::new(ptr)); // ptr (*const u8)
+        s.params.push(AbiParam::new(ptr)); // len (usize)
+        s.returns.push(AbiParam::new(I64));
+        s
+    };
+    // malus_read_file(path_handle: i64) -> i64
+    let sig_read_file = {
+        let mut s = Signature::new(call_conv);
+        s.params.push(AbiParam::new(I64));
+        s.returns.push(AbiParam::new(I64));
+        s
+    };
+    // malus_str_len(handle: i64) -> i64
+    let sig_str_len = {
+        let mut s = Signature::new(call_conv);
+        s.params.push(AbiParam::new(I64));
+        s.returns.push(AbiParam::new(I64));
+        s
+    };
+    // malus_str_char_at(handle: i64, idx: i64) -> i64
+    let sig_str_char_at = {
+        let mut s = Signature::new(call_conv);
+        s.params.push(AbiParam::new(I64));
+        s.params.push(AbiParam::new(I64));
+        s.returns.push(AbiParam::new(I64));
+        s
+    };
+    // malus_str_from_char(c: i64) -> i64
+    let sig_str_from_char = {
+        let mut s = Signature::new(call_conv);
+        s.params.push(AbiParam::new(I64));
+        s.returns.push(AbiParam::new(I64));
+        s
+    };
+    // print_str(handle: i64) -> ()  (same as sig_free)
+    let rt_malus_str_box = module.declare_function("malus_str_box", Linkage::Import, &sig_str_box)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
+    let rt_malus_read_file = module.declare_function("malus_read_file", Linkage::Import, &sig_read_file)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
+    let rt_malus_str_len = module.declare_function("malus_str_len", Linkage::Import, &sig_str_len)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
+    let rt_malus_str_char_at = module.declare_function("malus_str_char_at", Linkage::Import, &sig_str_char_at)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
+    let rt_malus_str_from_char = module.declare_function("malus_str_from_char", Linkage::Import, &sig_str_from_char)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
+    let rt_print_str = module.declare_function("print_str", Linkage::Import, &sig_free)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
+
     // First pass: declare all user fn signatures.
     let mut func_ids: HashMap<String, FuncId> = HashMap::new();
     for typed_fn in &program.fns {
@@ -2959,6 +3084,12 @@ pub fn compile_and_run(
         rt_tensor_randn,
         rt_tape_record_embedding,
         rt_powf,
+        rt_malus_str_box,
+        rt_malus_read_file,
+        rt_malus_str_len,
+        rt_malus_str_char_at,
+        rt_malus_str_from_char,
+        rt_print_str,
     };
 
     // Second pass: compile each fn body.

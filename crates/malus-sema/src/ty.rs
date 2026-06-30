@@ -9,6 +9,10 @@ pub enum ResolvedTy {
     Bool,
     Tuple(Vec<ResolvedTy>),
     Unit,
+    /// A runtime string value — opaque i64 handle to a heap-allocated
+    /// `StrBox { ptr, len }`.  Whole-program lifetime (leaked); no Drop.
+    /// Used for `read_file`, `str_len`, `str_char_at`, `str_from_char`.
+    Str,
     /// User-defined product type. Nominal: name determines identity.
     Struct {
         name: String,
@@ -42,6 +46,7 @@ impl fmt::Display for ResolvedTy {
                 write!(f, ")")
             }
             ResolvedTy::Unit => write!(f, "None"),
+            ResolvedTy::Str => write!(f, "str"),
             ResolvedTy::Struct { name, .. } => write!(f, "{}", name),
             ResolvedTy::Enum { name, .. } => write!(f, "{}", name),
             ResolvedTy::Array { elem, len } => write!(f, "Array<{}, {}>", elem, len),
@@ -116,6 +121,10 @@ impl ResolvedTy {
             ResolvedTy::Array { len, .. } => Some(*len),
             _ => None,
         }
+    }
+
+    pub fn is_str(&self) -> bool {
+        matches!(self, ResolvedTy::Str)
     }
 }
 

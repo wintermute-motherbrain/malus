@@ -1,3 +1,10 @@
+// M22 string I/O — platform-independent.
+mod strio;
+pub use strio::{
+    malus_str_box, malus_read_file, malus_str_len, malus_str_char_at, malus_str_from_char,
+    StrBox,
+};
+
 #[cfg(target_os = "macos")]
 mod metal;
 

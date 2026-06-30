@@ -282,16 +282,15 @@ fn main():
 }
 
 #[test]
-fn test_string_literal_not_first_arg_rejected() {
+fn test_string_literal_as_str_value_accepted() {
+    // Since M22, string literals have type Str and are valid in any print
+    // position — not just as the first format-string arg.  print(1.0, "oops")
+    // prints the f32 value then the string "oops" via the legacy variadic path.
     let src = r#"
 fn main():
     print(1.0, "oops")
 "#;
-    let errors = check_src(src).expect_err("string literal as non-first arg should fail");
-    assert!(
-        errors.iter().any(|e| matches!(e, SemaError::StringLiteralOutsidePrint { .. })),
-        "expected StringLiteralOutsidePrint, got: {:?}", errors
-    );
+    check_src(src).expect("string literal in non-first arg of print should now be accepted");
 }
 
 // ── Module aliases ────────────────────────────────────────────────────────────

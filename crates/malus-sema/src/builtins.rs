@@ -185,5 +185,32 @@ pub fn register_builtins() -> HashMap<String, BuiltinSig> {
         return_placement: None,
     });
 
+    // M22 string I/O.
+    // read_file(path: str) -> str
+    m.insert("read_file".to_string(), BuiltinSig {
+        kind: BuiltinKind::Fixed(vec![ResolvedTy::Str]),
+        return_ty: ResolvedTy::Str,
+        return_placement: None,
+    });
+    // str_len(s: str) -> i64  (byte length; matches malus integer default I64)
+    m.insert("str_len".to_string(), BuiltinSig {
+        kind: BuiltinKind::Fixed(vec![ResolvedTy::Str]),
+        return_ty: ResolvedTy::Scalar(ScalarTy::I64),
+        return_placement: None,
+    });
+    // str_char_at(s: str, i: i64) -> i64  (Unicode codepoint at position i)
+    // i64 so that loop counters (let mut i = 0) work without explicit casts.
+    m.insert("str_char_at".to_string(), BuiltinSig {
+        kind: BuiltinKind::Fixed(vec![ResolvedTy::Str, ResolvedTy::Scalar(ScalarTy::I64)]),
+        return_ty: ResolvedTy::Scalar(ScalarTy::I64),
+        return_placement: None,
+    });
+    // str_from_char(c: i64) -> str  (encode a Unicode codepoint as a str)
+    m.insert("str_from_char".to_string(), BuiltinSig {
+        kind: BuiltinKind::Fixed(vec![ResolvedTy::Scalar(ScalarTy::I64)]),
+        return_ty: ResolvedTy::Str,
+        return_placement: None,
+    });
+
     m
 }

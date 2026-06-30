@@ -663,7 +663,11 @@ fn check_lit(
         }
         Lit::Float(_) => ResolvedTy::Scalar(ScalarTy::F32),
         Lit::Bool(_) => ResolvedTy::Bool,
-        Lit::Str(_) => ResolvedTy::Unit, // string literals are only valid in print calls
+        // String literals always have type Str.  When used as the first arg of
+        // print/println they are also pattern-matched by codegen as a
+        // compile-time format template (via TypedExprKind::Lit(Lit::Str(_))),
+        // independently of their resolved type.
+        Lit::Str(_) => ResolvedTy::Str,
     };
     Some(typed_expr(TypedExprKind::Lit(lit.clone()), ty, None, span))
 }
@@ -1093,17 +1097,8 @@ fn check_call(
             let typed_args: Vec<TypedExpr> = match &sig.kind {
                 BuiltinKind::Variadic => {
                     let mut out = Vec::new();
-                    for (i, arg) in positional.iter().enumerate() {
+                    for arg in positional.iter() {
                         let checked = check_expr(arg, None, ctx)?;
-                        // String literals are only valid as the first arg of print/println.
-                        if checked.ty == ResolvedTy::Unit {
-                            if let TypedExprKind::Lit(Lit::Str(_)) = &checked.kind {
-                                if !is_print_call || i > 0 {
-                                    ctx.errors.push(SemaError::StringLiteralOutsidePrint { span: arg.span });
-                                    return None;
-                                }
-                            }
-                        }
                         out.push(checked);
                     }
                     out
@@ -1881,6 +1876,7 @@ pub fn resolve_ty(
             Some(ResolvedTy::Array { elem: Box::new(resolved_elem), len: *len })
         }
         Ty::Named(name) if name == "None" => Some(ResolvedTy::Unit),
+        Ty::Named(name) if name == "str" => Some(ResolvedTy::Str),
         Ty::Named(name) => {
             if let Some(def) = nominals.structs.get(name.as_str()) {
                 return Some(ResolvedTy::Struct {

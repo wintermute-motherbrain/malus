@@ -155,6 +155,12 @@ fn run_script(path: &str) {
             tensor_embedding:          malus_runtime::tensor_embedding,
             tensor_randn:              malus_runtime::tensor_randn,
             tape_record_embedding:     malus_runtime::tape_record_embedding,
+            // M22 string I/O.
+            malus_str_box:             malus_runtime::malus_str_box,
+            malus_read_file:           malus_runtime::malus_read_file,
+            malus_str_len:             malus_runtime::malus_str_len,
+            malus_str_char_at:         malus_runtime::malus_str_char_at,
+            malus_str_from_char:       malus_runtime::malus_str_from_char,
         };
         if let Err(e) = malus_codegen_cpu::compile_and_run(&typed, &symbols, &kernel_ids) {
             eprintln!("error: {e}");

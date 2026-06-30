@@ -479,6 +479,8 @@ fn make_drop_stmt_for_ty(name: &str, ty: &ResolvedTy) -> Option<TypedStmt> {
     match ty {
         ResolvedTy::Variable { .. } => Some(TypedStmt::Release { name: name.to_string() }),
         ResolvedTy::Tensor { .. } => Some(TypedStmt::Drop { name: name.to_string() }),
+        // Str is a leaked whole-program-lifetime buffer (ADR-0018). No drop needed.
+        ResolvedTy::Str => None,
         ResolvedTy::Struct { fields, .. } => {
             let droppable_fields = droppable_struct_fields(fields);
             Some(TypedStmt::DropStruct { name: name.to_string(), droppable_fields, retained_agg_slots: vec![] })
