@@ -1266,6 +1266,15 @@ pub extern "C" fn tensor_randn(shape_ptr: *const usize, ndims: usize) -> i64 {
     tensor_alloc_gpu(0, shape.as_ptr(), ndims, data.as_ptr())
 }
 
+/// rand_uniform() → f32 in [0, 1). Shares the same Philox4x32-10 call counter as randn.
+#[no_mangle]
+pub extern "C" fn malus_rand_uniform() -> f32 {
+    let call_idx = RANDN_CALL_COUNTER.with(|c| { let v = c.get(); c.set(v + 1); v });
+    let key = [call_idx as u32, (call_idx >> 32) as u32];
+    let r = philox4x32_10([0u32, 0u32, 0u32, 0u32], key);
+    (r[0] as f64 / 4_294_967_296.0) as f32
+}
+
 // ── VJP helpers (pub(crate) for tape.rs) ─────────────────────────────────────
 
 /// Expand `h` to `out_shape` using NumPy broadcast semantics.

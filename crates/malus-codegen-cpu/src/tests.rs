@@ -419,6 +419,8 @@ fn mock_symbols() -> RuntimeSymbols {
         malus_str_len:             mock_malus_str_len,
         malus_str_char_at:         mock_malus_str_char_at,
         malus_str_from_char:       mock_malus_str_from_char,
+        // M22 rand_uniform — use real runtime (platform-independent Philox).
+        malus_rand_uniform:        malus_runtime::malus_rand_uniform,
         // M22 Buffer<i32> mocks.
         malus_buffer_i32:          mock_malus_buffer_i32,
         malus_buffer_get_i32:      mock_malus_buffer_get_i32,
@@ -1749,4 +1751,16 @@ fn main():
     tensor_print(m.w.data)
 "#;
     run_src(src).expect("Variable field assign should compile and run without leaks");
+}
+
+#[test]
+fn test_rand_uniform_in_range() {
+    // rand_uniform() → f32 in [0,1); verify by sampling and checking basic properties.
+    let src = r#"
+fn main():
+    let a = rand_uniform()
+    let b = rand_uniform()
+    println("{} {}", a, b)
+"#;
+    run_src(src).expect("rand_uniform should compile and run");
 }

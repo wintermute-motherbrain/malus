@@ -147,6 +147,8 @@ pub struct RuntimeSymbols {
     pub malus_str_len:             extern "C" fn(i64) -> i64,
     pub malus_str_char_at:         extern "C" fn(i64, i64) -> i64,
     pub malus_str_from_char:       extern "C" fn(i64) -> i64,
+    // M22 rand_uniform — no args, returns f32.
+    pub malus_rand_uniform:        extern "C" fn() -> f32,
     // M22 Buffer<i32>.
     pub malus_buffer_i32:          extern "C" fn(i64) -> i64,
     pub malus_buffer_get_i32:      extern "C" fn(i64, i64) -> i64,
@@ -416,6 +418,8 @@ struct Codegen<'m> {
     rt_malus_str_char_at:          FuncId,
     rt_malus_str_from_char:        FuncId,
     rt_print_str:                  FuncId,
+    // M22: rand_uniform.
+    rt_malus_rand_uniform:         FuncId,
     // M22: Buffer<i32>.
     rt_malus_buffer_i32:           FuncId,
     rt_malus_buffer_get_i32:       FuncId,
@@ -1616,6 +1620,10 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                     let func_ref = self.import_func(self.codegen.rt_malus_str_from_char);
                     let call = self.builder.ins().call(func_ref, &[c]);
                     Ok(self.builder.inst_results(call).to_vec()[0])
+                } else if callee == "rand_uniform" {
+                    let func_ref = self.import_func(self.codegen.rt_malus_rand_uniform);
+                    let call = self.builder.ins().call(func_ref, &[]);
+                    Ok(self.builder.inst_results(call).to_vec()[0])
                 } else if callee == "buffer_i32" {
                     let n = self.lower_expr(&args[0])?;
                     let func_ref = self.import_func(self.codegen.rt_malus_buffer_i32);
@@ -2652,6 +2660,8 @@ pub fn compile_and_run(
     jit_builder.symbol("malus_str_char_at",        symbols.malus_str_char_at         as *const u8);
     jit_builder.symbol("malus_str_from_char",      symbols.malus_str_from_char       as *const u8);
     jit_builder.symbol("print_str",                print_str                         as *const u8);
+    // M22 rand_uniform.
+    jit_builder.symbol("malus_rand_uniform",        symbols.malus_rand_uniform        as *const u8);
     // M22 Buffer<i32>.
     jit_builder.symbol("malus_buffer_i32",         symbols.malus_buffer_i32          as *const u8);
     jit_builder.symbol("malus_buffer_get_i32",     symbols.malus_buffer_get_i32      as *const u8);
@@ -3063,6 +3073,15 @@ pub fn compile_and_run(
     let rt_print_str = module.declare_function("print_str", Linkage::Import, &sig_free)
         .map_err(|e| CodegenError::JitError(e.to_string()))?;
 
+    // M22 rand_uniform() -> f32.
+    let sig_rand_uniform = {
+        let mut s = Signature::new(call_conv);
+        s.returns.push(AbiParam::new(F32));
+        s
+    };
+    let rt_malus_rand_uniform = module.declare_function("malus_rand_uniform", Linkage::Import, &sig_rand_uniform)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
+
     // M22 Buffer<i32> signatures.
     // malus_buffer_i32(len: i64) -> i64
     let sig_buffer_i32 = {
@@ -3181,6 +3200,7 @@ pub fn compile_and_run(
         rt_malus_str_char_at,
         rt_malus_str_from_char,
         rt_print_str,
+        rt_malus_rand_uniform,
         rt_malus_buffer_i32,
         rt_malus_buffer_get_i32,
         rt_malus_buffer_set_i32,

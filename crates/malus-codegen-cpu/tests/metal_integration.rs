@@ -62,6 +62,8 @@ fn real_symbols() -> RuntimeSymbols {
         malus_str_len:             malus_runtime::malus_str_len,
         malus_str_char_at:         malus_runtime::malus_str_char_at,
         malus_str_from_char:       malus_runtime::malus_str_from_char,
+        // M22 rand_uniform.
+        malus_rand_uniform:        malus_runtime::malus_rand_uniform,
         // M22 Buffer<i32>.
         malus_buffer_i32:          malus_runtime::malus_buffer_i32,
         malus_buffer_get_i32:      malus_runtime::malus_buffer_get_i32,

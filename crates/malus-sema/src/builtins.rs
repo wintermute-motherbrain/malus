@@ -212,6 +212,13 @@ pub fn register_builtins() -> HashMap<String, BuiltinSig> {
         return_placement: None,
     });
 
+    // M22 rand_uniform() -> f32  — Philox4x32-10; non-differentiable.
+    m.insert("rand_uniform".to_string(), BuiltinSig {
+        kind: BuiltinKind::Fixed(vec![]),
+        return_ty: ResolvedTy::Scalar(ScalarTy::F32),
+        return_placement: None,
+    });
+
     // M22 Buffer<i32> — mutable CPU-side staging buffer for tokenization.
     // buffer_i32(n: i64) -> Buffer<i32>
     m.insert("buffer_i32".to_string(), BuiltinSig {

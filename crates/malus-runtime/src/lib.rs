@@ -31,6 +31,8 @@ pub use metal::{
     tensor_cross_entropy, tensor_causal_mask,
     // M19 embeddings + randn
     tensor_embedding, tensor_randn,
+    // M22 rand_uniform
+    malus_rand_uniform,
     kernel_dispatch, gpu_barrier, Dtype, TensorBuffer,
 };
 
