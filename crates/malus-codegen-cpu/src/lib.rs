@@ -147,6 +147,12 @@ pub struct RuntimeSymbols {
     pub malus_str_len:             extern "C" fn(i64) -> i64,
     pub malus_str_char_at:         extern "C" fn(i64, i64) -> i64,
     pub malus_str_from_char:       extern "C" fn(i64) -> i64,
+    // M22 Buffer<i32>.
+    pub malus_buffer_i32:          extern "C" fn(i64) -> i64,
+    pub malus_buffer_get_i32:      extern "C" fn(i64, i64) -> i64,
+    pub malus_buffer_set_i32:      extern "C" fn(i64, i64, i64),
+    pub malus_buffer_free:         extern "C" fn(i64),
+    pub malus_buffer_freeze_i32:   extern "C" fn(i64) -> i64,
 }
 
 // ── Error ─────────────────────────────────────────────────────────────────────
@@ -314,6 +320,8 @@ fn cranelift_type(ty: &ResolvedTy) -> Result<Option<cranelift_codegen::ir::Type>
         ResolvedTy::Tuple(_) => Ok(Some(I64)),
         // Structs, enums, and arrays are heap-allocated; represented as opaque i64 pointer.
         ResolvedTy::Struct { .. } | ResolvedTy::Enum { .. } | ResolvedTy::Array { .. } => Ok(Some(I64)),
+        // Buffer is a heap-allocated BufferData; opaque i64 pointer.
+        ResolvedTy::Buffer { .. } => Ok(Some(I64)),
     }
 }
 
@@ -408,6 +416,12 @@ struct Codegen<'m> {
     rt_malus_str_char_at:          FuncId,
     rt_malus_str_from_char:        FuncId,
     rt_print_str:                  FuncId,
+    // M22: Buffer<i32>.
+    rt_malus_buffer_i32:           FuncId,
+    rt_malus_buffer_get_i32:       FuncId,
+    rt_malus_buffer_set_i32:       FuncId,
+    rt_malus_buffer_free:          FuncId,
+    rt_malus_buffer_freeze_i32:    FuncId,
 }
 
 impl<'m> Codegen<'m> {
@@ -576,6 +590,14 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                         self.builder.ins().store(
                             cranelift_codegen::ir::MemFlags::trusted(), new_val, struct_ptr, offset,
                         );
+                    }
+                    TypedAssignTarget::BufferIndex { base, index, .. } => {
+                        // Buffer element assign: call malus_buffer_set_i32(handle, idx, val).
+                        let handle = self.use_var(base)?;
+                        let idx_val = self.lower_expr(index)?;
+                        let new_val = self.lower_expr(expr)?;
+                        let func_ref = self.import_func(self.codegen.rt_malus_buffer_set_i32);
+                        self.builder.ins().call(func_ref, &[handle, idx_val, new_val]);
                     }
                 }
                 Ok(false)
@@ -881,6 +903,14 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                     self.emit_drop_field(ptr, offset, field_ty)?;
                 }
                 self.call_aggregate_release(ptr);
+                Ok(false)
+            }
+
+            // ── M22: Buffer<i32> ──────────────────────────────────────────────────
+            TypedStmt::DropBuffer { name } => {
+                let handle = self.use_var(name)?;
+                let func_ref = self.import_func(self.codegen.rt_malus_buffer_free);
+                self.builder.ins().call(func_ref, &[handle]);
                 Ok(false)
             }
 
@@ -1586,6 +1616,16 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                     let func_ref = self.import_func(self.codegen.rt_malus_str_from_char);
                     let call = self.builder.ins().call(func_ref, &[c]);
                     Ok(self.builder.inst_results(call).to_vec()[0])
+                } else if callee == "buffer_i32" {
+                    let n = self.lower_expr(&args[0])?;
+                    let func_ref = self.import_func(self.codegen.rt_malus_buffer_i32);
+                    let call = self.builder.ins().call(func_ref, &[n]);
+                    Ok(self.builder.inst_results(call).to_vec()[0])
+                } else if callee == "freeze" {
+                    let handle = self.lower_expr(&args[0])?;
+                    let func_ref = self.import_func(self.codegen.rt_malus_buffer_freeze_i32);
+                    let call = self.builder.ins().call(func_ref, &[handle]);
+                    Ok(self.builder.inst_results(call).to_vec()[0])
                 } else {
                     let func_id = self.codegen.func_ids.get(callee)
                         .copied()
@@ -1679,7 +1719,15 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                         let val = self.builder.ins().load(cl_ty, cranelift_codegen::ir::MemFlags::trusted(), elem_ptr, 0);
                         Ok(val)
                     }
-                    _ => Err(CodegenError::UnsupportedExpr("Index: only Array indexing is supported".into())),
+                    ResolvedTy::Buffer { .. } => {
+                        // Buffer[i] — call malus_buffer_get_i32(handle, idx) -> i64
+                        let buf_handle = self.lower_expr(base)?;
+                        let idx_val = self.lower_expr(&indices[0])?;
+                        let func_ref = self.import_func(self.codegen.rt_malus_buffer_get_i32);
+                        let call = self.builder.ins().call(func_ref, &[buf_handle, idx_val]);
+                        Ok(self.builder.inst_results(call).to_vec()[0])
+                    }
+                    _ => Err(CodegenError::UnsupportedExpr("Index: only Array or Buffer indexing is supported".into())),
                 }
             }
 
@@ -2604,6 +2652,12 @@ pub fn compile_and_run(
     jit_builder.symbol("malus_str_char_at",        symbols.malus_str_char_at         as *const u8);
     jit_builder.symbol("malus_str_from_char",      symbols.malus_str_from_char       as *const u8);
     jit_builder.symbol("print_str",                print_str                         as *const u8);
+    // M22 Buffer<i32>.
+    jit_builder.symbol("malus_buffer_i32",         symbols.malus_buffer_i32          as *const u8);
+    jit_builder.symbol("malus_buffer_get_i32",     symbols.malus_buffer_get_i32      as *const u8);
+    jit_builder.symbol("malus_buffer_set_i32",     symbols.malus_buffer_set_i32      as *const u8);
+    jit_builder.symbol("malus_buffer_free",        symbols.malus_buffer_free         as *const u8);
+    jit_builder.symbol("malus_buffer_freeze_i32",  symbols.malus_buffer_freeze_i32   as *const u8);
 
     let mut module = JITModule::new(jit_builder);
     let ptr = module.target_config().pointer_type();
@@ -3009,6 +3063,43 @@ pub fn compile_and_run(
     let rt_print_str = module.declare_function("print_str", Linkage::Import, &sig_free)
         .map_err(|e| CodegenError::JitError(e.to_string()))?;
 
+    // M22 Buffer<i32> signatures.
+    // malus_buffer_i32(len: i64) -> i64
+    let sig_buffer_i32 = {
+        let mut s = Signature::new(call_conv);
+        s.params.push(AbiParam::new(I64));
+        s.returns.push(AbiParam::new(I64));
+        s
+    };
+    // malus_buffer_get_i32(handle: i64, idx: i64) -> i64
+    let sig_buffer_get = {
+        let mut s = Signature::new(call_conv);
+        s.params.push(AbiParam::new(I64));
+        s.params.push(AbiParam::new(I64));
+        s.returns.push(AbiParam::new(I64));
+        s
+    };
+    // malus_buffer_set_i32(handle: i64, idx: i64, val: i64) -> ()
+    let sig_buffer_set = {
+        let mut s = Signature::new(call_conv);
+        s.params.push(AbiParam::new(I64));
+        s.params.push(AbiParam::new(I64));
+        s.params.push(AbiParam::new(I64));
+        s
+    };
+    // malus_buffer_free(handle: i64) — same as sig_free.
+    // malus_buffer_freeze_i32(handle: i64) -> i64 — same as sig_buffer_i32.
+    let rt_malus_buffer_i32 = module.declare_function("malus_buffer_i32", Linkage::Import, &sig_buffer_i32)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
+    let rt_malus_buffer_get_i32 = module.declare_function("malus_buffer_get_i32", Linkage::Import, &sig_buffer_get)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
+    let rt_malus_buffer_set_i32 = module.declare_function("malus_buffer_set_i32", Linkage::Import, &sig_buffer_set)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
+    let rt_malus_buffer_free = module.declare_function("malus_buffer_free", Linkage::Import, &sig_free)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
+    let rt_malus_buffer_freeze_i32 = module.declare_function("malus_buffer_freeze_i32", Linkage::Import, &sig_buffer_i32)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
+
     // First pass: declare all user fn signatures.
     let mut func_ids: HashMap<String, FuncId> = HashMap::new();
     for typed_fn in &program.fns {
@@ -3090,6 +3181,11 @@ pub fn compile_and_run(
         rt_malus_str_char_at,
         rt_malus_str_from_char,
         rt_print_str,
+        rt_malus_buffer_i32,
+        rt_malus_buffer_get_i32,
+        rt_malus_buffer_set_i32,
+        rt_malus_buffer_free,
+        rt_malus_buffer_freeze_i32,
     };
 
     // Second pass: compile each fn body.

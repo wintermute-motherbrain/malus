@@ -8,6 +8,16 @@ pub use strio::{
 #[cfg(target_os = "macos")]
 mod metal;
 
+// M22 Buffer<i32> — macOS-only because freeze calls tensor_alloc_gpu.
+#[cfg(target_os = "macos")]
+mod buffer;
+
+#[cfg(target_os = "macos")]
+pub use buffer::{
+    malus_buffer_i32, malus_buffer_get_i32, malus_buffer_set_i32,
+    malus_buffer_free, malus_buffer_freeze_i32,
+};
+
 #[cfg(target_os = "macos")]
 pub use metal::{
     runtime_init, tensor_alloc_gpu, tensor_alloc_zeros_gpu, tensor_alloc_ones_gpu,

@@ -212,5 +212,19 @@ pub fn register_builtins() -> HashMap<String, BuiltinSig> {
         return_placement: None,
     });
 
+    // M22 Buffer<i32> — mutable CPU-side staging buffer for tokenization.
+    // buffer_i32(n: i64) -> Buffer<i32>
+    m.insert("buffer_i32".to_string(), BuiltinSig {
+        kind: BuiltinKind::Fixed(vec![ResolvedTy::Scalar(ScalarTy::I64)]),
+        return_ty: ResolvedTy::Buffer { dtype: ScalarTy::I32 },
+        return_placement: None,
+    });
+    // freeze(buf: Buffer<i32>) -> Tensor<i32>
+    m.insert("freeze".to_string(), BuiltinSig {
+        kind: BuiltinKind::Fixed(vec![ResolvedTy::Buffer { dtype: ScalarTy::I32 }]),
+        return_ty: ResolvedTy::Tensor { dtype: ScalarTy::I32 },
+        return_placement: Some(Placement::Gpu),
+    });
+
     m
 }

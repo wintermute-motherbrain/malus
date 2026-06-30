@@ -451,7 +451,7 @@ fn insert_assign_drops(body: &mut Vec<TypedStmt>, escaping: &HashSet<String>) {
             // The codegen handles the old-element-release inline (load old slot →
             // tensor_release/tensor_free → store new), after the RHS has been fully
             // evaluated into a temp by `hoist_gpu_subexprs`.
-            TypedStmt::Assign { target: TypedAssignTarget::Index { .. } | TypedAssignTarget::Field { .. }, .. } => {}
+            TypedStmt::Assign { target: TypedAssignTarget::Index { .. } | TypedAssignTarget::Field { .. } | TypedAssignTarget::BufferIndex { .. }, .. } => {}
             _ => {}
         }
         // Recurse into inner bodies so outer-scope `let mut` bindings reassigned
@@ -507,6 +507,7 @@ fn make_drop_stmt_for_ty(name: &str, ty: &ResolvedTy) -> Option<TypedStmt> {
                 .collect();
             Some(TypedStmt::DropTuple { name: name.to_string(), droppable_fields })
         }
+        ResolvedTy::Buffer { .. } => Some(TypedStmt::DropBuffer { name: name.to_string() }),
         _ => None,
     }
 }
@@ -600,6 +601,7 @@ fn inject_early_return_unwinds(
             | TypedStmt::DropEnum { name, .. }
             | TypedStmt::DropArray { name, .. }
             | TypedStmt::DropTuple { name, .. }
+            | TypedStmt::DropBuffer { name }
             | TypedStmt::Release { name } => {
                 drop_positions.insert(name.clone(), i);
             }
@@ -738,6 +740,7 @@ fn inject_break_continue_unwinds(body: &mut Vec<TypedStmt>, local_types: &HashMa
             | TypedStmt::DropEnum { name, .. }
             | TypedStmt::DropArray { name, .. }
             | TypedStmt::DropTuple { name, .. }
+            | TypedStmt::DropBuffer { name }
             | TypedStmt::Release { name } => {
                 drop_positions.insert(name.clone(), i);
             }
@@ -888,6 +891,7 @@ fn insert_barriers(body: &mut Vec<TypedStmt>) {
             | TypedStmt::DropEnum { name, .. }
             | TypedStmt::DropArray { name, .. }
             | TypedStmt::DropTuple { name, .. }
+            | TypedStmt::DropBuffer { name }
             | TypedStmt::Release { name } => Some(name.as_str()),
             _ => None,
         };
@@ -957,6 +961,7 @@ fn extract_gpu_producing_expr(stmt: &TypedStmt) -> Option<(Vec<String>, Option<S
         | TypedStmt::DropEnum { .. }
         | TypedStmt::DropArray { .. }
         | TypedStmt::DropTuple { .. }
+        | TypedStmt::DropBuffer { .. }
         | TypedStmt::GpuBarrier
         | TypedStmt::Assign { .. }
         | TypedStmt::If { .. }
@@ -1097,6 +1102,7 @@ fn collect_idents_in_stmt(stmt: &TypedStmt, out: &mut HashSet<String>) {
         | TypedStmt::DropEnum { .. }
         | TypedStmt::DropArray { .. }
         | TypedStmt::DropTuple { .. }
+        | TypedStmt::DropBuffer { .. }
         | TypedStmt::GpuBarrier
         | TypedStmt::Retain { .. }
         | TypedStmt::Release { .. }

@@ -26,6 +26,8 @@ pub enum ResolvedTy {
     },
     /// Fixed-length homogeneous array `Array<T, N>`.
     Array { elem: Box<ResolvedTy>, len: usize },
+    /// Runtime-length mutable staging buffer `Buffer<dtype>`.
+    Buffer { dtype: ScalarTy },
 }
 
 impl fmt::Display for ResolvedTy {
@@ -50,6 +52,7 @@ impl fmt::Display for ResolvedTy {
             ResolvedTy::Struct { name, .. } => write!(f, "{}", name),
             ResolvedTy::Enum { name, .. } => write!(f, "{}", name),
             ResolvedTy::Array { elem, len } => write!(f, "Array<{}, {}>", elem, len),
+            ResolvedTy::Buffer { dtype } => write!(f, "Buffer<{}>", scalar_ty_name(dtype)),
         }
     }
 }
@@ -125,6 +128,10 @@ impl ResolvedTy {
 
     pub fn is_str(&self) -> bool {
         matches!(self, ResolvedTy::Str)
+    }
+
+    pub fn is_buffer(&self) -> bool {
+        matches!(self, ResolvedTy::Buffer { .. })
     }
 }
 
