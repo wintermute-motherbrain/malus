@@ -56,8 +56,8 @@ pub use metal::{
     // M22 rand_uniform + rand_int + tensor_get_f32
     malus_rand_uniform, malus_rand_int, malus_tensor_get_f32,
     kernel_dispatch, gpu_barrier, Dtype, TensorBuffer,
-    // M23 — extended dispatch ABI + softmax de-risk kernel
-    kernel_dispatch_v2, register_m23_softmax_row_kernel, M23_SOFTMAX_ROW_KERNEL_ID,
+    // M23 — extended dispatch ABI (de-risk spike retired in M24)
+    kernel_dispatch_v2,
 };
 
 #[cfg(target_os = "macos")]

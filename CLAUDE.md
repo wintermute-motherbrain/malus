@@ -4,7 +4,7 @@
 
 malus is a compiled ML DSL for Apple Silicon. Python-like syntax, dual compilation pipeline: `fn` bodies → Cranelift JIT (CPU), `kernel` bodies → Metal Shading Language (GPU). The CTMM memory model uses escape analysis + Lobster-style borrow-inference to insert static `free` calls at compile time, falling back to reference counting only for tensors that genuinely escape their creation scope (primarily tape-saved tensors for autograd). There is one tensor type: `Tensor<dtype>`.
 
-## Current state: **V3 complete — V4 roadmap approved (2026-06-29)**
+## Current state: **V4 in progress — M24 done (2026-06-30)**
 
 | Milestone | Status | Crate |
 |---|---|---|
@@ -36,7 +36,7 @@ malus is a compiled ML DSL for Apple Silicon. Python-like syntax, dual compilati
 | M22 — Data I/O + nanoGPT Capstone (`read_file`, char tokenization, transformer) | ✅ done | all crates |
 | **V4 — Reclaiming the Vision** (roadmap approved 2026-06-29; see `docs/adr/0026–0031`, plan file) | | |
 | M23 — De-risk spike (extended `kernel_dispatch` ABI + CPU-compute counter CI gate) | ✅ done | `malus-runtime` |
-| M24 — Kernel language v2 (thread hierarchy, shared memory, barrier, arbitrary indexing, control flow) | 🔲 todo | `malus-codegen-gpu`, `malus-syntax`, `malus-sema`, `malus-runtime` |
+| M24 — Kernel language v2 (thread hierarchy, flat indexing, `let shared`, `barrier()`, control flow, scalar uniforms) | ✅ done | `malus-codegen-gpu`, `malus-syntax`, `malus-sema`, `malus-runtime` |
 | M25 — Stdlib forward kernels (all CPU-loop ops → malus `.ml` kernels; forward-hot-path CPU-counter==0) | 🔲 todo | all crates |
 | M26 — Backward kernels (GPU autograd; full-step CPU-counter==0 canonical gate) | 🔲 todo | `malus-runtime` |
 | M27 — Kill `Variable` (static grad-inference; one `Tensor` type) | 🔲 todo | `malus-sema`, `malus-codegen-cpu` |
@@ -206,7 +206,8 @@ The `i64` handle is a raw pointer to a heap-allocated `TensorBuffer { buffer: me
 | `Variable` type (type-directed RC) | **M27** | To be eliminated; replaced by single `Tensor` type + static grad-inference (ADR-0030) |
 | Generics / `impl` / `Module` trait / `List<T>` | **M28** | ADR-0007 fenced scope; required for generic optimizer |
 | Lobster borrow-inference RC elimination | **M29** | The founding CTMM differentiator; ADR-0026 |
-| Kernel language beyond elementwise maps | **M24** | Thread hierarchy, shared memory, barrier, arbitrary indexing (ADR-0027) |
+| Kernel language beyond elementwise maps | ✅ M24 | Thread hierarchy, flat indexing, `let shared`, `barrier()`, control flow, scalar uniforms (ADR-0027) |
+| Multi-dim `a[i,j]` indexing + `TensorMeta` strides | **M25** | M24 uses flat 1-D indexing; rank/stride infra deferred with launch-config |
 | Stdlib ops as malus kernels (dogfooding) | **M25** | Currently Rust CPU loops; will move to kernel language (ADR-0028) |
 | Backward kernels on GPU | **M26** | Currently Rust CPU VJPs in tape.rs; will become GPU kernel dispatches (ADR-0031 gate) |
 | Flash attention | Post-V4 | Composed attention ships V4 (ADR-0029); flash requires simdgroup_matrix + mixed precision |

@@ -107,24 +107,32 @@ _Avoid_: integer tensor (fine informally, but "index tensor" conveys the use)
 Static properties of a kernel dispatch — threadgroup size, grid dimensions — set via annotations on the kernel function.
 _Avoid_: Dispatch config, thread config
 
-**Kernel body (V4)**:
-A kernel body in V4 expresses a real GPU algorithm: arbitrary tensor indexing (`a[i,j]`), thread/threadgroup/grid hierarchy intrinsics, shared memory declarations, `barrier()`, `for`/`while`/`if`, and explicit reductions. The V1 restriction to elementwise maps (`out[tid] = f(inputs[tid])`) is lifted. See ADR-0027.
-_Avoid_: Complex kernel, multi-line kernel
+**Explicit kernel**:
+A `kernel` body that uses thread-hierarchy intrinsics, flat tensor indexing (`a[expr]`), `let shared` arrays, `barrier()`, and/or control flow (`if`/`for`/`while`). Tensor params stay as `Tensor<dtype>` (indexable pointers in MSL); output is written via the implicit `out` binding (`out[expr] = val`). Sema detects this form via `is_implicit_map_kernel` returning false. Codegen-gpu emits a full MSL kernel with scalar params packed into a `struct Uniforms_N` at `buffer(handle_count+1)`. Added in V4-M1 (M24). See ADR-0027.
+_Avoid_: Full kernel, v2 kernel, general kernel
+
+**Implicit-map kernel**:
+The legacy `kernel` sugar form retained for backward compat: body consists only of `let`/`let mut` bindings and a final `return scalar_expr`. Sema rebinds each tensor param to its scalar element type; codegen-gpu emits `out[tid] = expr`. Detected by `is_implicit_map_kernel(body)`. No thread intrinsics or indexed writes (`out[i]=…`) are valid in this form.
+_Avoid_: Simple kernel, elementwise kernel (too vague)
 
 **Thread hierarchy intrinsics**:
-Built-in functions inside kernel bodies that expose the Metal thread model: `thread_id()`, `threadgroup_id()`, `threads_per_threadgroup()`, `threads_per_grid()`. Map to MSL `thread_position_in_grid` etc. Added in V4-M1. See ADR-0027.
+Built-in functions callable only inside explicit kernel bodies, exposing the Metal thread model: `thread_id()` (global), `threadgroup_id()`, `thread_in_threadgroup()` (local), `threads_per_threadgroup()`, `threads_per_grid()`. All return `i32`. Map to MSL `[[thread_position_in_grid]]` etc. Only the intrinsics actually used in a kernel body have their MSL `[[attribute]]` parameters injected. Added in V4-M1 (M24). See ADR-0027.
 _Avoid_: GPU intrinsics, builtins (too vague)
 
 **Shared memory**:
-Threadgroup-scoped fast memory in a kernel body, declared as `let shared x: SharedArray<f32, N>`. Size `N` is a compile-time literal. Maps to MSL `threadgroup float x[N]`. Used for reduction intermediates (e.g. partial sums in softmax). Added in V4-M1.
-_Avoid_: local memory, scratchpad
+Threadgroup-scoped fast memory in a kernel body, declared as `let shared x: Array<f32, N>`. Size `N` is a compile-time integer literal. Maps to MSL `threadgroup float x[N]`. Only valid inside an explicit kernel body; sema rejects it in `fn` bodies. Used for reduction intermediates (e.g. partial sums in softmax, mean/var in layernorm). Added in V4-M1 (M24).
+_Avoid_: local memory, scratchpad, SharedArray (not a type in malus)
+
+**`barrier()`**:
+Explicit threadgroup barrier inside a kernel body. Emits MSL `threadgroup_barrier(mem_flags::mem_threadgroup)`. Only valid inside an explicit kernel body. Ensures all threads in a threadgroup have completed preceding memory writes to shared memory before any thread proceeds. Added in V4-M1 (M24).
+_Avoid_: sync, fence, memory fence
 
 **`inout` parameter**:
 A kernel parameter that is mutated in place rather than borrowed immutably. Avoids allocating a new output buffer for element-wise ops. Post-V1.
 _Avoid_: Mutable parameter, write parameter
 
 **Dispatch uniforms**:
-Per-kernel metadata passed alongside tensor data handles in `kernel_dispatch_v2`: shape, strides, ndim, and scalar parameters (e.g. `axis`, `eps`, `cols`). Required in V4 for kernels that index tensors with multi-dimensional coordinates. In M23, a scalar uniforms blob (opaque `const void*`) is bound as one `MTLBuffer` at index `handle_count+1`. Per-tensor `{shape, strides, ndim}` descriptors are deferred to M24. See ADR-0027.
+Scalar kernel parameters (non-tensor args such as `cols: i32`, `eps: f32`) packed into a `struct Uniforms_N` by codegen-gpu and bound at `buffer(handle_count+1)` in `kernel_dispatch_v2`. Accessed inside the MSL kernel as `u.field_name`. Field order in the struct matches declaration order in the malus kernel signature. Per-tensor `{shape, strides, ndim}` descriptors and multi-dimensional indexing are deferred to M25. See ADR-0027.
 _Avoid_: kernel arguments (overloaded)
 
 **`kernel_dispatch_v2`**:

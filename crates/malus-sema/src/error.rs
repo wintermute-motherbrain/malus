@@ -75,6 +75,13 @@ pub enum SemaError {
     AssignVariableField { field: String, span: Span },
     /// `**` used with non-scalar operands (scalar-only in M20).
     PowOperatorScalarOnly { span: Span },
+    // ── M24: kernel language v2 ─────────────────────────────────────────────────
+    /// `let shared` declaration outside a kernel body.
+    LetSharedOutsideKernel { span: Span },
+    /// Kernel-only intrinsic called outside a kernel body.
+    KernelIntrinsicOutsideKernel { name: String, span: Span },
+    /// `out[i]=e` tensor indexed assignment outside a kernel body.
+    TensorIndexAssignOutsideKernel { span: Span },
 }
 
 impl SemaError {
@@ -122,7 +129,10 @@ impl SemaError {
             | NestedLvalue { span }
             | MutParamBareRebind { span, .. }
             | AssignVariableField { span, .. }
-            | PowOperatorScalarOnly { span } => Some(*span),
+            | PowOperatorScalarOnly { span }
+            | LetSharedOutsideKernel { span }
+            | KernelIntrinsicOutsideKernel { span, .. }
+            | TensorIndexAssignOutsideKernel { span } => Some(*span),
             DuplicateDefinition { second, .. } | DuplicateTypeDefinition { second, .. } => Some(*second),
             MainNotFound => None,
         }
@@ -183,6 +193,9 @@ impl SemaError {
             MutParamBareRebind { .. } => "mut param may only be mutated in place",
             AssignVariableField { .. } => "cannot assign to a Variable struct field",
             PowOperatorScalarOnly { .. } => "** requires scalar operands",
+            LetSharedOutsideKernel { .. } => "`let shared` only valid inside a kernel body",
+            KernelIntrinsicOutsideKernel { .. } => "thread intrinsic only valid inside a kernel body",
+            TensorIndexAssignOutsideKernel { .. } => "tensor indexed assignment only valid inside a kernel body",
             MainNotFound => "",
         }
     }
@@ -299,6 +312,12 @@ impl fmt::Display for SemaError {
                 write!(f, "cannot assign to Variable field '{}': Variable struct fields are post-V3 (see ADR-0016)", field),
             SemaError::PowOperatorScalarOnly { .. } =>
                 write!(f, "`**` requires scalar (f32) operands; tensor power is not supported in M20"),
+            SemaError::LetSharedOutsideKernel { .. } =>
+                write!(f, "`let shared` declarations are only valid inside a kernel body"),
+            SemaError::KernelIntrinsicOutsideKernel { name, .. } =>
+                write!(f, "thread intrinsic '{}' is only valid inside a kernel body", name),
+            SemaError::TensorIndexAssignOutsideKernel { .. } =>
+                write!(f, "tensor indexed assignment `out[i]=e` is only valid inside a kernel body"),
         }
     }
 }

@@ -205,6 +205,10 @@ pub enum StmtKind {
     /// `with no_grad: body` — suspend tape recording for `body`.
     /// Variable RC semantics are unchanged; only tape pushes are suppressed.
     NoGrad { body: Vec<Stmt> },
+    /// `let shared name: Array<T, N>` — declare threadgroup shared memory.
+    /// Only valid inside an explicit kernel body.  `N` must be an integer
+    /// literal.  Lowers to MSL `threadgroup T name[N]`.
+    LetShared { name: String, elem_ty: ScalarTy, size: usize },
 }
 
 // ── Parameters ────────────────────────────────────────────────────────────────

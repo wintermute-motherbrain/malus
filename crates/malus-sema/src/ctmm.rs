@@ -976,7 +976,8 @@ fn extract_gpu_producing_expr(stmt: &TypedStmt) -> Option<(Vec<String>, Option<S
         | TypedStmt::LetTuple { .. }
         | TypedStmt::Break
         | TypedStmt::Continue
-        | TypedStmt::NoGrad { .. } => return None,
+        | TypedStmt::NoGrad { .. }
+        | TypedStmt::LetShared { .. } => return None,
     };
     match &expr.kind {
         TypedExprKind::KernelCall { in_flight, .. } => {
@@ -1140,6 +1141,7 @@ fn collect_idents_in_stmt(stmt: &TypedStmt, out: &mut HashSet<String>) {
         TypedStmt::NoGrad { body } => {
             for s in body { collect_idents_in_stmt(s, out); }
         }
+        TypedStmt::LetShared { .. } => {}
     }
 }
 

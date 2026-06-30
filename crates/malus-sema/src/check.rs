@@ -263,22 +263,42 @@ pub fn check(
                     None => continue,
                 };
 
+                let implicit = is_implicit_map_kernel(body);
+
                 env.push_scope();
-                for p in &sig.params {
-                    // Element-space: inside the kernel body, tensor params are seen as
-                    // their element scalar type. The external signature stays Tensor.
-                    let elem_ty = match &p.ty {
-                        ResolvedTy::Tensor { dtype } => ResolvedTy::Scalar(dtype.clone()),
-                        other => other.clone(),
-                    };
-                    env.bind(p.name.clone(), elem_ty, Some(Placement::Gpu));
+                if implicit {
+                    // Legacy element-space rebinding: tensor params seen as scalar element type.
+                    for p in &sig.params {
+                        let elem_ty = match &p.ty {
+                            ResolvedTy::Tensor { dtype } => ResolvedTy::Scalar(dtype.clone()),
+                            other => other.clone(),
+                        };
+                        env.bind(p.name.clone(), elem_ty, Some(Placement::Gpu));
+                    }
+                } else {
+                    // Explicit kernel: params keep their resolved types (indexable Tensors,
+                    // pass-through scalars).  The implicit `out` binding is a mutable Tensor
+                    // of the return dtype; body writes `out[expr] = val`.
+                    for p in &sig.params {
+                        let pl = if matches!(&p.ty, ResolvedTy::Tensor { .. }) {
+                            Some(Placement::Gpu)
+                        } else {
+                            None
+                        };
+                        env.bind(p.name.clone(), p.ty.clone(), pl);
+                    }
+                    env.bind_mutable("out".to_string(), sig.return_ty.clone(), Some(Placement::Gpu));
                 }
 
-                // Element-space: kernel body returns the element scalar type; the
-                // external return type (Tensor<dtype>) is used for callers.
-                let kernel_return_ty = match &sig.return_ty {
-                    ResolvedTy::Tensor { dtype } => ResolvedTy::Scalar(dtype.clone()),
-                    other => other.clone(),
+                let kernel_return_ty = if implicit {
+                    // Element-space return: body returns scalar element type.
+                    match &sig.return_ty {
+                        ResolvedTy::Tensor { dtype } => ResolvedTy::Scalar(dtype.clone()),
+                        other => other.clone(),
+                    }
+                } else {
+                    // Explicit kernels write to `out`; no explicit return expected.
+                    ResolvedTy::Unit
                 };
 
                 let mut body_errors: Vec<SemaError> = Vec::new();
@@ -305,6 +325,7 @@ pub fn check(
                     return_ty: sig.return_ty.clone(),
                     body: typed_body,
                     span: item.span,
+                    is_implicit_map: implicit,
                 });
             }
             _ => {}
@@ -316,6 +337,27 @@ pub fn check(
     } else {
         Err(errors)
     }
+}
+
+// ── Kernel form classifier ────────────────────────────────────────────────────
+
+/// Returns `true` iff the kernel body is the legacy implicit-map form: only
+/// `Let`/`LetMut` bindings followed by a single final `Return` expression, with
+/// no thread intrinsics, indexing, shared memory, control flow, or `out` writes.
+/// Codegen-gpu uses this to choose the old `out[tid]=expr` lowering.
+fn is_implicit_map_kernel(body: &[malus_syntax::ast::Stmt]) -> bool {
+    use malus_syntax::ast::StmtKind;
+    if body.is_empty() {
+        return false;
+    }
+    for stmt in body {
+        match &stmt.kind {
+            StmtKind::Let { .. } | StmtKind::LetMut { .. } => {}
+            StmtKind::Return { .. } => {}
+            _ => return false,
+        }
+    }
+    matches!(body.last().map(|s| &s.kind), Some(StmtKind::Return { .. }))
 }
 
 // ── Body checking ─────────────────────────────────────────────────────────────
@@ -417,12 +459,13 @@ fn check_body(
                 }
             }
             StmtKind::If { condition, then_body, else_body } => {
-                // Condition must be Bool.
+                // Condition must be Bool (or any Scalar in kernel bodies, where
+                // comparisons yield a scalar mask that MSL treats as truthy).
                 let tcond = match check_expr(condition, Some(&ResolvedTy::Bool), ctx) {
                     Some(e) => e,
                     None => return typed,
                 };
-                if tcond.ty != ResolvedTy::Bool {
+                if !ctx.in_kernel && tcond.ty != ResolvedTy::Bool {
                     ctx.errors.push(SemaError::TypeMismatch {
                         expected: ResolvedTy::Bool,
                         found: tcond.ty.clone(),
@@ -467,19 +510,23 @@ fn check_body(
                 typed.push(TypedStmt::NoGrad { body: tbody });
             }
             StmtKind::For { var, start, end, body } => {
-                // Loop bounds must be I64 (range() desugars to int literals or exprs).
-                let i64_ty = ResolvedTy::Scalar(ScalarTy::I64);
-                let tstart = match check_expr(start, Some(&i64_ty), ctx) {
+                // In kernel bodies, loop variable and bounds are I32 (matching thread
+                // intrinsics which return i32).  In fn bodies, I64 (integer default).
+                let loop_var_ty = if ctx.in_kernel {
+                    ResolvedTy::Scalar(ScalarTy::I32)
+                } else {
+                    ResolvedTy::Scalar(ScalarTy::I64)
+                };
+                let tstart = match check_expr(start, Some(&loop_var_ty), ctx) {
                     Some(e) => e,
                     None => return typed,
                 };
-                let tend = match check_expr(end, Some(&i64_ty), ctx) {
+                let tend = match check_expr(end, Some(&loop_var_ty), ctx) {
                     Some(e) => e,
                     None => return typed,
                 };
-                // Loop variable is I64, visible only inside the body.
                 ctx.env.push_scope();
-                ctx.env.bind(var.clone(), i64_ty, None);
+                ctx.env.bind(var.clone(), loop_var_ty, None);
                 ctx.loop_depth += 1;
                 let tbody = check_body(body, ctx);
                 ctx.loop_depth -= 1;
@@ -515,12 +562,12 @@ fn check_body(
                 typed.push(TypedStmt::ForIn { var: var.clone(), iter: titer, body: tbody });
             }
             StmtKind::While { condition, body } => {
-                // Condition must be Bool.
+                // Condition must be Bool (or any Scalar in kernel bodies).
                 let tcond = match check_expr(condition, Some(&ResolvedTy::Bool), ctx) {
                     Some(e) => e,
                     None => return typed,
                 };
-                if tcond.ty != ResolvedTy::Bool {
+                if !ctx.in_kernel && tcond.ty != ResolvedTy::Bool {
                     ctx.errors.push(SemaError::TypeMismatch {
                         expected: ResolvedTy::Bool,
                         found: tcond.ty.clone(),
@@ -617,6 +664,20 @@ fn check_body(
                     });
                 }
                 typed.push(TypedStmt::Match { scrutinee: tscrutinee, arms: typed_arms });
+            }
+            // ── M24: threadgroup shared memory ────────────────────────────────────
+            StmtKind::LetShared { name, elem_ty, size } => {
+                if !ctx.in_kernel {
+                    ctx.errors.push(SemaError::LetSharedOutsideKernel { span: stmt.span });
+                    return typed;
+                }
+                // Bind as a mutable Array<Scalar(elem_ty), size> so `scratch[i]=val` works.
+                let arr_ty = ResolvedTy::Array {
+                    elem: Box::new(ResolvedTy::Scalar(elem_ty.clone())),
+                    len: *size,
+                };
+                ctx.env.bind_mutable(name.clone(), arr_ty, None);
+                typed.push(TypedStmt::LetShared { name: name.clone(), elem_ty: elem_ty.clone(), size: *size });
             }
         }
     }
@@ -1093,6 +1154,37 @@ fn check_call(
             if let BuiltinKind::AxisOnly = &sig.kind {
                 return check_axis_only_call(&callee_name, args, span, ctx);
             }
+            // KernelOnly builtins (thread intrinsics, barrier, fmax/fmin, rsqrt).
+            if let BuiltinKind::KernelOnly { params, ret } = &sig.kind {
+                let params = params.clone();
+                let ret = ret.clone();
+                if !ctx.in_kernel {
+                    ctx.errors.push(SemaError::KernelIntrinsicOutsideKernel {
+                        name: callee_name.clone(),
+                        span,
+                    });
+                    return None;
+                }
+                if positional.len() != params.len() {
+                    ctx.errors.push(SemaError::ArgCountMismatch {
+                        callee: callee_name.clone(),
+                        expected: params.len(),
+                        found: positional.len(),
+                        span,
+                    });
+                    return None;
+                }
+                let mut typed_args = Vec::new();
+                for (arg, param_ty) in positional.iter().zip(params.iter()) {
+                    typed_args.push(check_expr(arg, Some(param_ty), ctx)?);
+                }
+                return Some(typed_expr(
+                    TypedExprKind::Call { callee: callee_name, args: typed_args },
+                    ret,
+                    None,
+                    span,
+                ));
+            }
             let is_print_call = callee_name == "print" || callee_name == "println";
             let typed_args: Vec<TypedExpr> = match &sig.kind {
                 BuiltinKind::Variadic => {
@@ -1145,6 +1237,7 @@ fn check_call(
                 BuiltinKind::Reduction => unreachable!("Reduction handled above"),
                 BuiltinKind::TensorThenShapeArgs => unreachable!("TensorThenShapeArgs handled above"),
                 BuiltinKind::AxisOnly => unreachable!("AxisOnly handled above"),
+                BuiltinKind::KernelOnly { .. } => unreachable!("KernelOnly handled above"),
             };
             // Validate format string arg count for print/println.
             if is_print_call {
@@ -1177,6 +1270,18 @@ fn check_call(
                 {
                     if let ResolvedTy::Variable { dtype } = &typed_args[0].ty {
                         ResolvedTy::Variable { dtype: dtype.clone() }
+                    } else {
+                        sig.return_ty.clone()
+                    }
+                } else if ctx.in_kernel
+                    && sig.return_ty.is_tensor()
+                    && typed_args.iter().all(|a| matches!(&a.ty, ResolvedTy::Scalar(_)))
+                    && !typed_args.is_empty()
+                {
+                    // Scalar-math pass-through in explicit kernel bodies.
+                    // `exp(a[i])` → `Scalar(F32)` not `Tensor<F32>`.
+                    if let ResolvedTy::Tensor { dtype } = &sig.return_ty {
+                        ResolvedTy::Scalar(dtype.clone())
                     } else {
                         sig.return_ty.clone()
                     }
@@ -2042,6 +2147,31 @@ fn check_lvalue(
                     }
                     Some(TypedStmt::Assign {
                         target: TypedAssignTarget::BufferIndex { base: base_name, index: Box::new(tidx), dtype },
+                        expr: texpr,
+                    })
+                }
+                // M24: `out[expr] = val` inside an explicit kernel body.
+                // `out` is bound as a mutable Tensor<F32> by the kernel scope setup.
+                ResolvedTy::Tensor { dtype } => {
+                    if !ctx.in_kernel {
+                        ctx.errors.push(SemaError::TensorIndexAssignOutsideKernel { span: target.span });
+                        return None;
+                    }
+                    let dtype = dtype.clone();
+                    let elem_ty = ResolvedTy::Scalar(dtype.clone());
+                    let idx_hint = ResolvedTy::Scalar(ScalarTy::I32);
+                    let tidx = check_expr(&indices[0], Some(&idx_hint), ctx)?;
+                    let texpr = check_expr(rhs, Some(&elem_ty), ctx)?;
+                    if texpr.ty != elem_ty {
+                        ctx.errors.push(SemaError::TypeMismatch {
+                            expected: elem_ty.clone(),
+                            found: texpr.ty.clone(),
+                            span: rhs.span,
+                        });
+                        return None;
+                    }
+                    Some(TypedStmt::Assign {
+                        target: TypedAssignTarget::Index { base: base_name, index: Box::new(tidx), elem_ty },
                         expr: texpr,
                     })
                 }

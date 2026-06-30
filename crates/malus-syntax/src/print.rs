@@ -131,6 +131,9 @@ fn print_stmt(out: &mut String, stmt: &Stmt, depth: usize) {
             let binding = format!("({})", names.join(", "));
             writeln!(out, "{indent}let {mut_kw}{binding} = {}", print_expr(expr)).unwrap();
         }
+        StmtKind::LetShared { name, elem_ty, size } => {
+            writeln!(out, "{indent}let shared {name}: Array<{elem_ty:?}, {size}>").unwrap();
+        }
     }
 }
 
@@ -432,6 +435,8 @@ mod tests {
                     mutable,
                     expr: erase_expr(expr, z),
                 },
+                StmtKind::LetShared { name, elem_ty, size } =>
+                    StmtKind::LetShared { name, elem_ty, size },
             },
         }
     }

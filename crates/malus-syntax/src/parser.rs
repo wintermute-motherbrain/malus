@@ -324,6 +324,33 @@ impl Parser {
         match self.current_kind().clone() {
             TokenKind::Let => {
                 self.advance();
+                // `let shared name: Array<T, N>` — threadgroup shared-memory declaration.
+                // `shared` is contextual: only special immediately after `let`.
+                if matches!(self.current_kind(), TokenKind::Ident(s) if s == "shared") {
+                    self.advance(); // consume 'shared'
+                    let (name, _) = self.expect_ident()?;
+                    self.expect(&TokenKind::Colon)?;
+                    let ty = self.parse_type()?;
+                    let (elem_ty, size) = match ty {
+                        Ty::Array { elem, len } => match *elem {
+                            Ty::Scalar(s) => (s, len),
+                            _ => return Err(ParseError::new(
+                                "shared array element type must be a scalar (e.g. f32)",
+                                start,
+                            )),
+                        },
+                        _ => return Err(ParseError::new(
+                            "expected `Array<T, N>` after `let shared name:`",
+                            start,
+                        )),
+                    };
+                    let end = self.current_span();
+                    self.expect_newline_or_eof()?;
+                    return Ok(Stmt {
+                        kind: StmtKind::LetShared { name, elem_ty, size },
+                        span: Span::new(start.file, start.start as usize, end.start as usize),
+                    });
+                }
                 let mutable = if self.current_kind() == &TokenKind::Mut {
                     self.advance();
                     true

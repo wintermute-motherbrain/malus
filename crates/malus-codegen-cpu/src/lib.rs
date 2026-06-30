@@ -973,6 +973,13 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                 self.call_tape_resume();
                 Ok(false)
             }
+
+            // ── M24: kernel shared memory ─────────────────────────────────────────
+            // LetShared is a kernel-body-only statement; codegen-cpu never lowers
+            // kernel bodies, so this arm is unreachable in practice.
+            TypedStmt::LetShared { .. } => {
+                unreachable!("LetShared is only valid in kernel bodies (lowered by codegen-gpu)");
+            }
         }
     }
 

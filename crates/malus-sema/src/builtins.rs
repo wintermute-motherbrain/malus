@@ -26,6 +26,9 @@ pub enum BuiltinKind {
     /// No keepdim.  Normalized to positional [tensor, axis] in check_call.
     /// Variable propagation: if arg0 is Variable the return type is Variable.
     AxisOnly,
+    /// Kernel-only intrinsic or scalar-math helper.  Only callable inside a
+    /// kernel body (`in_kernel`).  Zero or fixed scalar args; scalar return.
+    KernelOnly { params: Vec<ResolvedTy>, ret: ResolvedTy },
 }
 
 #[derive(Debug, Clone)]
@@ -222,6 +225,38 @@ pub fn register_builtins() -> HashMap<String, BuiltinSig> {
     m.insert("rand_int".to_string(), BuiltinSig {
         kind: BuiltinKind::Fixed(vec![ResolvedTy::Scalar(ScalarTy::I64)]),
         return_ty: ResolvedTy::Scalar(ScalarTy::I64),
+        return_placement: None,
+    });
+
+    // M24 — thread-hierarchy intrinsics (only valid inside explicit kernel bodies).
+    let i32_ty = ResolvedTy::Scalar(ScalarTy::I32);
+    for name in &["thread_id", "threadgroup_id", "thread_in_threadgroup",
+                  "threads_per_threadgroup", "threads_per_grid"] {
+        m.insert(name.to_string(), BuiltinSig {
+            kind: BuiltinKind::KernelOnly { params: vec![], ret: i32_ty.clone() },
+            return_ty: i32_ty.clone(),
+            return_placement: None,
+        });
+    }
+    // barrier() — threadgroup memory fence; void return.
+    m.insert("barrier".to_string(), BuiltinSig {
+        kind: BuiltinKind::KernelOnly { params: vec![], ret: ResolvedTy::Unit },
+        return_ty: ResolvedTy::Unit,
+        return_placement: None,
+    });
+    // 2-arg scalar-math kernel helpers.
+    let f32_ty = ResolvedTy::Scalar(ScalarTy::F32);
+    for name in &["fmax", "fmin"] {
+        m.insert(name.to_string(), BuiltinSig {
+            kind: BuiltinKind::KernelOnly { params: vec![f32_ty.clone(), f32_ty.clone()], ret: f32_ty.clone() },
+            return_ty: f32_ty.clone(),
+            return_placement: None,
+        });
+    }
+    // 1-arg scalar-math kernel helpers (not already covered as tensor builtins).
+    m.insert("rsqrt".to_string(), BuiltinSig {
+        kind: BuiltinKind::KernelOnly { params: vec![f32_ty.clone()], ret: f32_ty.clone() },
+        return_ty: f32_ty.clone(),
         return_placement: None,
     });
 

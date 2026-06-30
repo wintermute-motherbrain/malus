@@ -4,7 +4,37 @@
 **Track:** GPU  
 **Depends on:** M24
 
-Replace all Rust CPU-loop forward-pass operations with malus `.ml` kernels in the stdlib. The nanoGPT forward pass must run end-to-end with zero CPU arithmetic. See ADR-0028.
+Replace all Rust CPU-loop forward-pass operations with malus `.ml` kernels in the stdlib.
+The nanoGPT forward pass must run end-to-end with zero CPU arithmetic. See ADR-0028.
+
+## M24 handoffs (deferred from M24)
+
+The following M24-planned items were deliberately punted to M25 because they all require
+runtime shape information that launch-config must also provide:
+
+1. **Launch-configuration mechanism.** When `fn` code calls `let p = softmax(logits)`,
+   something must compute `grid_dims`, `tg_dims`, `out_shape`, and `uniforms` from the
+   runtime input shapes. M25 must design how a kernel declares its launch config (e.g. a
+   `launch` clause expressing grid/tg/out-shape as functions of param shapes).
+
+2. **codegen-cpu `kernel_dispatch_v2` emission.** A `KernelCall` to a v2 kernel must lower
+   to a `kernel_dispatch_v2` call in Cranelift JIT (today only `kernel_dispatch` is emitted —
+   `lower_kernel_dispatch` in `malus-codegen-cpu/src/lib.rs`), baking in the computed
+   grid/tg/out-shape/uniforms.
+
+3. **`RuntimeSymbols` wiring.** Add the `kernel_dispatch_v2` fn pointer to `RuntimeSymbols`
+   and register it as a JIT symbol + import declaration.
+
+4. **Multi-dim `a[i,j]` indexing + `TensorMeta` strides + rank tracking.** M24 uses flat
+   1-D indexing with scalar uniform params. M25 must add: a rank mechanism so sema validates
+   `a[i,j]`; per-tensor `TensorMeta_name { uint shape[N]; uint strides[N]; }` structs in
+   codegen-gpu + stride-indexed access; stride serialization from runtime shapes. Design the
+   shape-aware ABI once here — launch-config and multi-dim indexing share it.
+
+5. **Stdlib kernel files.** The M24 validation kernels live in `examples/v4-kernels/` as
+   standalone artifacts. M25 moves them to `stdlib/` and integrates them so calling
+   `softmax(t, axis=2)` in a malus program dispatches through `kernel_dispatch_v2` instead
+   of the CPU-loop ABI.
 
 ## Done-When
 

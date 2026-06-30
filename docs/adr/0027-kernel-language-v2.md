@@ -1,6 +1,6 @@
 # ADR-0027 — Kernel Language v2: Real GPU Programming Model
 
-**Status:** Accepted (V4-M1)  
+**Status:** Accepted (V4-M1); M24 implemented  
 **Amends:** ADR-0005 (MPS for stdlib — inverted), ADR-0012/0017 (eager CPU loops — retired for stdlib ops)
 
 ## Context
@@ -20,11 +20,11 @@ V4-M1 rewrites the `kernel` codegen to a real GPU programming model. The kernel 
 
 **Thread hierarchy intrinsics:** `thread_id()`, `threadgroup_id()`, `threads_per_threadgroup()`, `threads_per_grid()` → MSL `thread_position_in_grid`, etc.
 
-**Arbitrary tensor indexing:** `a[i]` and `a[i,j]` (and higher rank) → MSL buffer pointer arithmetic with stride/shape metadata passed as uniforms. The dispatch ABI is extended to pass per-tensor `{shape, strides, ndim}` as uniform buffers alongside the data handle (see CI-assert mechanism in the plan).
+**Arbitrary tensor indexing:** `a[expr]` (flat 1-D) in M24; `a[i,j]` multi-dim with stride/shape metadata deferred to M25 (requires both launch-config and per-tensor `TensorMeta` strides — same runtime-shape concern, designed together). M24 kernels use flat manual index arithmetic (`a[row*cols+col]`) plus scalar uniform params (`cols: i32`).
 
 **Control flow inside kernels:** `for`/`while`/`if` — the `TypedStmt` variants already exist in the IR; the GPU codegen simply needs to lower them instead of rejecting them.
 
-**Shared memory:** `let shared x: SharedArray<f32, N>` → MSL `threadgroup float x[N]`. Size `N` must be a compile-time literal (static shared-mem sizing).
+**Shared memory:** `let shared x: Array<f32, N>` (reusing the existing `Array<T,N>` type with the `shared` storage qualifier) → MSL `threadgroup float x[N]`. Size `N` must be a compile-time literal (static shared-mem sizing). `shared` is a contextual keyword, not a reserved word. `SharedArray` was considered but rejected — a separate type per address space conflicts with the Mojo-inspired model where address space is a parameter on the same array abstraction.
 
 **Barrier:** `barrier()` → MSL `threadgroup_barrier(mem_flags::mem_threadgroup)`.
 
@@ -61,14 +61,14 @@ to use `kernel_dispatch` unchanged — no backward-compat break.
 compile-time literal in the MSL source. The host never calls `setThreadgroupMemoryLength`.
 No `tg_mem_bytes` in the ABI.
 
-**Per-tensor shape/stride uniform descriptors:** `{data_ptr, shape_ptr, ndim, strides_ptr}`
-for arbitrary `a[i,j]` indexing are deferred to M24. M23's softmax kernel needs only a
-scalar `cols` uniform, so building stride infra now would ship un-exercised ABI.
+**Per-tensor shape/stride uniform descriptors:** `{shape_ptr, ndim, strides_ptr}` for
+arbitrary `a[i,j]` indexing are deferred to M25 (alongside launch-config syntax, which
+requires the same per-shape runtime information).
 
-**Scalar uniforms (f32, i32):** Passed as an opaque `const void* uniforms` blob bound as
-one buffer at `buffer(handle_count+1)`. Each kernel MSL function declares the relevant
-fields as a `constant uint&`, `constant float&`, or similar at that index. M24 will formalize
-a struct layout for multi-field uniform blobs.
+**Scalar uniforms (f32, i32):** codegen-gpu emits a `struct Uniforms_N { … }` whose fields
+match kernel scalar params in declaration order.  Bound at `buffer(handle_count+1)` and
+accessed as `u.field_name` in the MSL kernel.  The host packs an equivalent `#[repr(C)]`
+struct and passes it as the `uniforms` pointer to `kernel_dispatch_v2`.
 
 ## Why this is the M1 rewrite
 
@@ -76,14 +76,18 @@ This is not additive — `lower_kernel_body` and `lower_expr` must be rewritten,
 
 ## Consequences
 
-- `malus-syntax` / `malus-sema`: kernel grammar is extended to accept the new intrinsics, `SharedArray`, and `barrier()`. Sema validates shared-mem size literals.
-- `malus-codegen-gpu/src/lib.rs`: `lower_kernel_body` rewrite; `lower_expr` extended for index expressions and intrinsics.
-- `malus-runtime/src/metal.rs`: `kernel_dispatch` ABI extended (shape/stride/scalar uniforms). The `RuntimeSymbols` struct gains new fields for the extended dispatch.
+- `malus-syntax`: `StmtKind::LetShared { name, elem_ty, size }` added; `shared` made
+  a contextual keyword (not reserved, only special after `let`).
+- `malus-sema`: new `KernelOnly` builtin kind for thread intrinsics, `barrier()`, and
+  scalar-math helpers (`fmax`, `fmin`, `rsqrt`). Scalar-math pass-through for `Fixed`
+  builtins in kernel bodies.  `is_implicit_map_kernel` predicate drives param binding.
+- `malus-codegen-gpu/src/lib.rs`: `lower_kernel_explicit` / `lower_kernel_body_explicit` /
+  `lower_expr_kernel` added alongside the preserved implicit-map path.  `collect_used_intrinsics`
+  injects only the thread-position attributes actually referenced by the body.
+- `malus-runtime/src/metal.rs`: M23 spike (`SOFTMAX_ROW_MSL`, `register_m23_softmax_row_kernel`,
+  `M23_SOFTMAX_ROW_KERNEL_ID`) retired in M24.  `kernel_dispatch_v2` ABI unchanged.
+- `RuntimeSymbols` **not** extended in M24 — the codegen-cpu call-site emission for
+  `kernel_dispatch_v2` is deferred to M25 along with launch-config.
 - All existing elementwise kernels (built-in `malus_add`, etc.) continue to work unchanged.
-- M23 de-risk spike: one hand-written MSL `softmax_row` kernel is dispatched through
-  `kernel_dispatch_v2` to validate the ABI and CPU-compute counter before the M24 rewrite.
-  The kernel is registered under `M23_SOFTMAX_ROW_KERNEL_ID = 0x8000_0000_0000_0001`
-  (high-bit reserved; cannot collide with sequential IDs from `compile_kernels`). Retired
-  in M24 when the malus compiler generates the equivalent MSL from a `.ml` kernel source.
-  `kernel_dispatch_v2` is NOT added to `RuntimeSymbols` in M23 — that happens in M24
-  when codegen first emits a call to it.
+- M23 de-risk spike (hand-written MSL `softmax_row` registered under
+  `M23_SOFTMAX_ROW_KERNEL_ID = 0x8000_0000_0000_0001`) retired in M24 as intended.

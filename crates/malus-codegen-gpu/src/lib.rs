@@ -198,6 +198,7 @@ fn collect_binops_in_stmt(
         TypedStmt::NoGrad { body } => {
             for s in body { collect_binops_in_stmt(s, tensor_ops, scalar_ops); }
         }
+        TypedStmt::LetShared { .. } => {}
     }
 }
 
@@ -301,6 +302,7 @@ fn collect_unary_builtins_in_stmt(stmt: &TypedStmt, out: &mut BTreeSet<String>) 
         TypedStmt::NoGrad { body } => {
             for s in body { collect_unary_builtins_in_stmt(s, out); }
         }
+        TypedStmt::LetShared { .. } => {}
     }
 }
 
@@ -403,6 +405,16 @@ fn synthesize_scalar_builtin(
 // ── MSL lowering ──────────────────────────────────────────────────────────────
 
 fn lower_kernel(kernel: &TypedKernel, kernel_id: u64) -> Result<String, CodegenError> {
+    if kernel.is_implicit_map {
+        lower_kernel_implicit(kernel, kernel_id)
+    } else {
+        lower_kernel_explicit(kernel, kernel_id)
+    }
+}
+
+// ── Implicit-map kernel (legacy element-space form) ───────────────────────────
+
+fn lower_kernel_implicit(kernel: &TypedKernel, kernel_id: u64) -> Result<String, CodegenError> {
     let func_name = format!("malus_kernel_{}", kernel_id);
 
     let return_dtype = kernel.return_ty.tensor_dtype().ok_or_else(|| {
@@ -432,7 +444,7 @@ fn lower_kernel(kernel: &TypedKernel, kernel_id: u64) -> Result<String, CodegenE
     ));
     params.push("uint tid [[thread_position_in_grid]]".to_string());
 
-    let body_msl = lower_kernel_body(&kernel.body, &param_names)?;
+    let body_msl = lower_kernel_body_implicit(&kernel.body, &param_names)?;
 
     let msl = format!(
         "#include <metal_stdlib>\nusing namespace metal;\n\nkernel void {}(\n    {}\n) {{\n    {}\n}}\n",
@@ -444,7 +456,7 @@ fn lower_kernel(kernel: &TypedKernel, kernel_id: u64) -> Result<String, CodegenE
     Ok(msl)
 }
 
-fn lower_kernel_body(
+fn lower_kernel_body_implicit(
     body: &[TypedStmt],
     param_names: &HashSet<String>,
 ) -> Result<String, CodegenError> {
@@ -466,8 +478,8 @@ fn lower_kernel_body(
                         "kernel body must end with a return statement".into(),
                     ));
                 }
-                let msl_ty = resolved_scalar_to_msl(&expr.ty)?;
-                let expr_msl = lower_expr(expr, param_names, &local_names)?;
+                let msl_ty = resolved_ty_to_msl(&expr.ty)?;
+                let expr_msl = lower_expr_implicit(expr, param_names, &local_names)?;
                 lines.push(format!("{} {} = {};", msl_ty, name, expr_msl));
                 local_names.insert(name.clone());
             }
@@ -477,12 +489,12 @@ fn lower_kernel_body(
                         "return must be the last statement in kernel body".into(),
                     ));
                 }
-                let expr_msl = lower_expr(expr, param_names, &local_names)?;
+                let expr_msl = lower_expr_implicit(expr, param_names, &local_names)?;
                 lines.push(format!("out[tid] = {};", expr_msl));
             }
             _ => {
                 return Err(CodegenError::UnsupportedKernelBody(
-                    "only let bindings and a final return are allowed in kernel bodies".into(),
+                    "only let bindings and a final return are allowed in implicit-map kernel bodies".into(),
                 ));
             }
         }
@@ -491,7 +503,7 @@ fn lower_kernel_body(
     Ok(lines.join("\n    "))
 }
 
-fn lower_expr(
+fn lower_expr_implicit(
     expr: &TypedExpr,
     param_names: &HashSet<String>,
     local_names: &HashSet<String>,
@@ -499,10 +511,8 @@ fn lower_expr(
     match &expr.kind {
         TypedExprKind::Ident(name) => {
             if param_names.contains(name) {
-                // Tensor parameters: index by thread id (element-space).
                 Ok(format!("{}[tid]", name))
             } else if local_names.contains(name) {
-                // Let-bound locals: scalar value, no indexing.
                 Ok(name.clone())
             } else {
                 Err(CodegenError::UnsupportedKernelBody(format!(
@@ -511,65 +521,460 @@ fn lower_expr(
             }
         }
 
-        TypedExprKind::Lit(lit) => match lit {
-            Lit::Float(f) => Ok(format!("{:?}f", f)),
-            Lit::Int(n) => Ok(format!("{}", n)),
-            Lit::Bool(_) => Err(CodegenError::UnsupportedKernelBody(
-                "bool literals not supported in kernel bodies (comparisons yield float masks)".into(),
-            )),
-            Lit::Str(_) => Err(CodegenError::UnsupportedKernelBody(
-                "string literals not supported in kernel bodies".into(),
-            )),
-        },
+        TypedExprKind::Lit(lit) => lower_lit(lit),
 
         TypedExprKind::BinOp { op, lhs, rhs } => {
-            let l = lower_expr(lhs, param_names, local_names)?;
-            let r = lower_expr(rhs, param_names, local_names)?;
-            let msl_op = binop_to_msl(op)?;
+            let l = lower_expr_implicit(lhs, param_names, local_names)?;
+            let r = lower_expr_implicit(rhs, param_names, local_names)?;
+            let msl_op = binop_to_msl_infix(op)?;
             Ok(format!("({} {} {})", l, msl_op, r))
         }
 
         TypedExprKind::Unary { op, operand } => {
-            let val = lower_expr(operand, param_names, local_names)?;
+            let val = lower_expr_implicit(operand, param_names, local_names)?;
             match op {
                 UnaryOp::Neg => Ok(format!("(-{})", val)),
                 UnaryOp::Not => Err(CodegenError::UnsupportedKernelBody(
-                    "bitwise not not supported in kernel bodies".into(),
+                    "logical not not supported in kernel bodies".into(),
                 )),
             }
         }
 
-        _ => Err(CodegenError::UnsupportedKernelBody(format!(
-            "unsupported expression kind in kernel body"
+        _ => Err(CodegenError::UnsupportedKernelBody(
+            "unsupported expression kind in implicit-map kernel body".into(),
+        )),
+    }
+}
+
+// ── Explicit kernel (M24 full GPU programming model) ──────────────────────────
+
+/// Context threaded through explicit kernel body lowering.
+#[derive(Clone)]
+struct KernelCtx {
+    /// Names of tensor pointer parameters (device const T* name).
+    tensor_param_names: HashSet<String>,
+    /// Names of scalar uniform parameters (accessed as u.name).
+    scalar_param_names: HashSet<String>,
+    /// All names bound as locals in the current or any enclosing scope,
+    /// including shared-memory arrays.  Let-bound loop variables are added
+    /// as the For stmt is processed.
+    local_names: HashSet<String>,
+}
+
+/// Thread intrinsic names and their MSL [[attribute]] equivalents.
+const INTRINSIC_ATTR: &[(&str, &str, &str)] = &[
+    ("thread_id",              "_tid",     "thread_position_in_grid"),
+    ("threadgroup_id",         "_tgid",    "threadgroup_position_in_grid"),
+    ("thread_in_threadgroup",  "_lid",     "thread_position_in_threadgroup"),
+    ("threads_per_threadgroup","_tgsize",  "threads_per_threadgroup"),
+    ("threads_per_grid",       "_gridsize","threads_per_grid"),
+];
+
+fn intrinsic_var(name: &str) -> Option<&'static str> {
+    INTRINSIC_ATTR.iter().find(|(n, _, _)| *n == name).map(|(_, v, _)| *v)
+}
+
+fn collect_used_intrinsics(body: &[TypedStmt], out: &mut HashSet<String>) {
+    for stmt in body {
+        collect_used_intrinsics_stmt(stmt, out);
+    }
+}
+
+fn collect_used_intrinsics_stmt(stmt: &TypedStmt, out: &mut HashSet<String>) {
+    match stmt {
+        TypedStmt::Let { expr, .. } | TypedStmt::Return { expr } | TypedStmt::Assign { expr, .. } => {
+            collect_used_intrinsics_expr(expr, out);
+        }
+        TypedStmt::Expr(expr) => collect_used_intrinsics_expr(expr, out),
+        TypedStmt::If { condition, then_body, else_body } => {
+            collect_used_intrinsics_expr(condition, out);
+            collect_used_intrinsics(then_body, out);
+            if let Some(eb) = else_body { collect_used_intrinsics(eb, out); }
+        }
+        TypedStmt::For { start, end, body, .. } => {
+            collect_used_intrinsics_expr(start, out);
+            collect_used_intrinsics_expr(end, out);
+            collect_used_intrinsics(body, out);
+        }
+        TypedStmt::While { condition, body } => {
+            collect_used_intrinsics_expr(condition, out);
+            collect_used_intrinsics(body, out);
+        }
+        _ => {}
+    }
+}
+
+fn collect_used_intrinsics_expr(expr: &TypedExpr, out: &mut HashSet<String>) {
+    match &expr.kind {
+        TypedExprKind::Call { callee, args } => {
+            if INTRINSIC_ATTR.iter().any(|(n, _, _)| n == callee) {
+                out.insert(callee.clone());
+            }
+            for a in args { collect_used_intrinsics_expr(a, out); }
+        }
+        TypedExprKind::BinOp { lhs, rhs, .. } => {
+            collect_used_intrinsics_expr(lhs, out);
+            collect_used_intrinsics_expr(rhs, out);
+        }
+        TypedExprKind::Unary { operand, .. } => collect_used_intrinsics_expr(operand, out),
+        TypedExprKind::Index { base, indices } => {
+            collect_used_intrinsics_expr(base, out);
+            for i in indices { collect_used_intrinsics_expr(i, out); }
+        }
+        _ => {}
+    }
+}
+
+fn lower_kernel_explicit(kernel: &TypedKernel, kernel_id: u64) -> Result<String, CodegenError> {
+    let func_name = format!("malus_kernel_{}", kernel_id);
+
+    let return_dtype = kernel.return_ty.tensor_dtype().ok_or_else(|| {
+        CodegenError::NonTensorReturnType(kernel.return_ty.to_string())
+    })?;
+    let return_msl_type = dtype_to_msl(return_dtype);
+
+    // Partition params into tensor buffers and scalar uniforms.
+    let mut tensor_params: Vec<_> = Vec::new();
+    let mut scalar_params: Vec<_> = Vec::new();
+    for p in &kernel.params {
+        if p.ty.is_tensor() || p.ty.is_variable() {
+            tensor_params.push(p);
+        } else {
+            scalar_params.push(p);
+        }
+    }
+
+    // Collect which thread intrinsics the body uses.
+    let mut used_intrinsics: HashSet<String> = HashSet::new();
+    collect_used_intrinsics(&kernel.body, &mut used_intrinsics);
+
+    // Build MSL parameter list.
+    let mut msl_params: Vec<String> = Vec::new();
+
+    // Tensor params → device const buffers 0..N-1.
+    for (i, p) in tensor_params.iter().enumerate() {
+        let dtype = p.ty.tensor_dtype().unwrap();
+        let msl_ty = dtype_to_msl(dtype);
+        msl_params.push(format!("device const {}* {} [[buffer({})]]", msl_ty, p.name, i));
+    }
+
+    // out → device buffer N.
+    let out_idx = tensor_params.len();
+    msl_params.push(format!("device {}* out [[buffer({})]]", return_msl_type, out_idx));
+
+    // Uniforms → constant buffer N+1.
+    let has_uniforms = !scalar_params.is_empty();
+    if has_uniforms {
+        msl_params.push(format!("constant Uniforms_{}& u [[buffer({})]]", kernel_id, out_idx + 1));
+    }
+
+    // Thread-position attributes (injected only for intrinsics the body uses).
+    for (name, var, attr) in INTRINSIC_ATTR {
+        if used_intrinsics.contains(*name) {
+            msl_params.push(format!("uint {} [[{}]]", var, attr));
+        }
+    }
+
+    // Build uniforms struct (if needed).
+    let uniforms_struct = if has_uniforms {
+        let fields: Vec<String> = scalar_params.iter().map(|p| {
+            let msl_ty = match &p.ty {
+                ResolvedTy::Scalar(s) => dtype_to_msl(s),
+                other => panic!("scalar param expected, got {}", other),
+            };
+            format!("    {} {};", msl_ty, p.name)
+        }).collect();
+        format!("struct Uniforms_{} {{\n{}}};\n\n", kernel_id, fields.join("\n"))
+    } else {
+        String::new()
+    };
+
+    let tensor_param_names: HashSet<String> = tensor_params.iter().map(|p| p.name.clone()).collect();
+    let scalar_param_names: HashSet<String> = scalar_params.iter().map(|p| p.name.clone()).collect();
+
+    let ctx = KernelCtx {
+        tensor_param_names,
+        scalar_param_names,
+        local_names: HashSet::new(),
+    };
+
+    let mut body_lines: Vec<String> = Vec::new();
+    lower_kernel_body_explicit(&kernel.body, &ctx, 1, &mut body_lines)?;
+
+    let indent = "    ";
+    let body_str = body_lines.iter()
+        .map(|l| format!("{}{}", indent, l))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let msl = format!(
+        "#include <metal_stdlib>\nusing namespace metal;\n\n{}kernel void {}(\n    {}\n) {{\n{}\n}}\n",
+        uniforms_struct,
+        func_name,
+        msl_params.join(",\n    "),
+        body_str,
+    );
+
+    Ok(msl)
+}
+
+/// Lower a sequence of explicit-kernel statements, appending MSL lines to `out`.
+/// `depth` controls indentation (1 = inside the kernel function, 2 = inside an if/for body).
+fn lower_kernel_body_explicit(
+    body: &[TypedStmt],
+    ctx: &KernelCtx,
+    depth: usize,
+    out: &mut Vec<String>,
+) -> Result<(), CodegenError> {
+    let indent = "    ".repeat(depth.saturating_sub(1));
+    let mut ctx = ctx.clone();
+
+    for stmt in body {
+        match stmt {
+            TypedStmt::Let { name, expr } => {
+                let msl_ty = resolved_ty_to_msl(&expr.ty)?;
+                let expr_s = lower_expr_kernel(expr, &ctx)?;
+                out.push(format!("{}{} {} = {};", indent, msl_ty, name, expr_s));
+                ctx.local_names.insert(name.clone());
+            }
+
+            TypedStmt::LetShared { name, elem_ty, size } => {
+                let msl_ty = dtype_to_msl(elem_ty);
+                out.push(format!("{}threadgroup {} {}[{}];", indent, msl_ty, name, size));
+                ctx.local_names.insert(name.clone());
+            }
+
+            TypedStmt::Assign { target, expr } => {
+                use malus_sema::TypedAssignTarget;
+                let expr_s = lower_expr_kernel(expr, &ctx)?;
+                match target {
+                    TypedAssignTarget::Ident(name) => {
+                        out.push(format!("{}{} = {};", indent, name, expr_s));
+                    }
+                    TypedAssignTarget::Index { base, index, .. } => {
+                        let idx_s = lower_expr_kernel(index, &ctx)?;
+                        out.push(format!("{}{}[{}] = {};", indent, base, idx_s, expr_s));
+                    }
+                    other => {
+                        return Err(CodegenError::UnsupportedKernelBody(format!(
+                            "unsupported lvalue target in kernel: {:?}", other
+                        )));
+                    }
+                }
+            }
+
+            TypedStmt::Expr(expr) => {
+                if let TypedExprKind::Call { callee, .. } = &expr.kind {
+                    if callee == "barrier" {
+                        out.push(format!("{}threadgroup_barrier(mem_flags::mem_threadgroup);", indent));
+                        continue;
+                    }
+                }
+                let expr_s = lower_expr_kernel(expr, &ctx)?;
+                out.push(format!("{}{};", indent, expr_s));
+            }
+
+            TypedStmt::If { condition, then_body, else_body } => {
+                let cond_s = lower_expr_kernel(condition, &ctx)?;
+                out.push(format!("{}if ({}) {{", indent, cond_s));
+                lower_kernel_body_explicit(then_body, &ctx, depth + 1, out)?;
+                if let Some(eb) = else_body {
+                    out.push(format!("{}}} else {{", indent));
+                    lower_kernel_body_explicit(eb, &ctx, depth + 1, out)?;
+                }
+                out.push(format!("{}}}", indent));
+            }
+
+            TypedStmt::For { var, start, end, body } => {
+                let start_s = lower_expr_kernel(start, &ctx)?;
+                let end_s = lower_expr_kernel(end, &ctx)?;
+                let var_ty = resolved_ty_to_msl(&start.ty)?;
+                out.push(format!("{}for({} {} = {}; {} < {}; {}++) {{",
+                    indent, var_ty, var, start_s, var, end_s, var));
+                let mut sub_ctx = ctx.clone();
+                sub_ctx.local_names.insert(var.clone());
+                lower_kernel_body_explicit(body, &sub_ctx, depth + 1, out)?;
+                out.push(format!("{}}}", indent));
+            }
+
+            TypedStmt::While { condition, body } => {
+                let cond_s = lower_expr_kernel(condition, &ctx)?;
+                out.push(format!("{}while ({}) {{", indent, cond_s));
+                lower_kernel_body_explicit(body, &ctx, depth + 1, out)?;
+                out.push(format!("{}}}", indent));
+            }
+
+            TypedStmt::Return { .. } => {
+                // Explicit kernels write to `out`; a `return` here is an early exit.
+                out.push(format!("{}return;", indent));
+            }
+
+            // CTMM nodes don't appear in kernel bodies — skip silently.
+            TypedStmt::Drop { .. }
+            | TypedStmt::GpuBarrier
+            | TypedStmt::Retain { .. }
+            | TypedStmt::Release { .. }
+            | TypedStmt::RetainAgg { .. }
+            | TypedStmt::ReleaseAgg { .. }
+            | TypedStmt::DropStruct { .. }
+            | TypedStmt::DropEnum { .. }
+            | TypedStmt::DropArray { .. }
+            | TypedStmt::DropTuple { .. }
+            | TypedStmt::DropBuffer { .. }
+            | TypedStmt::NoGrad { .. }
+            | TypedStmt::Break
+            | TypedStmt::Continue
+            | TypedStmt::LetTuple { .. }
+            | TypedStmt::ForIn { .. }
+            | TypedStmt::Match { .. } => {
+                return Err(CodegenError::UnsupportedKernelBody(format!(
+                    "statement not valid in explicit kernel body: {:?}",
+                    std::mem::discriminant(stmt)
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Lower an expression in the context of an explicit kernel body.
+fn lower_expr_kernel(expr: &TypedExpr, ctx: &KernelCtx) -> Result<String, CodegenError> {
+    match &expr.kind {
+        TypedExprKind::Ident(name) => {
+            if ctx.tensor_param_names.contains(name) || name == "out" {
+                // Tensor parameter or output buffer: raw pointer name (caller indexes explicitly).
+                Ok(name.clone())
+            } else if ctx.scalar_param_names.contains(name) {
+                // Scalar uniform: accessed via the constant uniforms struct.
+                Ok(format!("u.{}", name))
+            } else {
+                // Local variable (let-bound scalar, shared array, loop var).
+                Ok(name.clone())
+            }
+        }
+
+        TypedExprKind::Lit(lit) => lower_lit(lit),
+
+        TypedExprKind::BinOp { op, lhs, rhs } => {
+            if *op == BinOp::Pow {
+                let l = lower_expr_kernel(lhs, ctx)?;
+                let r = lower_expr_kernel(rhs, ctx)?;
+                return Ok(format!("pow({}, {})", l, r));
+            }
+            let l = lower_expr_kernel(lhs, ctx)?;
+            let r = lower_expr_kernel(rhs, ctx)?;
+            let msl_op = binop_to_msl_infix(op)?;
+            Ok(format!("({} {} {})", l, msl_op, r))
+        }
+
+        TypedExprKind::Unary { op, operand } => {
+            let val = lower_expr_kernel(operand, ctx)?;
+            match op {
+                UnaryOp::Neg => Ok(format!("(-{})", val)),
+                UnaryOp::Not => Ok(format!("(!{})", val)),
+            }
+        }
+
+        TypedExprKind::Index { base, indices } => {
+            if indices.len() != 1 {
+                return Err(CodegenError::UnsupportedKernelBody(
+                    "multi-dimensional indexing not supported in M24 (use flat index arithmetic)".into(),
+                ));
+            }
+            let base_s = lower_expr_kernel(base, ctx)?;
+            let idx_s = lower_expr_kernel(&indices[0], ctx)?;
+            Ok(format!("{}[{}]", base_s, idx_s))
+        }
+
+        TypedExprKind::Call { callee, args } => {
+            // Thread-hierarchy intrinsics → cast MSL attribute variable to int.
+            if let Some(var) = intrinsic_var(callee) {
+                return Ok(format!("(int){}", var));
+            }
+            // barrier() is handled at statement level; if it appears as an expr, emit the call.
+            if callee == "barrier" {
+                return Ok("threadgroup_barrier(mem_flags::mem_threadgroup)".to_string());
+            }
+            // Scalar math builtins → MSL function calls.
+            let msl_callee = match callee.as_str() {
+                "exp"   => "exp",
+                "log"   => "log",
+                "sqrt"  => "sqrt",
+                "rsqrt" => "rsqrt",
+                "tanh"  => "tanh",
+                "abs"   => "fabs",
+                "relu"  => return {
+                    let a = lower_expr_kernel(&args[0], ctx)?;
+                    Ok(format!("fmax(0.0f, {})", a))
+                },
+                "sigmoid" => return {
+                    let a = lower_expr_kernel(&args[0], ctx)?;
+                    Ok(format!("(1.0f / (1.0f + exp(-{})))", a))
+                },
+                "fmax"  => "fmax",
+                "fmin"  => "fmin",
+                "pow"   => "pow",
+                other => return Err(CodegenError::UnsupportedKernelBody(format!(
+                    "unsupported call in explicit kernel body: {}", other
+                ))),
+            };
+            let arg_strs: Result<Vec<_>, _> = args.iter().map(|a| lower_expr_kernel(a, ctx)).collect();
+            Ok(format!("{}({})", msl_callee, arg_strs?.join(", ")))
+        }
+
+        other => Err(CodegenError::UnsupportedKernelBody(format!(
+            "unsupported expression kind in explicit kernel: {:?}",
+            std::mem::discriminant(other)
         ))),
     }
 }
 
-fn binop_to_msl(op: &BinOp) -> Result<&'static str, CodegenError> {
+// ── Shared helpers ─────────────────────────────────────────────────────────────
+
+fn lower_lit(lit: &Lit) -> Result<String, CodegenError> {
+    match lit {
+        Lit::Float(f) => Ok(format!("{:?}f", f)),
+        Lit::Int(n) => Ok(format!("{}", n)),
+        Lit::Bool(b) => Ok(if *b { "true".to_string() } else { "false".to_string() }),
+        Lit::Str(_) => Err(CodegenError::UnsupportedKernelBody(
+            "string literals not supported in kernel bodies".into(),
+        )),
+    }
+}
+
+fn binop_to_msl_infix(op: &BinOp) -> Result<&'static str, CodegenError> {
     match op {
-        BinOp::Add => Ok("+"),
-        BinOp::Sub => Ok("-"),
-        BinOp::Mul => Ok("*"),
-        BinOp::Div => Ok("/"),
+        BinOp::Add   => Ok("+"),
+        BinOp::Sub   => Ok("-"),
+        BinOp::Mul   => Ok("*"),
+        BinOp::Div   => Ok("/"),
         BinOp::Eq    => Ok("=="),
         BinOp::NotEq => Ok("!="),
         BinOp::Lt    => Ok("<"),
         BinOp::LtEq  => Ok("<="),
         BinOp::Gt    => Ok(">"),
         BinOp::GtEq  => Ok(">="),
+        BinOp::And   => Ok("&&"),
+        BinOp::Or    => Ok("||"),
         BinOp::Matmul => Err(CodegenError::UnsupportedKernelBody(
             "matmul is not element-wise".into(),
         )),
-        _ => Err(CodegenError::UnsupportedKernelBody(format!(
-            "unsupported binop in kernel: {:?}", op
-        ))),
+        BinOp::Pow => Err(CodegenError::UnsupportedKernelBody(
+            "Pow must be handled before binop_to_msl_infix".into(),
+        )),
     }
 }
 
-/// Map a resolved scalar type to its MSL type name.
-fn resolved_scalar_to_msl(ty: &ResolvedTy) -> Result<&'static str, CodegenError> {
+// Keep the old name as an alias for the synthesize_* functions that still use it.
+fn binop_to_msl(op: &BinOp) -> Result<&'static str, CodegenError> {
+    binop_to_msl_infix(op)
+}
+
+/// Map a resolved type to its MSL type string (scalar types only; tensors not valid here).
+fn resolved_ty_to_msl(ty: &ResolvedTy) -> Result<&'static str, CodegenError> {
     match ty {
         ResolvedTy::Scalar(s) => Ok(dtype_to_msl(s)),
+        ResolvedTy::Unit => Ok("void"),
         _ => Err(CodegenError::UnsupportedKernelBody(format!(
             "expected scalar type for kernel local, got: {}", ty
         ))),

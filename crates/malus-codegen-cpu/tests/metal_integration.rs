@@ -143,11 +143,23 @@ kernel add(a: Tensor<f32>, b: Tensor<f32>) -> Tensor<f32>:
     run_metal_src(src);
 }
 
-// V4 M23 CI gate: softmax_row dispatched via kernel_dispatch_v2 produces
-// numerically correct output and triggers zero CPU-compute counter increments.
+// V4 M24 CI gate: softmax/layernorm/gelu authored in the malus kernel language,
+// dispatched via kernel_dispatch_v2, produce numerically correct output with
+// cpu_compute_count()==0.  The M23 spike (register_m23_softmax_row_kernel /
+// M23_SOFTMAX_ROW_KERNEL_ID) is retired; these tests replace it.
+
+fn setup_kernel(src: &str) -> (malus_codegen_gpu::KernelRegistry, std::collections::HashMap<String, u64>) {
+    let program = malus_syntax::parse(malus_syntax::FileId(0), src).expect("parse failed");
+    let aliases = std::collections::HashMap::new();
+    let typed = malus_sema::check(&program, &aliases).expect("type check failed");
+    let (registry, kernel_ids) =
+        malus_codegen_gpu::compile_kernels(&typed).expect("kernel compilation failed");
+    malus_runtime::runtime_init(&registry.clone().into_hashmap());
+    (registry, kernel_ids)
+}
+
 #[test]
-fn test_v4_m23_softmax_row_gpu_counter_zero() {
-    // Pure-Rust reference — no malus_runtime calls, so no counter pollution.
+fn test_v4_m24_softmax_gpu_counter_zero() {
     fn softmax_ref(input: &[f32], rows: usize, cols: usize) -> Vec<f32> {
         let mut out = vec![0.0f32; rows * cols];
         for r in 0..rows {
@@ -155,14 +167,39 @@ fn test_v4_m23_softmax_row_gpu_counter_zero() {
             let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
             let exps: Vec<f32> = row.iter().map(|&x| (x - max).exp()).collect();
             let sum: f32 = exps.iter().sum();
-            for c in 0..cols {
-                out[r * cols + c] = exps[c] / sum;
-            }
+            for c in 0..cols { out[r * cols + c] = exps[c] / sum; }
         }
         out
     }
 
     let _guard = METAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    // Inline the malus kernel source with a dummy main() so sema is satisfied.
+    let src = r#"
+kernel softmax(input: Tensor<f32>, cols: i32) -> Tensor<f32>:
+    let row = threadgroup_id()
+    let col = thread_in_threadgroup()
+    let start = row * cols
+    let shared scratch: Array<f32, 1024>
+    scratch[col] = input[start + col]
+    barrier()
+    let mut m = scratch[0]
+    for i in range(1, cols):
+        m = fmax(m, scratch[i])
+    barrier()
+    scratch[col] = exp(scratch[col] - m)
+    barrier()
+    let mut s = 0.0
+    for j in range(0, cols):
+        s = s + scratch[j]
+    barrier()
+    out[start + col] = scratch[col] / s
+
+fn main():
+    let _a = 0
+"#;
+    let (_registry, kernel_ids) = setup_kernel(src);
+    let kernel_id = *kernel_ids.get("softmax").expect("softmax kernel not found");
 
     let rows: usize = 4;
     let cols: usize = 8;
@@ -174,7 +211,6 @@ fn test_v4_m23_softmax_row_gpu_counter_zero() {
     ];
     let reference = softmax_ref(&input_data, rows, cols);
 
-    malus_runtime::register_m23_softmax_row_kernel();
     malus_runtime::malus_cpu_compute_reset();
 
     let in_shape = [rows, cols];
@@ -184,38 +220,206 @@ fn test_v4_m23_softmax_row_gpu_counter_zero() {
 
     let out_shape = [rows, cols];
     let grid: [usize; 3] = [rows, 1, 1];
-    let tg: [usize; 3]   = [cols, 1, 1];
-    let uniforms: u32 = cols as u32;
+    let tg:   [usize; 3] = [cols, 1, 1];
+    let uniforms: i32 = cols as i32;
 
     let out_handle = unsafe {
         malus_runtime::kernel_dispatch_v2(
-            malus_runtime::M23_SOFTMAX_ROW_KERNEL_ID,
+            kernel_id,
             &in_handle as *const i64,
             1,
             grid.as_ptr(),
             tg.as_ptr(),
             out_shape.as_ptr(),
             2,
-            0, // f32 dtype_tag
-            &uniforms as *const u32 as *const std::ffi::c_void,
-            std::mem::size_of::<u32>(),
+            0,
+            &uniforms as *const i32 as *const std::ffi::c_void,
+            std::mem::size_of::<i32>(),
         )
     };
     malus_runtime::gpu_barrier();
 
-    // Snapshot the count before element reads so the assertion is logically tight.
     let cpu_count = malus_runtime::malus_cpu_compute_count();
 
     for i in 0..(rows * cols) {
         let got = unsafe { malus_runtime::malus_tensor_get_f32(out_handle, i as i64) };
         assert!(
             (got - reference[i]).abs() < 1e-5,
-            "output[{i}]: got {got:.6}, expected {:.6}",
-            reference[i]
+            "softmax output[{i}]: got {got:.6}, expected {:.6}", reference[i]
         );
     }
-
     assert_eq!(cpu_count, 0, "CPU compute was invoked during GPU softmax dispatch");
+
+    malus_runtime::tensor_free(in_handle);
+    malus_runtime::tensor_free(out_handle);
+}
+
+#[test]
+fn test_v4_m24_layernorm_gpu_counter_zero() {
+    fn layernorm_ref(input: &[f32], rows: usize, cols: usize, eps: f32) -> Vec<f32> {
+        let mut out = vec![0.0f32; rows * cols];
+        for r in 0..rows {
+            let row = &input[r * cols..(r + 1) * cols];
+            let mean = row.iter().sum::<f32>() / cols as f32;
+            let var = row.iter().map(|&x| (x - mean) * (x - mean)).sum::<f32>() / cols as f32;
+            let inv_std = (var + eps).sqrt().recip();
+            for c in 0..cols { out[r * cols + c] = (row[c] - mean) * inv_std; }
+        }
+        out
+    }
+
+    let _guard = METAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let src = r#"
+kernel layernorm(input: Tensor<f32>, cols: i32, inv_cols: f32, eps: f32) -> Tensor<f32>:
+    let row = threadgroup_id()
+    let col = thread_in_threadgroup()
+    let start = row * cols
+    let shared scratch: Array<f32, 1024>
+    scratch[col] = input[start + col]
+    barrier()
+    let mut s = 0.0
+    for i in range(0, cols):
+        s = s + scratch[i]
+    let mean = s * inv_cols
+    barrier()
+    let mut v = 0.0
+    for j in range(0, cols):
+        let d = scratch[j] - mean
+        v = v + d * d
+    let inv_std = rsqrt(v * inv_cols + eps)
+    barrier()
+    out[start + col] = (scratch[col] - mean) * inv_std
+
+fn main():
+    let _a = 0
+"#;
+    let (_registry, kernel_ids) = setup_kernel(src);
+    let kernel_id = *kernel_ids.get("layernorm").expect("layernorm kernel not found");
+
+    let rows: usize = 4;
+    let cols: usize = 8;
+    let eps: f32 = 1e-5;
+    let input_data: [f32; 32] = [
+        1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0,
+        0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8,
+        -3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0, 4.0,
+        10.0, 10.1, 9.9, 10.2, 9.8, 10.3, 9.7, 10.4,
+    ];
+    let reference = layernorm_ref(&input_data, rows, cols, eps);
+
+    malus_runtime::malus_cpu_compute_reset();
+
+    let in_shape = [rows, cols];
+    let in_handle = unsafe {
+        malus_runtime::tensor_alloc_gpu(0, in_shape.as_ptr(), 2, input_data.as_ptr())
+    };
+
+    let out_shape = [rows, cols];
+    let grid: [usize; 3] = [rows, 1, 1];
+    let tg:   [usize; 3] = [cols, 1, 1];
+
+    #[repr(C)]
+    struct LnUniforms { cols: i32, inv_cols: f32, eps: f32 }
+    let uniforms = LnUniforms { cols: cols as i32, inv_cols: 1.0 / cols as f32, eps };
+
+    let out_handle = unsafe {
+        malus_runtime::kernel_dispatch_v2(
+            kernel_id,
+            &in_handle as *const i64,
+            1,
+            grid.as_ptr(),
+            tg.as_ptr(),
+            out_shape.as_ptr(),
+            2,
+            0,
+            &uniforms as *const LnUniforms as *const std::ffi::c_void,
+            std::mem::size_of::<LnUniforms>(),
+        )
+    };
+    malus_runtime::gpu_barrier();
+
+    let cpu_count = malus_runtime::malus_cpu_compute_count();
+
+    for i in 0..(rows * cols) {
+        let got = unsafe { malus_runtime::malus_tensor_get_f32(out_handle, i as i64) };
+        assert!(
+            (got - reference[i]).abs() < 1e-5,
+            "layernorm output[{i}]: got {got:.6}, expected {:.6}", reference[i]
+        );
+    }
+    assert_eq!(cpu_count, 0, "CPU compute was invoked during GPU layernorm dispatch");
+
+    malus_runtime::tensor_free(in_handle);
+    malus_runtime::tensor_free(out_handle);
+}
+
+#[test]
+fn test_v4_m24_gelu_gpu_counter_zero() {
+    fn gelu_ref(input: &[f32]) -> Vec<f32> {
+        input.iter().map(|&x| {
+            let inner = 0.7978845608028654_f32 * (x + 0.044715 * x * x * x);
+            0.5 * x * (1.0 + inner.tanh())
+        }).collect()
+    }
+
+    let _guard = METAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let src = r#"
+kernel gelu(input: Tensor<f32>) -> Tensor<f32>:
+    let i = thread_id()
+    let x = input[i]
+    let x3 = x * x * x
+    let inner = 0.7978845608028654 * (x + 0.044715 * x3)
+    out[i] = 0.5 * x * (1.0 + tanh(inner))
+
+fn main():
+    let _a = 0
+"#;
+    let (_registry, kernel_ids) = setup_kernel(src);
+    let kernel_id = *kernel_ids.get("gelu").expect("gelu kernel not found");
+
+    let n: usize = 8;
+    let input_data: [f32; 8] = [1.0, -1.0, 0.0, 2.0, -2.0, 0.5, -0.5, 3.0];
+    let reference = gelu_ref(&input_data);
+
+    malus_runtime::malus_cpu_compute_reset();
+
+    let in_shape = [n];
+    let in_handle = unsafe {
+        malus_runtime::tensor_alloc_gpu(0, in_shape.as_ptr(), 1, input_data.as_ptr())
+    };
+
+    let out_shape = [n];
+    let grid: [usize; 3] = [n, 1, 1];
+    let tg:   [usize; 3] = [1, 1, 1];
+
+    let out_handle = unsafe {
+        malus_runtime::kernel_dispatch_v2(
+            kernel_id,
+            &in_handle as *const i64,
+            1,
+            grid.as_ptr(),
+            tg.as_ptr(),
+            out_shape.as_ptr(),
+            1,
+            0,
+            std::ptr::null(),
+            0,
+        )
+    };
+    malus_runtime::gpu_barrier();
+
+    let cpu_count = malus_runtime::malus_cpu_compute_count();
+
+    for i in 0..n {
+        let got = unsafe { malus_runtime::malus_tensor_get_f32(out_handle, i as i64) };
+        assert!(
+            (got - reference[i]).abs() < 1e-5,
+            "gelu output[{i}]: got {got:.6}, expected {:.6}", reference[i]
+        );
+    }
+    assert_eq!(cpu_count, 0, "CPU compute was invoked during GPU gelu dispatch");
 
     malus_runtime::tensor_free(in_handle);
     malus_runtime::tensor_free(out_handle);

@@ -446,3 +446,112 @@ fn main():
     assert!(copy_id  < add_id,   "user kernel id ({copy_id}) < tensor-tensor builtin id ({add_id})");
     assert!(add_id   < mul_s_id, "tensor-tensor builtin id ({add_id}) < scalar builtin id ({mul_s_id})");
 }
+
+// ── M24: explicit kernel codegen tests ───────────────────────────────────────
+
+#[test]
+fn test_m24_explicit_kernel_emits_msl() {
+    // Smoke-test: an explicit kernel that exercises let shared, barrier(), for loop,
+    // if, threadgroup_id(), thread_in_threadgroup(), flat indexing, and a scalar
+    // uniform — all required M24 features.  Only validates the MSL is emitted
+    // (no xcrun available in CI); structure assertions cover correctness.
+    let src = r#"
+kernel softmax(input: Tensor<f32>, cols: i32) -> Tensor<f32>:
+    let row = threadgroup_id()
+    let col = thread_in_threadgroup()
+    let start = row * cols
+    let shared scratch: Array<f32, 1024>
+    scratch[col] = input[start + col]
+    barrier()
+    let mut m = scratch[0]
+    for i in range(1, cols):
+        m = fmax(m, scratch[i])
+    barrier()
+    scratch[col] = exp(scratch[col] - m)
+    barrier()
+    let mut s = 0.0
+    for j in range(0, cols):
+        s = s + scratch[j]
+    barrier()
+    out[start + col] = scratch[col] / s
+
+fn main():
+    let _a = 0
+"#;
+    let (registry, name_to_id) = compile_src(src).expect("should compile");
+    let kernel_id = name_to_id["softmax"];
+    let msl = registry.msl_for(kernel_id).expect("MSL for softmax not found");
+
+    assert!(msl.contains("threadgroup float scratch[1024]"), "shared memory declaration missing");
+    assert!(msl.contains("threadgroup_barrier(mem_flags::mem_threadgroup)"), "barrier missing");
+    assert!(msl.contains("for(long i = 1; i < u.cols; i++)"), "for loop (range 1..cols) missing");
+    assert!(msl.contains("for(long j = 0; j < u.cols; j++)"), "for loop (range 0..cols) missing");
+    assert!(msl.contains("uint _tgid [[threadgroup_position_in_grid]]"), "threadgroup_id attr missing");
+    assert!(msl.contains("uint _lid [[thread_position_in_threadgroup]]"), "thread_in_threadgroup attr missing");
+    assert!(msl.contains("struct Uniforms_0"), "uniforms struct missing");
+    assert!(msl.contains("int cols"), "cols field in uniforms missing");
+    assert!(msl.contains("fmax("), "fmax call missing");
+    assert!(msl.contains("exp("), "exp call missing");
+}
+
+#[test]
+fn test_m24_gelu_explicit_kernel_no_uniforms() {
+    let src = r#"
+kernel gelu(input: Tensor<f32>) -> Tensor<f32>:
+    let i = thread_id()
+    let x = input[i]
+    let x3 = x * x * x
+    let inner = 0.7978845608028654 * (x + 0.044715 * x3)
+    out[i] = 0.5 * x * (1.0 + tanh(inner))
+
+fn main():
+    let _a = 0
+"#;
+    let (registry, name_to_id) = compile_src(src).expect("should compile");
+    let kernel_id = name_to_id["gelu"];
+    let msl = registry.msl_for(kernel_id).expect("MSL for gelu not found");
+
+    assert!(msl.contains("uint _tid [[thread_position_in_grid]]"), "thread_id attr missing");
+    assert!(!msl.contains("Uniforms_"), "no uniforms struct expected for gelu");
+    assert!(msl.contains("tanh("), "tanh call missing");
+    // No threadgroup shared memory in gelu.
+    assert!(!msl.contains("threadgroup"), "no threadgroup memory expected in gelu");
+}
+
+#[test]
+fn test_m24_layernorm_uniforms_struct() {
+    let src = r#"
+kernel layernorm(input: Tensor<f32>, cols: i32, inv_cols: f32, eps: f32) -> Tensor<f32>:
+    let row = threadgroup_id()
+    let col = thread_in_threadgroup()
+    let start = row * cols
+    let shared scratch: Array<f32, 1024>
+    scratch[col] = input[start + col]
+    barrier()
+    let mut s = 0.0
+    for i in range(0, cols):
+        s = s + scratch[i]
+    let mean = s * inv_cols
+    barrier()
+    let mut v = 0.0
+    for j in range(0, cols):
+        let d = scratch[j] - mean
+        v = v + d * d
+    let inv_std = rsqrt(v * inv_cols + eps)
+    barrier()
+    out[start + col] = (scratch[col] - mean) * inv_std
+
+fn main():
+    let _a = 0
+"#;
+    let (registry, name_to_id) = compile_src(src).expect("should compile");
+    let kernel_id = name_to_id["layernorm"];
+    let msl = registry.msl_for(kernel_id).expect("MSL for layernorm not found");
+
+    assert!(msl.contains("struct Uniforms_0"), "uniforms struct missing");
+    assert!(msl.contains("int cols"), "cols field missing");
+    assert!(msl.contains("float inv_cols"), "inv_cols field missing");
+    assert!(msl.contains("float eps"), "eps field missing");
+    assert!(msl.contains("rsqrt("), "rsqrt call missing");
+    assert!(msl.contains("threadgroup float scratch[1024]"), "shared memory missing");
+}

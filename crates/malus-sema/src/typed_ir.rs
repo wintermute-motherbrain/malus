@@ -43,6 +43,12 @@ pub struct TypedKernel {
     pub return_ty: ResolvedTy,
     pub body: Vec<TypedStmt>,
     pub span: Span,
+    /// True when the kernel body is the legacy implicit-map form: only `let`
+    /// bindings and a single final `return scalar_expr` with no thread
+    /// intrinsics, indexing, shared memory, or control flow.  Codegen-gpu
+    /// uses this to choose the old `out[tid]=expr` lowering vs the new
+    /// explicit lowering.
+    pub is_implicit_map: bool,
 }
 
 // ── Assign targets ───────────────────────────────────────────────────────────
@@ -180,6 +186,10 @@ pub enum TypedStmt {
     // ── M22: Buffer<i32> ─────────────────────────────────────────────────────
     /// CTMM: free a CPU-side staging buffer.
     DropBuffer { name: String },
+    // ── M24: kernel shared memory ─────────────────────────────────────────────
+    /// `let shared name: Array<T, N>` inside an explicit kernel body.
+    /// Codegen-gpu emits `threadgroup T name[N]`.
+    LetShared { name: String, elem_ty: malus_syntax::ast::ScalarTy, size: usize },
 }
 
 /// One arm of a `match` statement.
