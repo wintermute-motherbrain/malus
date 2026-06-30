@@ -1259,7 +1259,7 @@ fn main():
 }
 
 #[test]
-fn test_variable_field_assign_rejected() {
+fn test_variable_field_assign_accepted() {
     let src = r#"
 struct Model:
     w: Variable<f32>
@@ -1272,11 +1272,8 @@ fn main():
     let v2 = variable(t2)
     m.w = v2
 "#;
-    let errors = check_src(src).expect_err("assigning to Variable field should be rejected");
-    assert!(
-        errors.iter().any(|e| matches!(e, SemaError::AssignVariableField { .. })),
-        "expected AssignVariableField, got: {:?}", errors
-    );
+    // M22 commit 3: Variable field assign is now supported (mut base required).
+    check_src(src).expect("assigning to Variable field on mut struct should now be accepted");
 }
 
 #[test]

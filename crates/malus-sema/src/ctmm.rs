@@ -1213,6 +1213,16 @@ fn variable_arc_retains_for_expr(expr: &TypedExpr) -> Vec<String> {
                 if let TypedExprKind::Ident(n) = &e.kind { Some(n.clone()) } else { None }
             })
             .collect(),
+        // Struct literal: retain Variable ident fields so the struct slot is a genuine
+        // co-owner alongside any binding that still references the same handle.
+        // (variable() calls self-retain, so only Ident sources need an extra retain here.)
+        TypedExprKind::StructInit { fields, .. } => fields
+            .iter()
+            .filter(|f| f.ty.is_variable())
+            .filter_map(|f| {
+                if let TypedExprKind::Ident(n) = &f.kind { Some(n.clone()) } else { None }
+            })
+            .collect(),
         _ => vec![],
     }
 }

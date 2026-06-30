@@ -1731,3 +1731,22 @@ fn main():
 "#;
     run_src(src).expect("buffer tokenization from string should compile and run");
 }
+
+#[test]
+fn test_variable_field_assign_rc_balanced() {
+    // Variable field assign on a mut struct: construct, reassign, drop — RC stays balanced.
+    let src = r#"
+struct Model:
+    w: Variable<f32>
+
+fn main():
+    let t1 = Tensor.gpu<f32>([1.0, 2.0])
+    let v1 = variable(t1)
+    let mut m = Model(w=v1)
+    let t2 = Tensor.gpu<f32>([3.0, 4.0])
+    let v2 = variable(t2)
+    m.w = v2
+    tensor_print(m.w.data)
+"#;
+    run_src(src).expect("Variable field assign should compile and run without leaks");
+}

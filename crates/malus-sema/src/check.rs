@@ -2088,11 +2088,6 @@ fn check_lvalue(
                     return None;
                 }
             };
-            // Reject Variable fields (post-V3, ADR-0016).
-            if field_ty.is_variable() {
-                ctx.errors.push(SemaError::AssignVariableField { field: field.clone(), span: target.span });
-                return None;
-            }
             let texpr = check_expr(rhs, Some(&field_ty), ctx)?;
             if texpr.ty != field_ty {
                 ctx.errors.push(SemaError::TypeMismatch {
