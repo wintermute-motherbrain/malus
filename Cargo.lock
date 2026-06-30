@@ -270,6 +270,7 @@ dependencies = [
  "malus-loader",
  "malus-runtime",
  "malus-sema",
+ "malus-stdlib",
  "malus-syntax",
 ]
 
@@ -285,6 +286,7 @@ dependencies = [
  "malus-codegen-gpu",
  "malus-runtime",
  "malus-sema",
+ "malus-stdlib",
  "malus-syntax",
 ]
 
@@ -315,6 +317,13 @@ dependencies = [
 
 [[package]]
 name = "malus-sema"
+version = "0.1.0"
+dependencies = [
+ "malus-syntax",
+]
+
+[[package]]
+name = "malus-stdlib"
 version = "0.1.0"
 dependencies = [
  "malus-syntax",

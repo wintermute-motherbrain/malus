@@ -86,7 +86,12 @@ fn run_script(path: &str) {
         }
     };
 
-    let typed = match malus_sema::check(&loaded.program, &loaded.module_aliases) {
+    // Prepend stdlib items so stdlib fns/kernels are visible to the user program.
+    let mut stdlib_items = malus_stdlib::stdlib_items();
+    stdlib_items.extend(loaded.program.items.into_iter());
+    let full_program = malus_syntax::ast::Program { items: stdlib_items };
+
+    let typed = match malus_sema::check(&full_program, &loaded.module_aliases) {
         Ok(t) => t,
         Err(errors) => {
             for e in &errors {
@@ -172,6 +177,10 @@ fn run_script(path: &str) {
             // M22 rand_int + tensor_get_f32.
             malus_rand_int:            malus_runtime::malus_rand_int,
             malus_tensor_get_f32:      malus_runtime::malus_tensor_get_f32,
+            // M25 metadata accessors + kernel_dispatch_v2.
+            tensor_ndim:               malus_runtime::tensor_ndim,
+            tensor_dim:                malus_runtime::tensor_dim,
+            kernel_dispatch_v2:        malus_runtime::kernel_dispatch_v2,
         };
         if let Err(e) = malus_codegen_cpu::compile_and_run(&typed, &symbols, &kernel_ids) {
             eprintln!("error: {e}");

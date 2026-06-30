@@ -284,4 +284,17 @@ pub enum TypedExprKind {
         base: Box<TypedExpr>,
         index: usize,
     },
+    /// M25 kernel launch: `kernel[grid=[..], tg=[..], out=[..]](tensor_args, scalar_args)`.
+    /// `grid`/`tg` are i64[3] arrays; `out_shape` is optional (None = first tensor input's shape).
+    /// Lowers to `kernel_dispatch_v2` in codegen-cpu.
+    KernelLaunch {
+        kernel: String,
+        grid: Box<TypedExpr>,
+        tg: Box<TypedExpr>,
+        out_shape: Option<Box<TypedExpr>>,
+        /// Tensor input args in declaration order (become handles).
+        tensor_args: Vec<TypedExpr>,
+        /// Scalar uniform args in declaration order (packed into Uniforms blob).
+        scalar_args: Vec<TypedExpr>,
+    },
 }

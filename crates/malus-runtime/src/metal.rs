@@ -317,6 +317,23 @@ pub extern "C" fn tensor_len(handle: i64) -> i64 {
     tb.len as i64
 }
 
+#[no_mangle]
+pub extern "C" fn tensor_ndim(handle: i64) -> i64 {
+    let tb = unsafe { &*(handle as *const TensorBuffer) };
+    tb.shape.len() as i64
+}
+
+#[no_mangle]
+pub extern "C" fn tensor_dim(handle: i64, i: i64) -> i64 {
+    let tb = unsafe { &*(handle as *const TensorBuffer) };
+    let rank = tb.shape.len();
+    let idx = if i < 0 { i + rank as i64 } else { i };
+    if idx < 0 || idx as usize >= rank {
+        panic!("malus: tensor_dim index {} out of range for rank-{} tensor", i, rank);
+    }
+    tb.shape[idx as usize] as i64
+}
+
 // ── GPU barrier ───────────────────────────────────────────────────────────────
 
 #[no_mangle]
@@ -1146,7 +1163,6 @@ pub extern "C" fn tensor_cross_entropy(logits: i64, targets: i64, softmax_out: *
 /// Returns a [T, T] causal mask: 0.0 on and below the diagonal, -1e9 above.
 #[no_mangle]
 pub extern "C" fn tensor_causal_mask(t_size: i64) -> i64 {
-    crate::cpu_compute_inc();
     let t = t_size as usize;
     let mut data = vec![0.0f32; t * t];
     for i in 0..t {
@@ -1261,7 +1277,6 @@ thread_local! {
 /// Box-Muller transform. Fixed default seed (counter starts at 0 per thread).
 #[no_mangle]
 pub extern "C" fn tensor_randn(shape_ptr: *const usize, ndims: usize) -> i64 {
-    crate::cpu_compute_inc();
     let shape = unsafe { std::slice::from_raw_parts(shape_ptr, ndims).to_vec() };
     let n: usize = shape.iter().product();
     let call_idx = RANDN_CALL_COUNTER.with(|c| { let v = c.get(); c.set(v + 1); v });
@@ -1496,7 +1511,15 @@ pub extern "C" fn kernel_dispatch_v2(
         .map(|i| unsafe { &*(handles.add(i).read() as *const TensorBuffer) })
         .collect();
 
-    let output_handle = tensor_alloc_gpu(out_dtype_tag, out_shape, out_ndim, std::ptr::null());
+    // out_ndim==0 means "inherit first input's shape and dtype" (launch omitted out= config).
+    let output_handle = if out_ndim == 0 {
+        let first_tb = inputs.first()
+            .expect("malus: kernel_dispatch_v2: out_ndim==0 but no tensor inputs");
+        let dtype_tag = if out_dtype_tag >= 0 { out_dtype_tag } else { first_tb.dtype.to_tag() };
+        tensor_alloc_gpu(dtype_tag, first_tb.shape.as_ptr(), first_tb.shape.len(), std::ptr::null())
+    } else {
+        tensor_alloc_gpu(out_dtype_tag, out_shape, out_ndim, std::ptr::null())
+    };
     let output_tb = unsafe { &*(output_handle as *const TensorBuffer) };
 
     if output_tb.len == 0 {
@@ -1538,6 +1561,42 @@ pub extern "C" fn kernel_dispatch_v2(
         }
         unsafe { encoder.setBuffer_offset_atIndex(Some(&*uniform_buf), 0, handle_count + 1) };
         // uniform_buf drops here; the Metal encoder retains it until command buffer completion.
+    }
+
+    // D5 TensorMeta binding convention: bind a {u32 ndim; u32 shape[8]; u32 strides[8]} for
+    // each input tensor and the output tensor at buffer indices hc+2, hc+3, ..., hc+2+N.
+    // Row-major strides derived on-the-fly (all live tensors are contiguous per D5 validation).
+    // codegen-gpu emits matching `constant TensorMeta& <name>_meta [[buffer(idx)]]` params.
+    let all_tbs: Vec<&TensorBuffer> = inputs.iter().map(|&t| t).chain(std::iter::once(output_tb)).collect();
+    for (idx_offset, tb) in all_tbs.iter().enumerate() {
+        let rank = tb.shape.len().min(8);
+        let mut meta = [0u32; 17]; // ndim + shape[8] + strides[8]
+        meta[0] = rank as u32;
+        // Compute row-major strides.
+        let mut stride = 1usize;
+        let mut strides = [1usize; 8];
+        for k in (0..rank).rev() {
+            strides[k] = stride;
+            stride *= tb.shape[k];
+        }
+        for k in 0..rank {
+            meta[1 + k] = tb.shape[k] as u32;
+            meta[9 + k] = strides[k] as u32;
+        }
+        let meta_bytes = 17 * std::mem::size_of::<u32>();
+        let meta_buf = ctx.device
+            .newBufferWithLength_options(meta_bytes, MTLResourceOptions::StorageModeShared)
+            .expect("malus: kernel_dispatch_v2 failed to allocate TensorMeta buffer");
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                meta.as_ptr() as *const u8,
+                meta_buf.contents().as_ptr() as *mut u8,
+                meta_bytes,
+            );
+        }
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(&*meta_buf), 0, handle_count + 2 + idx_offset);
+        }
     }
 
     let grid_size = MTLSize { width: grid[0], height: grid[1], depth: grid[2] };

@@ -145,6 +145,15 @@ pub enum ExprKind {
     Tuple(Vec<Expr>),
     /// `expr.0`, `expr.1` — positional field access on a tuple.
     TupleIndex { base: Box<Expr>, index: usize },
+    /// M25 kernel launch expression:
+    /// `kernel_name[grid=[gx,gy,gz], tg=[tx,ty,tz], out=[...]](inputs, scalars)`
+    /// `[ ]` = named launch config; `( )` = runtime args (tensor inputs + scalar uniforms).
+    /// `out` is optional — defaults to the shape of the first tensor input.
+    KernelLaunch {
+        kernel: String,
+        config: Vec<(String, Expr)>,
+        args: Vec<CallArg>,
+    },
 }
 
 // ── Statements ────────────────────────────────────────────────────────────────

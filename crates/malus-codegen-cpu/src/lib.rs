@@ -158,6 +158,11 @@ pub struct RuntimeSymbols {
     // M22 rand_int + tensor_get_f32.
     pub malus_rand_int:            extern "C" fn(i64) -> i64,
     pub malus_tensor_get_f32:      extern "C" fn(i64, i64) -> f32,
+    // M25 metadata accessors (no cpu_compute_inc).
+    pub tensor_ndim:               extern "C" fn(i64) -> i64,
+    pub tensor_dim:                extern "C" fn(i64, i64) -> i64,
+    // M25 extended dispatch ABI (kernel_dispatch_v2).
+    pub kernel_dispatch_v2:        extern "C" fn(u64, *const i64, usize, *const usize, *const usize, *const usize, usize, i32, *const std::ffi::c_void, usize) -> i64,
 }
 
 // ── Error ─────────────────────────────────────────────────────────────────────
@@ -432,6 +437,10 @@ struct Codegen<'m> {
     // M22: rand_int + tensor_get_f32.
     rt_malus_rand_int:             FuncId,
     rt_malus_tensor_get_f32:       FuncId,
+    // M25: metadata accessors + kernel_dispatch_v2.
+    rt_tensor_ndim:                FuncId,
+    rt_tensor_dim:                 FuncId,
+    rt_kernel_dispatch_v2:         FuncId,
 }
 
 impl<'m> Codegen<'m> {
@@ -1731,6 +1740,17 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
             }
 
             TypedExprKind::Index { base, indices } => {
+                // M25: detect `t.shape[i]` / `t.strides[i]` — fuse into tensor_dim(t, i).
+                // sema types .shape as Array<I64,8>; the array itself is not materialised.
+                if let TypedExprKind::FieldAccess { base: fa_base, field } = &base.kind {
+                    if (field == "shape" || field == "strides") && (fa_base.ty.is_tensor() || fa_base.ty.is_variable()) {
+                        let handle = self.lower_expr(fa_base)?;
+                        let idx_val = self.lower_expr(&indices[0])?;
+                        let dim_ref = self.import_func(self.codegen.rt_tensor_dim);
+                        let call = self.builder.ins().call(dim_ref, &[handle, idx_val]);
+                        return Ok(self.builder.inst_results(call).to_vec()[0]);
+                    }
+                }
                 match &base.ty {
                     ResolvedTy::Array { .. } => {
                         let arr_ptr = self.lower_expr(base)?;
@@ -1789,6 +1809,20 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                     let len_ref = self.import_func(self.codegen.rt_tensor_len);
                     let call = self.builder.ins().call(len_ref, &[handle]);
                     Ok(self.builder.inst_results(call).to_vec()[0])
+                } else if field == "ndim" && (base.ty.is_tensor() || base.ty.is_variable()) {
+                    // M25: x.ndim → tensor_ndim(handle) -> i64
+                    let handle = self.lower_expr(base)?;
+                    let ndim_ref = self.import_func(self.codegen.rt_tensor_ndim);
+                    let call = self.builder.ins().call(ndim_ref, &[handle]);
+                    Ok(self.builder.inst_results(call).to_vec()[0])
+                } else if (field == "shape" || field == "strides") && (base.ty.is_tensor() || base.ty.is_variable()) {
+                    // M25: x.shape / x.strides — sema types as Array<i64,8>; consumed only
+                    // via x.shape[i] which is caught in the Index arm below.  Getting the array
+                    // itself is not representable at runtime (no descriptor pointer in the host);
+                    // if this arm is ever reached without an enclosing index the codegen emits 0.
+                    // (Sema already rejected bare .shape / .strides accesses other than .shape[k].)
+                    self.lower_expr(base)?; // lower for side effects (retain counts etc.)
+                    Ok(self.builder.ins().iconst(I64, 0))
                 } else if field == "data" && base.ty.is_variable() {
                     // Variable IS the tensor handle — .data just returns the same i64.
                     self.lower_expr(base)
@@ -1886,6 +1920,186 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                     cl_ty, cranelift_codegen::ir::MemFlags::trusted(), ptr, offset,
                 );
                 Ok(val)
+            }
+
+            // M25: host-side kernel launch — `kernel[grid=[..], tg=[..], out=[..]](tensors, scalars)`.
+            // Lowers to kernel_dispatch_v2(id, handles_ptr, hc, grid_ptr, tg_ptr,
+            //   out_shape_ptr, out_ndim, out_dtype_tag, uniforms_ptr, uniforms_bytes).
+            TypedExprKind::KernelLaunch { kernel, grid, tg, out_shape, tensor_args, scalar_args } => {
+                let kernel_id = *self.codegen.kernel_ids.get(kernel.as_str())
+                    .ok_or_else(|| CodegenError::UnknownKernel { name: kernel.clone() })?;
+
+                // 1. Handles slot: [i64; hc]
+                let hc = tensor_args.len() as u32;
+                let handles_slot = if hc > 0 {
+                    let slot = self.builder.create_sized_stack_slot(
+                        cranelift_codegen::ir::StackSlotData::new(
+                            cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                            hc * 8,
+                            3,
+                        )
+                    );
+                    for (i, ta) in tensor_args.iter().enumerate() {
+                        let v = self.lower_expr(ta)?;
+                        self.builder.ins().stack_store(v, slot, (i as i32) * 8);
+                    }
+                    slot
+                } else {
+                    // Degenerate: create a 1-slot dummy; runtime ignores it when hc==0.
+                    self.builder.create_sized_stack_slot(
+                        cranelift_codegen::ir::StackSlotData::new(
+                            cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                            8,
+                            3,
+                        )
+                    )
+                };
+
+                // 2. Grid slot: [usize; 3]  (each element stored as usize=i64)
+                let grid_slot = self.builder.create_sized_stack_slot(
+                    cranelift_codegen::ir::StackSlotData::new(
+                        cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                        24,
+                        3,
+                    )
+                );
+                {
+                    let grid_ptr_v = self.lower_expr(grid)?;
+                    for dim in 0..3i32 {
+                        let off = self.builder.ins().iconst(self.codegen.ptr_type(), (dim as i64) * 8);
+                        let src = self.builder.ins().iadd(grid_ptr_v, off);
+                        let v = self.builder.ins().load(I64, cranelift_codegen::ir::MemFlags::trusted(), src, 0);
+                        self.builder.ins().stack_store(v, grid_slot, dim * 8);
+                    }
+                }
+
+                // 3. Tg slot: [usize; 3]
+                let tg_slot = self.builder.create_sized_stack_slot(
+                    cranelift_codegen::ir::StackSlotData::new(
+                        cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                        24,
+                        3,
+                    )
+                );
+                {
+                    let tg_ptr_v = self.lower_expr(tg)?;
+                    for dim in 0..3i32 {
+                        let off = self.builder.ins().iconst(self.codegen.ptr_type(), (dim as i64) * 8);
+                        let src = self.builder.ins().iadd(tg_ptr_v, off);
+                        let v = self.builder.ins().load(I64, cranelift_codegen::ir::MemFlags::trusted(), src, 0);
+                        self.builder.ins().stack_store(v, tg_slot, dim * 8);
+                    }
+                }
+
+                // 4. Out shape slot + ndim + dtype_tag.
+                // If out_shape is provided: use it (Array<i64, N>); out_ndim = runtime len from type.
+                // If absent: pass null/0 — runtime uses first input's shape.
+                let (out_shape_ptr, out_ndim_val, out_dtype_val) = if let Some(os) = out_shape {
+                    // The out_shape expr is an Array<i64, 3> (same form as grid/tg).
+                    let os_arr = self.lower_expr(os)?;
+                    let out_slot = self.builder.create_sized_stack_slot(
+                        cranelift_codegen::ir::StackSlotData::new(
+                            cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                            24,
+                            3,
+                        )
+                    );
+                    for dim in 0..3i32 {
+                        let off = self.builder.ins().iconst(self.codegen.ptr_type(), (dim as i64) * 8);
+                        let src = self.builder.ins().iadd(os_arr, off);
+                        let v = self.builder.ins().load(I64, cranelift_codegen::ir::MemFlags::trusted(), src, 0);
+                        self.builder.ins().stack_store(v, out_slot, dim * 8);
+                    }
+                    let ptr_v = self.builder.ins().stack_addr(self.codegen.ptr_type(), out_slot, 0);
+                    // Infer out_ndim by stripping trailing literal-0 dimensions.
+                    // Writing out=[d0, d1, 0] means 2D; out=[d0, 0, 0] means 1D.
+                    // Use 0 (not 1) as the sentinel — a size-0 dimension is impossible;
+                    // keepdim=True can produce trailing-1 dims which must NOT be stripped.
+                    let out_ndim: usize = if let TypedExprKind::ArrayLiteral { elements } = &os.kind {
+                        let mut n = elements.len();
+                        while n > 1 {
+                            if matches!(elements[n-1].kind, TypedExprKind::Lit(malus_syntax::ast::Lit::Int(0))) {
+                                n -= 1;
+                            } else {
+                                break;
+                            }
+                        }
+                        n
+                    } else {
+                        3
+                    };
+                    let ndim_v = self.builder.ins().iconst(self.codegen.ptr_type(), out_ndim as i64);
+                    // dtype from expr's Tensor<dtype>
+                    let dt = match &expr.ty {
+                        ResolvedTy::Tensor { dtype } | ResolvedTy::Variable { dtype } => dtype_tag(dtype),
+                        _ => 0,
+                    };
+                    let dt_v = self.builder.ins().iconst(I32, dt as i64);
+                    (ptr_v, ndim_v, dt_v)
+                } else {
+                    let null_ptr = self.builder.ins().iconst(self.codegen.ptr_type(), 0);
+                    let zero_ndim = self.builder.ins().iconst(self.codegen.ptr_type(), 0);
+                    let dt = match &expr.ty {
+                        ResolvedTy::Tensor { dtype } | ResolvedTy::Variable { dtype } => dtype_tag(dtype),
+                        _ => 0,
+                    };
+                    let dt_v = self.builder.ins().iconst(I32, dt as i64);
+                    (null_ptr, zero_ndim, dt_v)
+                };
+
+                // 5. Uniforms blob: pack scalar_args sequentially (each as f32 or i32/i64).
+                let (uniforms_ptr, uniforms_bytes_val) = if scalar_args.is_empty() {
+                    let null_ptr = self.builder.ins().iconst(self.codegen.ptr_type(), 0);
+                    let zero = self.builder.ins().iconst(self.codegen.ptr_type(), 0);
+                    (null_ptr, zero)
+                } else {
+                    // Each uniform is 4 bytes (f32 or i32); i64 uniforms truncated to i64 (8 bytes).
+                    // Use 8-byte slots for alignment-safety (codegen-gpu packs in declaration order).
+                    let ub = (scalar_args.len() * 4) as u32;
+                    let uni_slot = self.builder.create_sized_stack_slot(
+                        cranelift_codegen::ir::StackSlotData::new(
+                            cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                            ub.max(4),
+                            2,
+                        )
+                    );
+                    let mut byte_off: i32 = 0;
+                    for sa in scalar_args.iter() {
+                        let v = self.lower_expr(sa)?;
+                        match &sa.ty {
+                            ResolvedTy::Scalar(s) if is_float_scalar(s) => {
+                                self.builder.ins().stack_store(v, uni_slot, byte_off);
+                                byte_off += 4;
+                            }
+                            ResolvedTy::Scalar(_) => {
+                                // integer: truncate to i32 and store
+                                let v32 = self.builder.ins().ireduce(I32, v);
+                                self.builder.ins().stack_store(v32, uni_slot, byte_off);
+                                byte_off += 4;
+                            }
+                            _ => return Err(CodegenError::UnsupportedExpr("KernelLaunch: scalar_arg is not a scalar".into())),
+                        }
+                    }
+                    let uni_ptr = self.builder.ins().stack_addr(self.codegen.ptr_type(), uni_slot, 0);
+                    let ub_val = self.builder.ins().iconst(self.codegen.ptr_type(), ub as i64);
+                    (uni_ptr, ub_val)
+                };
+
+                // 6. Call kernel_dispatch_v2.
+                let id_val = self.builder.ins().iconst(I64, kernel_id as i64);
+                let handles_ptr_v = self.builder.ins().stack_addr(self.codegen.ptr_type(), handles_slot, 0);
+                let hc_val = self.builder.ins().iconst(self.codegen.ptr_type(), hc as i64);
+                let grid_ptr_v = self.builder.ins().stack_addr(self.codegen.ptr_type(), grid_slot, 0);
+                let tg_ptr_v = self.builder.ins().stack_addr(self.codegen.ptr_type(), tg_slot, 0);
+
+                let dispatch_ref = self.import_func(self.codegen.rt_kernel_dispatch_v2);
+                let call = self.builder.ins().call(dispatch_ref, &[
+                    id_val, handles_ptr_v, hc_val,
+                    grid_ptr_v, tg_ptr_v,
+                    out_shape_ptr, out_ndim_val, out_dtype_val,
+                    uniforms_ptr, uniforms_bytes_val,
+                ]);
+                Ok(self.builder.inst_results(call).to_vec()[0])
             }
         }
     }
@@ -2697,6 +2911,10 @@ pub fn compile_and_run(
     // M22 rand_int + tensor_get_f32.
     jit_builder.symbol("malus_rand_int",            symbols.malus_rand_int            as *const u8);
     jit_builder.symbol("malus_tensor_get_f32",      symbols.malus_tensor_get_f32      as *const u8);
+    // M25 metadata accessors + kernel_dispatch_v2.
+    jit_builder.symbol("tensor_ndim",              symbols.tensor_ndim               as *const u8);
+    jit_builder.symbol("tensor_dim",               symbols.tensor_dim                as *const u8);
+    jit_builder.symbol("kernel_dispatch_v2",       symbols.kernel_dispatch_v2        as *const u8);
 
     let mut module = JITModule::new(jit_builder);
     let ptr = module.target_config().pointer_type();
@@ -3162,6 +3380,40 @@ pub fn compile_and_run(
     let rt_malus_tensor_get_f32 = module.declare_function("malus_tensor_get_f32", Linkage::Import, &sig_tensor_get_f32)
         .map_err(|e| CodegenError::JitError(e.to_string()))?;
 
+    // M25: tensor_ndim(handle: i64) -> i64  (same as sig_unary_tensor_ret)
+    let rt_tensor_ndim = module.declare_function("tensor_ndim", Linkage::Import, &sig_unary_tensor_ret)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
+    // M25: tensor_dim(handle: i64, i: i64) -> i64
+    let sig_tensor_dim = {
+        let mut s = Signature::new(call_conv);
+        s.params.push(AbiParam::new(I64)); // handle
+        s.params.push(AbiParam::new(I64)); // axis index
+        s.returns.push(AbiParam::new(I64));
+        s
+    };
+    let rt_tensor_dim = module.declare_function("tensor_dim", Linkage::Import, &sig_tensor_dim)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
+    // M25: kernel_dispatch_v2(kernel_id: u64→i64, handles: ptr, handle_count: ptr,
+    //       grid_dims: ptr, tg_dims: ptr, out_shape: ptr, out_ndim: ptr,
+    //       out_dtype_tag: i32, uniforms: ptr, uniforms_bytes: ptr) -> i64
+    let sig_dispatch_v2 = {
+        let mut s = Signature::new(call_conv);
+        s.params.push(AbiParam::new(I64)); // kernel_id (u64 fits in i64)
+        s.params.push(AbiParam::new(ptr)); // handles *const i64
+        s.params.push(AbiParam::new(ptr)); // handle_count usize
+        s.params.push(AbiParam::new(ptr)); // grid_dims *const usize
+        s.params.push(AbiParam::new(ptr)); // tg_dims *const usize
+        s.params.push(AbiParam::new(ptr)); // out_shape *const usize
+        s.params.push(AbiParam::new(ptr)); // out_ndim usize
+        s.params.push(AbiParam::new(I32)); // out_dtype_tag i32
+        s.params.push(AbiParam::new(ptr)); // uniforms *const c_void
+        s.params.push(AbiParam::new(ptr)); // uniforms_bytes usize
+        s.returns.push(AbiParam::new(I64));
+        s
+    };
+    let rt_kernel_dispatch_v2 = module.declare_function("kernel_dispatch_v2", Linkage::Import, &sig_dispatch_v2)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
+
     // First pass: declare all user fn signatures.
     let mut func_ids: HashMap<String, FuncId> = HashMap::new();
     for typed_fn in &program.fns {
@@ -3251,6 +3503,9 @@ pub fn compile_and_run(
         rt_malus_buffer_freeze_i32,
         rt_malus_rand_int,
         rt_malus_tensor_get_f32,
+        rt_tensor_ndim,
+        rt_tensor_dim,
+        rt_kernel_dispatch_v2,
     };
 
     // Second pass: compile each fn body.

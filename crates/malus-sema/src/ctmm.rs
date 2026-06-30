@@ -1264,6 +1264,13 @@ fn collect_idents_in_expr(expr: &crate::typed_ir::TypedExpr, out: &mut HashSet<S
             for e in elements { collect_idents_in_expr(e, out); }
         }
         TypedExprKind::TupleIndex { base, .. } => collect_idents_in_expr(base, out),
+        TypedExprKind::KernelLaunch { grid, tg, out_shape, tensor_args, scalar_args, .. } => {
+            collect_idents_in_expr(grid, out);
+            collect_idents_in_expr(tg, out);
+            if let Some(s) = out_shape { collect_idents_in_expr(s, out); }
+            for a in tensor_args { collect_idents_in_expr(a, out); }
+            for a in scalar_args { collect_idents_in_expr(a, out); }
+        }
         TypedExprKind::Lit(_) => {}
     }
 }

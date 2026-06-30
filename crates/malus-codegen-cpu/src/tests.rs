@@ -368,6 +368,29 @@ extern "C" fn mock_malus_tensor_get_f32(handle: i64, idx: i64) -> f32 {
     with_store(|s| s.tensors.get(&handle).map(|t| t.data[idx as usize]).unwrap_or(0.0))
 }
 
+// M25 metadata accessors.
+extern "C" fn mock_tensor_ndim(handle: i64) -> i64 {
+    with_store(|s| s.get_shape(handle).len()) as i64
+}
+extern "C" fn mock_tensor_dim(handle: i64, i: i64) -> i64 {
+    with_store(|s| s.get_shape(handle).get(i as usize).copied().unwrap_or(0)) as i64
+}
+// M25 kernel_dispatch_v2 — not exercised in CPU-mock tests; returns 0.
+extern "C" fn mock_kernel_dispatch_v2(
+    _kernel_id: u64,
+    _handles: *const i64,
+    _handle_count: usize,
+    _grid: *const usize,
+    _tg: *const usize,
+    _out_shape: *const usize,
+    _out_ndim: usize,
+    _out_dtype_tag: i32,
+    _uniforms: *const std::ffi::c_void,
+    _uniforms_bytes: usize,
+) -> i64 {
+    0
+}
+
 fn mock_symbols() -> RuntimeSymbols {
     RuntimeSymbols {
         tensor_alloc_gpu:       mock_tensor_alloc_gpu,
@@ -433,6 +456,10 @@ fn mock_symbols() -> RuntimeSymbols {
         // M22 rand_int + tensor_get_f32.
         malus_rand_int:            malus_runtime::malus_rand_int,
         malus_tensor_get_f32:      mock_malus_tensor_get_f32,
+        // M25 metadata accessors + kernel_dispatch_v2.
+        tensor_ndim:               mock_tensor_ndim,
+        tensor_dim:                mock_tensor_dim,
+        kernel_dispatch_v2:        mock_kernel_dispatch_v2,
     }
 }
 

@@ -259,6 +259,13 @@ fn collect_binops_in_expr(
             for e in elements { collect_binops_in_expr(e, tensor_ops, scalar_ops); }
         }
         TypedExprKind::TupleIndex { base, .. } => collect_binops_in_expr(base, tensor_ops, scalar_ops),
+        TypedExprKind::KernelLaunch { tensor_args, scalar_args, grid, tg, out_shape, .. } => {
+            for a in tensor_args { collect_binops_in_expr(a, tensor_ops, scalar_ops); }
+            for a in scalar_args { collect_binops_in_expr(a, tensor_ops, scalar_ops); }
+            collect_binops_in_expr(grid, tensor_ops, scalar_ops);
+            collect_binops_in_expr(tg, tensor_ops, scalar_ops);
+            if let Some(os) = out_shape { collect_binops_in_expr(os, tensor_ops, scalar_ops); }
+        }
         TypedExprKind::Lit(_) | TypedExprKind::Ident(_) => {}
     }
 }
@@ -351,6 +358,13 @@ fn collect_unary_builtins_in_expr(expr: &TypedExpr, out: &mut BTreeSet<String>) 
             for e in elements { collect_unary_builtins_in_expr(e, out); }
         }
         TypedExprKind::TupleIndex { base, .. } => collect_unary_builtins_in_expr(base, out),
+        TypedExprKind::KernelLaunch { tensor_args, scalar_args, grid, tg, out_shape, .. } => {
+            for a in tensor_args { collect_unary_builtins_in_expr(a, out); }
+            for a in scalar_args { collect_unary_builtins_in_expr(a, out); }
+            collect_unary_builtins_in_expr(grid, out);
+            collect_unary_builtins_in_expr(tg, out);
+            if let Some(os) = out_shape { collect_unary_builtins_in_expr(os, out); }
+        }
         TypedExprKind::Lit(_) | TypedExprKind::Ident(_) => {}
     }
 }
@@ -668,6 +682,13 @@ fn lower_kernel_explicit(kernel: &TypedKernel, kernel_id: u64) -> Result<String,
         msl_params.push(format!("constant Uniforms_{}& u [[buffer({})]]", kernel_id, out_idx + 1));
     }
 
+    // TensorMeta buffers: inputs at hc+2.., out at hc+2+input_count.
+    // Convention mirrors the runtime's D5 binding (always present; codegen emits for all tensors).
+    for (i, p) in tensor_params.iter().enumerate() {
+        msl_params.push(format!("constant TensorMeta& {}_meta [[buffer({})]]", p.name, out_idx + 2 + i));
+    }
+    msl_params.push(format!("constant TensorMeta& out_meta [[buffer({})]]", out_idx + 2 + tensor_params.len()));
+
     // Thread-position attributes (injected only for intrinsics the body uses).
     for (name, var, attr) in INTRINSIC_ATTR {
         if used_intrinsics.contains(*name) {
@@ -707,8 +728,17 @@ fn lower_kernel_explicit(kernel: &TypedKernel, kernel_id: u64) -> Result<String,
         .collect::<Vec<_>>()
         .join("\n");
 
+    // TensorMeta struct shared across all explicit kernels (D5 ABI).
+    let tensor_meta_struct = "\
+struct TensorMeta {\n    \
+    uint ndim;\n    \
+    uint shape[8];\n    \
+    uint strides[8];\n\
+};\n\n";
+
     let msl = format!(
-        "#include <metal_stdlib>\nusing namespace metal;\n\n{}kernel void {}(\n    {}\n) {{\n{}\n}}\n",
+        "#include <metal_stdlib>\nusing namespace metal;\n\n{}{}kernel void {}(\n    {}\n) {{\n{}\n}}\n",
+        tensor_meta_struct,
         uniforms_struct,
         func_name,
         msl_params.join(",\n    "),
@@ -837,6 +867,17 @@ fn lower_kernel_body_explicit(
     Ok(())
 }
 
+/// Extract the tensor name from a simple Ident expression, for metadata access.
+fn extract_tensor_name(expr: &TypedExpr) -> Result<String, CodegenError> {
+    match &expr.kind {
+        TypedExprKind::Ident(name) => Ok(name.clone()),
+        other => Err(CodegenError::UnsupportedKernelBody(format!(
+            "shape/stride/ndim access requires a simple tensor parameter name, got {:?}",
+            std::mem::discriminant(other)
+        ))),
+    }
+}
+
 /// Lower an expression in the context of an explicit kernel body.
 fn lower_expr_kernel(expr: &TypedExpr, ctx: &KernelCtx) -> Result<String, CodegenError> {
     match &expr.kind {
@@ -876,14 +917,47 @@ fn lower_expr_kernel(expr: &TypedExpr, ctx: &KernelCtx) -> Result<String, Codege
         }
 
         TypedExprKind::Index { base, indices } => {
-            if indices.len() != 1 {
-                return Err(CodegenError::UnsupportedKernelBody(
-                    "multi-dimensional indexing not supported in M24 (use flat index arithmetic)".into(),
-                ));
+            // Detect indexed metadata access: `t.shape[k]`, `t.strides[k]`.
+            if let TypedExprKind::FieldAccess { base: field_base, field } = &base.kind {
+                if field == "shape" || field == "strides" {
+                    if indices.len() != 1 {
+                        return Err(CodegenError::UnsupportedKernelBody(
+                            "shape/strides index must be single-dimensional".into(),
+                        ));
+                    }
+                    let tensor_name = extract_tensor_name(field_base)?;
+                    let meta_name = format!("{}_meta", tensor_name);
+                    let idx_s = lower_expr_kernel(&indices[0], ctx)?;
+                    return Ok(format!("(int){}.{}[{}]", meta_name, field, idx_s));
+                }
+            }
+            // Multi-dim tensor indexing: a[i,j,...] → a[i*strides[0]+j*strides[1]+...]
+            if indices.len() > 1 {
+                let base_name = extract_tensor_name(base)?;
+                let meta_name = format!("{}_meta", base_name);
+                let parts: Result<Vec<_>, _> = indices.iter().enumerate().map(|(dim, idx)| {
+                    let idx_s = lower_expr_kernel(idx, ctx)?;
+                    Ok(format!("({}) * (int){}.strides[{}]", idx_s, meta_name, dim))
+                }).collect();
+                let flat_idx = parts?.join(" + ");
+                return Ok(format!("{}[{}]", base_name, flat_idx));
             }
             let base_s = lower_expr_kernel(base, ctx)?;
             let idx_s = lower_expr_kernel(&indices[0], ctx)?;
             Ok(format!("{}[{}]", base_s, idx_s))
+        }
+
+        TypedExprKind::FieldAccess { base, field } => {
+            // `t.ndim` → `t_meta.ndim`.
+            if field == "ndim" {
+                let tensor_name = extract_tensor_name(base)?;
+                return Ok(format!("(int){}_meta.ndim", tensor_name));
+            }
+            // `.shape` and `.strides` without indexing are not directly emittable;
+            // they are only valid as the base of an Index expression.
+            Err(CodegenError::UnsupportedKernelBody(format!(
+                "field '{}' on tensor must be indexed (e.g. t.shape[i])", field
+            )))
         }
 
         TypedExprKind::Call { callee, args } => {

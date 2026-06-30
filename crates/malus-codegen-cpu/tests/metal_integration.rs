@@ -73,12 +73,19 @@ fn real_symbols() -> RuntimeSymbols {
         // M22 rand_int + tensor_get_f32.
         malus_rand_int:            malus_runtime::malus_rand_int,
         malus_tensor_get_f32:      malus_runtime::malus_tensor_get_f32,
+        // M25 metadata accessors + kernel_dispatch_v2.
+        tensor_ndim:               malus_runtime::tensor_ndim,
+        tensor_dim:                malus_runtime::tensor_dim,
+        kernel_dispatch_v2:        malus_runtime::kernel_dispatch_v2,
     }
 }
 
 fn run_metal_src(src: &str) {
     let _guard = METAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let program = parse(malus_syntax::FileId(0), src).expect("parse failed");
+    let mut user_program = parse(malus_syntax::FileId(0), src).expect("parse failed");
+    let mut stdlib = malus_stdlib::stdlib_items();
+    stdlib.extend(user_program.items.drain(..));
+    let program = malus_syntax::ast::Program { items: stdlib };
     let aliases = HashMap::new();
     let typed = check(&program, &aliases).expect("type check failed");
     let (registry, kernel_ids) =

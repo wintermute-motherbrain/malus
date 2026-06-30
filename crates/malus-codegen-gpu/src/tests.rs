@@ -484,8 +484,8 @@ fn main():
 
     assert!(msl.contains("threadgroup float scratch[1024]"), "shared memory declaration missing");
     assert!(msl.contains("threadgroup_barrier(mem_flags::mem_threadgroup)"), "barrier missing");
-    assert!(msl.contains("for(long i = 1; i < u.cols; i++)"), "for loop (range 1..cols) missing");
-    assert!(msl.contains("for(long j = 0; j < u.cols; j++)"), "for loop (range 0..cols) missing");
+    assert!(msl.contains("for(int i = 1; i < u.cols; i++)"), "for loop (range 1..cols) missing");
+    assert!(msl.contains("for(int j = 0; j < u.cols; j++)"), "for loop (range 0..cols) missing");
     assert!(msl.contains("uint _tgid [[threadgroup_position_in_grid]]"), "threadgroup_id attr missing");
     assert!(msl.contains("uint _lid [[thread_position_in_threadgroup]]"), "thread_in_threadgroup attr missing");
     assert!(msl.contains("struct Uniforms_0"), "uniforms struct missing");

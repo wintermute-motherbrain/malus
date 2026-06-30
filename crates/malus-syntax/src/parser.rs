@@ -728,22 +728,83 @@ impl Parser {
                     let span = Span::new(base.span.file, base.span.start as usize, end.end as usize);
                     base = Expr { kind: ExprKind::Call { callee: Box::new(base), args }, span };
                 }
-                // Index: base[indices]
+                // Index or kernel launch: base[...] or kernel[grid=.., tg=.., out=..](args)
                 TokenKind::LBracket => {
-                    self.advance();
-                    let mut indices = Vec::new();
-                    while !matches!(self.current_kind(), TokenKind::RBracket | TokenKind::Eof) {
-                        indices.push(self.parse_expr()?);
-                        if matches!(self.current_kind(), TokenKind::Comma) {
-                            self.advance();
+                    // Lookahead: kernel launch if base is a plain Ident AND next tokens are
+                    // `Ident` followed by `=` (not `==`). `ident =` cannot appear in an index
+                    // expression (indices are arbitrary expressions, not assignments).
+                    let is_launch = matches!(&base.kind, ExprKind::Ident(_))
+                        && self.pos + 1 < self.tokens.len()
+                        && self.pos + 2 < self.tokens.len()
+                        && matches!(self.tokens[self.pos + 1].kind, TokenKind::Ident(_))
+                        && matches!(self.tokens[self.pos + 2].kind, TokenKind::Eq)
+                        && !matches!(self.tokens.get(self.pos + 3).map(|t| &t.kind), Some(TokenKind::Eq));
+
+                    if is_launch {
+                        let kernel_name = if let ExprKind::Ident(n) = &base.kind {
+                            n.clone()
                         } else {
-                            break;
+                            unreachable!()
+                        };
+                        self.advance(); // consume `[`
+                        let mut config = Vec::new();
+                        while !matches!(self.current_kind(), TokenKind::RBracket | TokenKind::Eof) {
+                            let (key, _) = self.expect_ident()?;
+                            self.expect(&TokenKind::Eq)?;
+                            let val = self.parse_expr()?;
+                            config.push((key, val));
+                            if matches!(self.current_kind(), TokenKind::Comma) {
+                                self.advance();
+                            } else {
+                                break;
+                            }
                         }
+                        self.expect(&TokenKind::RBracket)?;
+                        self.expect(&TokenKind::LParen)?;
+                        let mut args = Vec::new();
+                        while !matches!(self.current_kind(), TokenKind::RParen | TokenKind::Eof) {
+                            let arg = if matches!(self.current_kind(), TokenKind::Ident(_))
+                                && self.pos + 1 < self.tokens.len()
+                                && matches!(self.tokens[self.pos + 1].kind, TokenKind::Eq)
+                            {
+                                let (name, _) = self.expect_ident()?;
+                                self.advance(); // consume `=`
+                                let value = self.parse_expr()?;
+                                CallArg { name: Some(name), value }
+                            } else {
+                                let value = self.parse_expr()?;
+                                CallArg { name: None, value }
+                            };
+                            args.push(arg);
+                            if matches!(self.current_kind(), TokenKind::Comma) {
+                                self.advance();
+                            } else {
+                                break;
+                            }
+                        }
+                        let end = self.current_span();
+                        self.expect(&TokenKind::RParen)?;
+                        let span = Span::new(base.span.file, base.span.start as usize, end.end as usize);
+                        base = Expr {
+                            kind: ExprKind::KernelLaunch { kernel: kernel_name, config, args },
+                            span,
+                        };
+                    } else {
+                        self.advance();
+                        let mut indices = Vec::new();
+                        while !matches!(self.current_kind(), TokenKind::RBracket | TokenKind::Eof) {
+                            indices.push(self.parse_expr()?);
+                            if matches!(self.current_kind(), TokenKind::Comma) {
+                                self.advance();
+                            } else {
+                                break;
+                            }
+                        }
+                        let end = self.current_span();
+                        self.expect(&TokenKind::RBracket)?;
+                        let span = Span::new(base.span.file, base.span.start as usize, end.end as usize);
+                        base = Expr { kind: ExprKind::Index { base: Box::new(base), indices }, span };
                     }
-                    let end = self.current_span();
-                    self.expect(&TokenKind::RBracket)?;
-                    let span = Span::new(base.span.file, base.span.start as usize, end.end as usize);
-                    base = Expr { kind: ExprKind::Index { base: Box::new(base), indices }, span };
                 }
                 // Field / method access: base.name, base.0, or Tensor.gpu<dtype>([...])
                 TokenKind::Dot => {

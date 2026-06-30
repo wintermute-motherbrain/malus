@@ -202,6 +202,16 @@ fn print_expr(expr: &Expr) -> String {
         ExprKind::TupleIndex { base, index } => {
             format!("{}.{}", print_expr(base), index)
         }
+        ExprKind::KernelLaunch { kernel, config, args } => {
+            let config_str = config.iter().map(|(k, v)| format!("{}={}", k, print_expr(v))).collect::<Vec<_>>().join(", ");
+            let args_str = args.iter().map(|a| {
+                match &a.name {
+                    Some(n) => format!("{}={}", n, print_expr(&a.value)),
+                    None => print_expr(&a.value),
+                }
+            }).collect::<Vec<_>>().join(", ");
+            format!("{}[{}]({})", kernel, config_str, args_str)
+        }
     }
 }
 
@@ -480,6 +490,11 @@ mod tests {
             ExprKind::TupleIndex { base, index } => ExprKind::TupleIndex {
                 base: Box::new(erase_expr(*base, z)),
                 index,
+            },
+            ExprKind::KernelLaunch { kernel, config, args } => ExprKind::KernelLaunch {
+                kernel,
+                config: config.into_iter().map(|(k, v)| (k, erase_expr(v, z))).collect(),
+                args: args.into_iter().map(|a| CallArg { value: erase_expr(a.value, z), ..a }).collect(),
             },
         };
         Expr { kind, span: z }

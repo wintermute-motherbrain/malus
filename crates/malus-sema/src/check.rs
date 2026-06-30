@@ -705,6 +705,8 @@ fn check_expr(
         ExprKind::FieldAccess { base, field } => check_field_access(base, field, expr.span, ctx),
         ExprKind::Tuple(elements) => check_tuple(elements, expr.span, ctx),
         ExprKind::TupleIndex { base, index } => check_tuple_index(base, *index, expr.span, ctx),
+        ExprKind::KernelLaunch { kernel, config, args } =>
+            check_kernel_launch(kernel, config, args, expr.span, ctx),
     }
 }
 
@@ -712,13 +714,17 @@ fn check_lit(
     lit: &Lit,
     expected: Option<&ResolvedTy>,
     span: Span,
-    _ctx: &mut BodyCtx<'_>,
+    ctx: &mut BodyCtx<'_>,
 ) -> Option<TypedExpr> {
     let ty = match lit {
         Lit::Int(_) => {
             // Coerce to float if expected type is a float scalar — lossless widening.
+            // In kernel bodies, integer literals default to I32 (matching thread intrinsics
+            // and scalar uniform params declared as i32). In fn bodies, default to I64.
             match expected {
                 Some(ResolvedTy::Scalar(s)) if is_float_scalar(s) => ResolvedTy::Scalar(s.clone()),
+                Some(ResolvedTy::Scalar(ScalarTy::I32)) => ResolvedTy::Scalar(ScalarTy::I32),
+                _ if ctx.in_kernel => ResolvedTy::Scalar(ScalarTy::I32),
                 _ => ResolvedTy::Scalar(ScalarTy::I64),
             }
         }
@@ -1460,13 +1466,12 @@ fn check_reduction_call(
         }
     };
 
-    let checked_axis = check_expr(axis_raw, Some(&ResolvedTy::Scalar(ScalarTy::I32)), ctx)?;
+    // Runtime ABI uses i64 for axis and keepdim; hint I64 so check_lit produces I64.
+    let checked_axis = check_expr(axis_raw, Some(&ResolvedTy::Scalar(ScalarTy::I64)), ctx)?;
 
-    // keepdim defaults to 0 (false).
-    // Scalar(I64) because check_lit always returns I64 for int literals regardless of hint,
-    // so the explicit-keepdim and default-keepdim paths agree on type.
+    // keepdim defaults to 0 (false); I64 throughout to match runtime sig and the default path.
     let checked_keepdim = if let Some(kd) = keepdim_raw {
-        check_expr(kd, Some(&ResolvedTy::Scalar(ScalarTy::I32)), ctx)?
+        check_expr(kd, Some(&ResolvedTy::Scalar(ScalarTy::I64)), ctx)?
     } else {
         typed_expr(
             TypedExprKind::Lit(Lit::Int(0)),
@@ -1565,7 +1570,8 @@ fn check_axis_only_call(
 
     let checked_tensor = check_expr(tensor_raw, Some(&tensor_f32), ctx)?;
     let is_variable = checked_tensor.ty.is_variable();
-    let checked_axis = check_expr(axis_raw, Some(&ResolvedTy::Scalar(ScalarTy::I32)), ctx)?;
+    // Runtime ABI uses i64 for axis; hint I64 so check_lit produces I64.
+    let checked_axis = check_expr(axis_raw, Some(&ResolvedTy::Scalar(ScalarTy::I64)), ctx)?;
 
     let return_ty = if is_variable {
         if let ResolvedTy::Variable { dtype } = &checked_tensor.ty {
@@ -1713,20 +1719,19 @@ fn check_index(
             span,
         ));
     }
-    // Tensor<f32>[i] → Scalar(F32)  (flat row-major read; gpu_barrier inserted by CTMM before use)
+    // Tensor<dtype>[i] → Scalar(dtype)  (flat row-major read; covers f32, i32, i64, etc.)
     if let ResolvedTy::Tensor { dtype } = &tbase.ty.clone() {
-        if *dtype == ScalarTy::F32 {
-            let mut typed_indices: Vec<TypedExpr> = Vec::new();
-            for idx in indices {
-                typed_indices.push(check_expr(idx, Some(&ResolvedTy::Scalar(ScalarTy::I64)), ctx)?);
-            }
-            return Some(typed_expr(
-                TypedExprKind::Index { base: Box::new(tbase), indices: typed_indices },
-                ResolvedTy::Scalar(ScalarTy::F32),
-                None,
-                span,
-            ));
+        let elem_ty = ResolvedTy::Scalar(dtype.clone());
+        let mut typed_indices: Vec<TypedExpr> = Vec::new();
+        for idx in indices {
+            typed_indices.push(check_expr(idx, Some(&ResolvedTy::Scalar(ScalarTy::I64)), ctx)?);
         }
+        return Some(typed_expr(
+            TypedExprKind::Index { base: Box::new(tbase), indices: typed_indices },
+            elem_ty,
+            None,
+            span,
+        ));
     }
     let ty = tbase.ty.clone();
     let placement = tbase.placement;
@@ -1804,6 +1809,31 @@ fn check_field_access(
             TypedExprKind::FieldAccess { base: Box::new(tbase), field: field.to_string() },
             ResolvedTy::Scalar(ScalarTy::I64),
             None,
+            span,
+        ));
+    }
+
+    // .ndim on a tensor or variable → Scalar(I64) in fn bodies, Scalar(I32) in kernel bodies.
+    // Kernel bodies use I32 to match thread intrinsics and scalar uniform params.
+    if field == "ndim" && (tbase.ty.is_tensor() || tbase.ty.is_variable()) {
+        let idx_ty = if ctx.in_kernel { ScalarTy::I32 } else { ScalarTy::I64 };
+        return Some(typed_expr(
+            TypedExprKind::FieldAccess { base: Box::new(tbase), field: field.to_string() },
+            ResolvedTy::Scalar(idx_ty),
+            None,
+            span,
+        ));
+    }
+
+    // .shape and .strides are valid only when immediately indexed (t.shape[i], t.strides[i]).
+    // In fn bodies, element type is I64. In kernel bodies, I32 (matching thread intrinsics).
+    if (field == "shape" || field == "strides") && (tbase.ty.is_tensor() || tbase.ty.is_variable()) {
+        let placement = tbase.placement;
+        let idx_ty = if ctx.in_kernel { ScalarTy::I32 } else { ScalarTy::I64 };
+        return Some(typed_expr(
+            TypedExprKind::FieldAccess { base: Box::new(tbase), field: field.to_string() },
+            ResolvedTy::Array { elem: Box::new(ResolvedTy::Scalar(idx_ty)), len: 8 },
+            placement,
             span,
         ));
     }
@@ -1926,6 +1956,133 @@ fn check_tuple_index(
             None
         }
     }
+}
+
+// ── M25 kernel launch expression ─────────────────────────────────────────────
+
+fn check_kernel_launch(
+    kernel_name: &str,
+    config: &[(String, malus_syntax::ast::Expr)],
+    args: &[CallArg],
+    span: Span,
+    ctx: &mut BodyCtx<'_>,
+) -> Option<TypedExpr> {
+    // Kernel launches are only valid in fn bodies, not inside kernel bodies.
+    if ctx.in_kernel {
+        ctx.errors.push(SemaError::KernelLaunchInsideKernel { span });
+        return None;
+    }
+
+    // Look up the kernel signature.
+    let ksig = match ctx.env.kernels.get(kernel_name) {
+        Some(s) => s.clone(),
+        None => {
+            ctx.errors.push(SemaError::UnknownKernel { name: kernel_name.to_string(), span });
+            return None;
+        }
+    };
+
+    // Extract and type-check config entries: grid (required), tg (required), out (optional).
+    let mut grid_expr: Option<malus_syntax::ast::Expr> = None;
+    let mut tg_expr: Option<malus_syntax::ast::Expr> = None;
+    let mut out_expr: Option<malus_syntax::ast::Expr> = None;
+    for (key, val) in config {
+        match key.as_str() {
+            "grid" => grid_expr = Some(val.clone()),
+            "tg"   => tg_expr   = Some(val.clone()),
+            "out"  => out_expr  = Some(val.clone()),
+            other => {
+                // Unknown key — ignore with a note (future-proofing); just emit a mismatch.
+                ctx.errors.push(SemaError::UnknownReductionArg { name: other.to_string(), span });
+            }
+        }
+    }
+    let grid_ast = match grid_expr {
+        Some(e) => e,
+        None => {
+            ctx.errors.push(SemaError::MissingLaunchConfig { key: "grid".to_string(), span });
+            return None;
+        }
+    };
+    let tg_ast = match tg_expr {
+        Some(e) => e,
+        None => {
+            ctx.errors.push(SemaError::MissingLaunchConfig { key: "tg".to_string(), span });
+            return None;
+        }
+    };
+
+    // Type-check config expressions; they must produce Array<i64,3>.
+    let array3_i64 = ResolvedTy::Array {
+        elem: Box::new(ResolvedTy::Scalar(ScalarTy::I64)),
+        len: 3,
+    };
+    let tgrid = check_expr(&grid_ast, Some(&array3_i64), ctx)?;
+    let ttg   = check_expr(&tg_ast,   Some(&array3_i64), ctx)?;
+    let tout_shape = if let Some(e) = out_expr.as_ref() {
+        Some(check_expr(e, Some(&array3_i64), ctx)?)
+    } else {
+        None
+    };
+
+    // Partition kernel params into tensor params and scalar params (declaration order).
+    let tensor_params: Vec<&KernelParamSig> = ksig.params.iter().filter(|p| p.ty.is_tensor() || p.ty.is_variable()).collect();
+    let scalar_params: Vec<&KernelParamSig> = ksig.params.iter().filter(|p| matches!(p.ty, ResolvedTy::Scalar(_))).collect();
+
+    // Check positional runtime args match the kernel params (tensors then scalars).
+    if args.len() != tensor_params.len() + scalar_params.len() {
+        ctx.errors.push(SemaError::ArgCountMismatch {
+            callee: kernel_name.to_string(),
+            expected: tensor_params.len() + scalar_params.len(),
+            found: args.len(),
+            span,
+        });
+        return None;
+    }
+
+    let mut tensor_args: Vec<TypedExpr> = Vec::new();
+    let mut scalar_args: Vec<TypedExpr> = Vec::new();
+
+    for (i, arg) in args.iter().enumerate() {
+        if i < tensor_params.len() {
+            let expected = &tensor_params[i].ty;
+            let ta = check_expr(&arg.value, Some(expected), ctx)?;
+            tensor_args.push(ta);
+        } else {
+            let j = i - tensor_params.len();
+            let expected = &scalar_params[j].ty;
+            let ta = check_expr(&arg.value, Some(expected), ctx)?;
+            scalar_args.push(ta);
+        }
+    }
+
+    // Result type = kernel return type as a GPU tensor.
+    let result_dtype = match &ksig.return_ty {
+        ResolvedTy::Tensor { dtype } => dtype.clone(),
+        other => {
+            ctx.errors.push(SemaError::TypeMismatch {
+                expected: ResolvedTy::Tensor { dtype: ScalarTy::F32 },
+                found: other.clone(),
+                span,
+            });
+            return None;
+        }
+    };
+    let result_ty = ResolvedTy::Tensor { dtype: result_dtype };
+
+    Some(typed_expr(
+        TypedExprKind::KernelLaunch {
+            kernel: kernel_name.to_string(),
+            grid: Box::new(tgrid),
+            tg: Box::new(ttg),
+            out_shape: tout_shape.map(Box::new),
+            tensor_args,
+            scalar_args,
+        },
+        result_ty,
+        Some(Placement::Gpu),
+        span,
+    ))
 }
 
 // ── Callee resolution from expression ────────────────────────────────────────

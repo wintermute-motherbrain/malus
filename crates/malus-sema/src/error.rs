@@ -82,6 +82,15 @@ pub enum SemaError {
     KernelIntrinsicOutsideKernel { name: String, span: Span },
     /// `out[i]=e` tensor indexed assignment outside a kernel body.
     TensorIndexAssignOutsideKernel { span: Span },
+    // ── M25: kernel launch expression ───────────────────────────────────────────
+    /// `kernel_name[...]()` — no kernel with that name exists.
+    UnknownKernel { name: String, span: Span },
+    /// Required launch config key (`grid` or `tg`) is missing.
+    MissingLaunchConfig { key: String, span: Span },
+    /// Launch config expression is not an array of 3 integer elements.
+    InvalidLaunchConfigShape { key: String, span: Span },
+    /// Kernel launch called from inside a kernel body (not allowed).
+    KernelLaunchInsideKernel { span: Span },
 }
 
 impl SemaError {
@@ -132,7 +141,11 @@ impl SemaError {
             | PowOperatorScalarOnly { span }
             | LetSharedOutsideKernel { span }
             | KernelIntrinsicOutsideKernel { span, .. }
-            | TensorIndexAssignOutsideKernel { span } => Some(*span),
+            | TensorIndexAssignOutsideKernel { span }
+            | UnknownKernel { span, .. }
+            | MissingLaunchConfig { span, .. }
+            | InvalidLaunchConfigShape { span, .. }
+            | KernelLaunchInsideKernel { span } => Some(*span),
             DuplicateDefinition { second, .. } | DuplicateTypeDefinition { second, .. } => Some(*second),
             MainNotFound => None,
         }
@@ -196,6 +209,10 @@ impl SemaError {
             LetSharedOutsideKernel { .. } => "`let shared` only valid inside a kernel body",
             KernelIntrinsicOutsideKernel { .. } => "thread intrinsic only valid inside a kernel body",
             TensorIndexAssignOutsideKernel { .. } => "tensor indexed assignment only valid inside a kernel body",
+            UnknownKernel { .. } => "no kernel with this name",
+            MissingLaunchConfig { .. } => "required launch config key missing",
+            InvalidLaunchConfigShape { .. } => "launch config must be a 3-element array literal",
+            KernelLaunchInsideKernel { .. } => "kernel launches not allowed inside a kernel body",
             MainNotFound => "",
         }
     }
@@ -318,6 +335,14 @@ impl fmt::Display for SemaError {
                 write!(f, "thread intrinsic '{}' is only valid inside a kernel body", name),
             SemaError::TensorIndexAssignOutsideKernel { .. } =>
                 write!(f, "tensor indexed assignment `out[i]=e` is only valid inside a kernel body"),
+            SemaError::UnknownKernel { name, .. } =>
+                write!(f, "no kernel named '{}'", name),
+            SemaError::MissingLaunchConfig { key, .. } =>
+                write!(f, "kernel launch requires a `{}=[gx,gy,gz]` config entry", key),
+            SemaError::InvalidLaunchConfigShape { key, .. } =>
+                write!(f, "launch config `{}` must be an array literal with exactly 3 elements", key),
+            SemaError::KernelLaunchInsideKernel { .. } =>
+                write!(f, "kernel launch expressions are only valid inside `fn` bodies, not inside `kernel` bodies"),
         }
     }
 }

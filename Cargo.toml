@@ -6,6 +6,7 @@ members = [
     "crates/malus-codegen-cpu",
     "crates/malus-codegen-gpu",
     "crates/malus-runtime",
+    "crates/malus-stdlib",
     "crates/malus-cli",
 ]
 resolver = "2"

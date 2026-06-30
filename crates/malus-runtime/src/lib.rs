@@ -44,6 +44,8 @@ pub use buffer::{
 pub use metal::{
     runtime_init, tensor_alloc_gpu, tensor_alloc_zeros_gpu, tensor_alloc_ones_gpu,
     tensor_retain, tensor_release, tensor_free, tensor_print, tensor_len,
+    // M25 — metadata accessors (no cpu_compute_inc)
+    tensor_ndim, tensor_dim,
     tensor_matmul, tensor_matmul_cpu, tensor_transpose, tensor_sum,
     tensor_broadcast_add, tensor_broadcast_sub, tensor_broadcast_mul, tensor_broadcast_div,
     tensor_reduce_sum_axis, tensor_reduce_mean_axis, tensor_reduce_max_axis, tensor_reduce_var_axis,
