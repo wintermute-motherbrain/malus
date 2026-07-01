@@ -5,6 +5,10 @@ use malus_syntax::FileId;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+mod lint;
+#[cfg(test)]
+mod tests;
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {

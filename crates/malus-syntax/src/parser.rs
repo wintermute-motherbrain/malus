@@ -172,6 +172,14 @@ impl Parser {
                 return Ok(Ty::Array { elem: Box::new(elem), len });
             }
 
+            if name == "List" {
+                self.advance();
+                self.expect(&TokenKind::Lt)?;
+                let elem = self.parse_type()?;
+                self.expect(&TokenKind::Gt)?;
+                return Ok(Ty::List { elem: Box::new(elem) });
+            }
+
             // Scalar type
             if let Some(s) = Self::parse_scalar_ty(&name) {
                 self.advance();
@@ -225,15 +233,29 @@ impl Parser {
                 false
             };
             let (name, _) = self.expect_ident()?;
-            self.expect(&TokenKind::Colon)?;
-            let ty = self.parse_type()?;
-            let end = self.current_span();
-            params.push(Param {
-                name,
-                ty,
-                is_mut,
-                span: Span::new(start.file, start.start as usize, end.start as usize),
-            });
+            // Bare `self` (M28 trait/impl method receiver): no `: Type` annotation.
+            // Only recognized when NOT followed by `:` — an ordinary parameter named
+            // `self` with an explicit type still parses as a normal (non-receiver) param,
+            // though sema will reject `self` as a non-receiver binding name.
+            if name == "self" && !matches!(self.current_kind(), TokenKind::Colon) {
+                let end = self.current_span();
+                params.push(Param {
+                    name,
+                    ty: Ty::SelfType,
+                    is_mut,
+                    span: Span::new(start.file, start.start as usize, end.start as usize),
+                });
+            } else {
+                self.expect(&TokenKind::Colon)?;
+                let ty = self.parse_type()?;
+                let end = self.current_span();
+                params.push(Param {
+                    name,
+                    ty,
+                    is_mut,
+                    span: Span::new(start.file, start.start as usize, end.start as usize),
+                });
+            }
             if matches!(self.current_kind(), TokenKind::Comma) {
                 self.advance();
             } else {
@@ -1023,6 +1045,7 @@ impl Parser {
         let start = self.current_span();
         self.expect(&TokenKind::Fn)?;
         let (name, _) = self.expect_ident()?;
+        let type_params = self.parse_type_params()?;
         let params = self.parse_params()?;
         let return_ty = if matches!(self.current_kind(), TokenKind::Arrow) {
             self.advance();
@@ -1034,7 +1057,124 @@ impl Parser {
         let body = self.parse_body()?;
         let end = self.current_span();
         Ok(Item {
-            kind: ItemKind::Fn { name, params, return_ty, body },
+            kind: ItemKind::Fn { name, type_params, params, return_ty, body },
+            span: Span::new(start.file, start.start as usize, end.start as usize),
+        })
+    }
+
+    /// `<T: Bound, ...>` — generic type-parameter list on a `fn` item (M28). Absent
+    /// entirely for a non-generic fn. The parser accepts any number of comma-separated
+    /// params; sema enforces the V4 fence of exactly one type parameter per item.
+    fn parse_type_params(&mut self) -> Result<Vec<TypeParam>, ParseError> {
+        if !matches!(self.current_kind(), TokenKind::Lt) {
+            return Ok(Vec::new());
+        }
+        self.advance(); // consume '<'
+        let mut type_params = Vec::new();
+        while !matches!(self.current_kind(), TokenKind::Gt | TokenKind::Eof) {
+            let start = self.current_span();
+            let (name, _) = self.expect_ident()?;
+            let bound = if matches!(self.current_kind(), TokenKind::Colon) {
+                self.advance();
+                let (bound_name, _) = self.expect_ident()?;
+                Some(bound_name)
+            } else {
+                None
+            };
+            let end = self.current_span();
+            type_params.push(TypeParam {
+                name,
+                bound,
+                span: Span::new(start.file, start.start as usize, end.start as usize),
+            });
+            if matches!(self.current_kind(), TokenKind::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        self.expect(&TokenKind::Gt)?;
+        Ok(type_params)
+    }
+
+    fn parse_trait(&mut self) -> Result<Item, ParseError> {
+        let start = self.current_span();
+        self.expect(&TokenKind::Trait)?;
+        let (name, _) = self.expect_ident()?;
+        self.expect(&TokenKind::Colon)?;
+        self.expect(&TokenKind::Newline)?;
+        if !matches!(self.current_kind(), TokenKind::Indent) {
+            return Err(ParseError::new("expected indented trait methods", self.current_span()));
+        }
+        self.advance(); // consume INDENT
+        let mut methods = Vec::new();
+        loop {
+            self.skip_newlines();
+            if matches!(self.current_kind(), TokenKind::Dedent | TokenKind::Eof) {
+                break;
+            }
+            let m_start = self.current_span();
+            self.expect(&TokenKind::Fn)?;
+            let (mname, _) = self.expect_ident()?;
+            let params = self.parse_params()?;
+            let return_ty = if matches!(self.current_kind(), TokenKind::Arrow) {
+                self.advance();
+                Some(self.parse_type()?)
+            } else {
+                None
+            };
+            let m_end = self.current_span();
+            self.expect_newline_or_eof()?;
+            methods.push(TraitMethodSig {
+                name: mname,
+                params,
+                return_ty,
+                span: Span::new(m_start.file, m_start.start as usize, m_end.start as usize),
+            });
+        }
+        if matches!(self.current_kind(), TokenKind::Dedent) {
+            self.advance(); // consume DEDENT
+        }
+        if methods.is_empty() {
+            return Err(ParseError::new("trait must have at least one method", self.current_span()));
+        }
+        let end = self.current_span();
+        Ok(Item {
+            kind: ItemKind::Trait { name, methods },
+            span: Span::new(start.file, start.start as usize, end.start as usize),
+        })
+    }
+
+    fn parse_impl(&mut self) -> Result<Item, ParseError> {
+        let start = self.current_span();
+        self.expect(&TokenKind::Impl)?;
+        let (trait_name, _) = self.expect_ident()?;
+        // `for` is a keyword already lexed as TokenKind::For (used in `for` loops).
+        self.expect(&TokenKind::For)?;
+        let (for_type, _) = self.expect_ident()?;
+        self.expect(&TokenKind::Colon)?;
+        self.expect(&TokenKind::Newline)?;
+        if !matches!(self.current_kind(), TokenKind::Indent) {
+            return Err(ParseError::new("expected indented impl methods", self.current_span()));
+        }
+        self.advance(); // consume INDENT
+        let mut methods = Vec::new();
+        loop {
+            self.skip_newlines();
+            if matches!(self.current_kind(), TokenKind::Dedent | TokenKind::Eof) {
+                break;
+            }
+            methods.push(self.parse_fn()?);
+        }
+        if matches!(self.current_kind(), TokenKind::Dedent) {
+            self.advance(); // consume DEDENT
+        }
+        if methods.is_empty() {
+            return Err(ParseError::new("impl block must have at least one method", self.current_span()));
+        }
+        let end = self.current_span();
+        Ok(Item {
+            kind: ItemKind::Impl { trait_name, for_type, methods },
             span: Span::new(start.file, start.start as usize, end.start as usize),
         })
     }
@@ -1172,19 +1312,21 @@ impl Parser {
             self.skip_newlines();
         }
 
-        // Phase 2: fn, kernel, struct, and enum definitions.
+        // Phase 2: fn, kernel, struct, enum, trait, and impl definitions.
         while !self.at_end() {
             match self.current_kind() {
                 TokenKind::Fn     => items.push(self.parse_fn()?),
                 TokenKind::Kernel => items.push(self.parse_kernel()?),
                 TokenKind::Struct => items.push(self.parse_struct()?),
                 TokenKind::Enum   => items.push(self.parse_enum()?),
+                TokenKind::Trait  => items.push(self.parse_trait()?),
+                TokenKind::Impl   => items.push(self.parse_impl()?),
                 TokenKind::Import | TokenKind::From => return Err(ParseError::new(
                     "import declarations must appear before function and kernel definitions",
                     self.current_span(),
                 )),
                 _ => return Err(ParseError::new(
-                    format!("expected 'fn', 'kernel', 'struct', or 'enum', got {:?}", self.current_kind()),
+                    format!("expected 'fn', 'kernel', 'struct', 'enum', 'trait', or 'impl', got {:?}", self.current_kind()),
                     self.current_span(),
                 )),
             }
@@ -1618,5 +1760,95 @@ mod tests {
         let prog = parse_ok(src);
         let ItemKind::Fn { params, .. } = &prog.items[0].kind else { panic!() };
         assert!(matches!(params[0].ty, Ty::Array { len: 3, .. }));
+    }
+
+    // ── M28: generics, trait/impl, List<T>, self ────────────────────────────────
+
+    #[test]
+    fn parse_list_type() {
+        let src = "fn f(xs: List<Tensor<f32>>):\n    return xs[0]\n";
+        let prog = parse_ok(src);
+        let ItemKind::Fn { params, .. } = &prog.items[0].kind else { panic!() };
+        match &params[0].ty {
+            Ty::List { elem } => assert!(matches!(**elem, Ty::Tensor { .. })),
+            other => panic!("expected List type, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_generic_fn_no_bound() {
+        let src = "fn id<T>(x: T) -> T:\n    return x\n";
+        let prog = parse_ok(src);
+        let ItemKind::Fn { type_params, params, .. } = &prog.items[0].kind else { panic!() };
+        assert_eq!(type_params.len(), 1);
+        assert_eq!(type_params[0].name, "T");
+        assert_eq!(type_params[0].bound, None);
+        assert!(matches!(&params[0].ty, Ty::Named(n) if n == "T"));
+    }
+
+    #[test]
+    fn parse_generic_fn_with_bound() {
+        let src = "fn adamw<M: Module>(model: M):\n    return 0\n";
+        let prog = parse_ok(src);
+        let ItemKind::Fn { type_params, .. } = &prog.items[0].kind else { panic!() };
+        assert_eq!(type_params.len(), 1);
+        assert_eq!(type_params[0].name, "M");
+        assert_eq!(type_params[0].bound, Some("Module".to_string()));
+    }
+
+    #[test]
+    fn non_generic_fn_has_empty_type_params() {
+        let src = "fn f():\n    return 0\n";
+        let prog = parse_ok(src);
+        let ItemKind::Fn { type_params, .. } = &prog.items[0].kind else { panic!() };
+        assert!(type_params.is_empty());
+    }
+
+    #[test]
+    fn parse_trait_def() {
+        let src = "trait Module:\n    fn parameters(self) -> List<Tensor<f32>>\n";
+        let prog = parse_ok(src);
+        let ItemKind::Trait { name, methods } = &prog.items[0].kind else { panic!() };
+        assert_eq!(name, "Module");
+        assert_eq!(methods.len(), 1);
+        assert_eq!(methods[0].name, "parameters");
+        assert_eq!(methods[0].params.len(), 1);
+        assert_eq!(methods[0].params[0].name, "self");
+        assert!(matches!(methods[0].params[0].ty, Ty::SelfType));
+        assert!(matches!(&methods[0].return_ty, Some(Ty::List { .. })));
+    }
+
+    #[test]
+    fn parse_impl_block() {
+        let src = "struct GPT:\n    params: List<Tensor<f32>>\n\n\
+                    impl Module for GPT:\n    \
+                    fn parameters(self) -> List<Tensor<f32>>:\n        \
+                    return self.params\n";
+        let prog = parse_ok(src);
+        let ItemKind::Impl { trait_name, for_type, methods } = &prog.items[1].kind else { panic!() };
+        assert_eq!(trait_name, "Module");
+        assert_eq!(for_type, "GPT");
+        assert_eq!(methods.len(), 1);
+        let ItemKind::Fn { name, params, .. } = &methods[0].kind else { panic!() };
+        assert_eq!(name, "parameters");
+        assert_eq!(params[0].name, "self");
+        assert!(matches!(params[0].ty, Ty::SelfType));
+    }
+
+    #[test]
+    fn self_param_only_recognized_without_type_annotation() {
+        // `self: Foo` is a normal (non-receiver) param — no special-casing.
+        let src = "fn f(self: i64):\n    return self\n";
+        let prog = parse_ok(src);
+        let ItemKind::Fn { params, .. } = &prog.items[0].kind else { panic!() };
+        assert!(matches!(params[0].ty, Ty::Scalar(ScalarTy::I64)));
+    }
+
+    #[test]
+    fn trait_method_body_is_rejected() {
+        // Trait method signatures have no body — a colon+body after the signature
+        // is not part of the trait grammar (bodies belong to `impl` methods only).
+        let src = "trait Module:\n    fn parameters(self) -> List<Tensor<f32>>:\n        return self\n";
+        assert!(parse(FileId(0), src).is_err());
     }
 }

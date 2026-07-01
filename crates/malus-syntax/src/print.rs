@@ -30,10 +30,11 @@ fn print_item(out: &mut String, item: &Item) {
             let name_list: Vec<&str> = names.iter().map(|(n, _)| n.as_str()).collect();
             writeln!(out, "from {} import {}", path.segments.join("."), name_list.join(", ")).unwrap();
         }
-        ItemKind::Fn { name, params, return_ty, body } => {
+        ItemKind::Fn { name, type_params, params, return_ty, body } => {
+            let tp_str = print_type_params(type_params);
             let params_str = params.iter().map(print_param).collect::<Vec<_>>().join(", ");
             let ret = return_ty.as_ref().map(|t| format!(" -> {}", print_ty(t))).unwrap_or_default();
-            writeln!(out, "fn {name}({params_str}){ret}:").unwrap();
+            writeln!(out, "fn {name}{tp_str}({params_str}){ret}:").unwrap();
             for stmt in body {
                 print_stmt(out, stmt, 1);
             }
@@ -65,7 +66,40 @@ fn print_item(out: &mut String, item: &Item) {
                 }
             }
         }
+        ItemKind::Trait { name, methods } => {
+            writeln!(out, "trait {name}:").unwrap();
+            for m in methods {
+                let params_str = m.params.iter().map(print_param).collect::<Vec<_>>().join(", ");
+                let ret = m.return_ty.as_ref().map(|t| format!(" -> {}", print_ty(t))).unwrap_or_default();
+                writeln!(out, "    fn {}({params_str}){ret}", m.name).unwrap();
+            }
+        }
+        ItemKind::Impl { trait_name, for_type, methods } => {
+            writeln!(out, "impl {trait_name} for {for_type}:").unwrap();
+            for m in methods {
+                let mut inner = String::new();
+                print_item(&mut inner, m);
+                for line in inner.lines() {
+                    writeln!(out, "    {line}").unwrap();
+                }
+            }
+        }
     }
+}
+
+fn print_type_params(type_params: &[TypeParam]) -> String {
+    if type_params.is_empty() {
+        return String::new();
+    }
+    let inner = type_params
+        .iter()
+        .map(|tp| match &tp.bound {
+            Some(b) => format!("{}: {}", tp.name, b),
+            None => tp.name.clone(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("<{inner}>")
 }
 
 // ── Statements ────────────────────────────────────────────────────────────────
@@ -294,6 +328,8 @@ fn print_ty(ty: &Ty) -> String {
         }
         Ty::Array { elem, len } => format!("Array<{}, {}>", print_ty(elem), len),
         Ty::Buffer { dtype } => format!("Buffer<{}>", print_scalar_ty(dtype)),
+        Ty::List { elem } => format!("List<{}>", print_ty(elem)),
+        Ty::SelfType => "Self".to_string(),
     }
 }
 
@@ -316,6 +352,9 @@ fn print_scalar_ty(s: &ScalarTy) -> &'static str {
 // ── Parameters ────────────────────────────────────────────────────────────────
 
 fn print_param(p: &Param) -> String {
+    if matches!(p.ty, Ty::SelfType) {
+        return p.name.clone();
+    }
     format!("{}: {}", p.name, print_ty(&p.ty))
 }
 
@@ -346,44 +385,67 @@ mod tests {
         Program {
             items: prog.items.into_iter().map(|item| Item {
                 span: z,
-                kind: match item.kind {
-                    ItemKind::Import { path } =>
-                        ItemKind::Import { path: ModulePath { span: z, ..path } },
-                    ItemKind::FromImport { path, names } =>
-                        ItemKind::FromImport {
-                            path: ModulePath { span: z, ..path },
-                            names: names.into_iter().map(|(n, _)| (n, z)).collect(),
-                        },
-                    ItemKind::Fn { name, params, return_ty, body } =>
-                        ItemKind::Fn {
-                            name,
-                            params: params.into_iter().map(|p| Param { span: z, ..p }).collect(),
-                            return_ty,
-                            body: body.into_iter().map(|s| erase_stmt(s, z)).collect(),
-                        },
-                    ItemKind::Kernel { name, params, return_ty, body } =>
-                        ItemKind::Kernel {
-                            name,
-                            params: params.into_iter().map(|p| KernelParam { span: z, ..p }).collect(),
-                            return_ty,
-                            body: body.into_iter().map(|s| erase_stmt(s, z)).collect(),
-                        },
-                    ItemKind::Struct { name, fields } =>
-                        ItemKind::Struct {
-                            name,
-                            fields: fields.into_iter().map(|f| FieldDef { span: z, ..f }).collect(),
-                        },
-                    ItemKind::Enum { name, variants } =>
-                        ItemKind::Enum {
-                            name,
-                            variants: variants.into_iter().map(|v| VariantDef {
-                                span: z,
-                                fields: v.fields.into_iter().map(|f| FieldDef { span: z, ..f }).collect(),
-                                ..v
-                            }).collect(),
-                        },
-                },
+                kind: erase_item_kind(item.kind, z),
             }).collect(),
+        }
+    }
+
+    fn erase_item_kind(kind: ItemKind, z: Span) -> ItemKind {
+        match kind {
+            ItemKind::Import { path } =>
+                ItemKind::Import { path: ModulePath { span: z, ..path } },
+            ItemKind::FromImport { path, names } =>
+                ItemKind::FromImport {
+                    path: ModulePath { span: z, ..path },
+                    names: names.into_iter().map(|(n, _)| (n, z)).collect(),
+                },
+            ItemKind::Fn { name, type_params, params, return_ty, body } =>
+                ItemKind::Fn {
+                    name,
+                    type_params: type_params.into_iter().map(|tp| TypeParam { span: z, ..tp }).collect(),
+                    params: params.into_iter().map(|p| Param { span: z, ..p }).collect(),
+                    return_ty,
+                    body: body.into_iter().map(|s| erase_stmt(s, z)).collect(),
+                },
+            ItemKind::Kernel { name, params, return_ty, body } =>
+                ItemKind::Kernel {
+                    name,
+                    params: params.into_iter().map(|p| KernelParam { span: z, ..p }).collect(),
+                    return_ty,
+                    body: body.into_iter().map(|s| erase_stmt(s, z)).collect(),
+                },
+            ItemKind::Struct { name, fields } =>
+                ItemKind::Struct {
+                    name,
+                    fields: fields.into_iter().map(|f| FieldDef { span: z, ..f }).collect(),
+                },
+            ItemKind::Enum { name, variants } =>
+                ItemKind::Enum {
+                    name,
+                    variants: variants.into_iter().map(|v| VariantDef {
+                        span: z,
+                        fields: v.fields.into_iter().map(|f| FieldDef { span: z, ..f }).collect(),
+                        ..v
+                    }).collect(),
+                },
+            ItemKind::Trait { name, methods } =>
+                ItemKind::Trait {
+                    name,
+                    methods: methods.into_iter().map(|m| TraitMethodSig {
+                        span: z,
+                        params: m.params.into_iter().map(|p| Param { span: z, ..p }).collect(),
+                        ..m
+                    }).collect(),
+                },
+            ItemKind::Impl { trait_name, for_type, methods } =>
+                ItemKind::Impl {
+                    trait_name,
+                    for_type,
+                    methods: methods.into_iter().map(|m| Item {
+                        span: z,
+                        kind: erase_item_kind(m.kind, z),
+                    }).collect(),
+                },
         }
     }
 

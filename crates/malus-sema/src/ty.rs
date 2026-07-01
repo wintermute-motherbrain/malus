@@ -27,6 +27,10 @@ pub enum ResolvedTy {
     Array { elem: Box<ResolvedTy>, len: usize },
     /// Runtime-length mutable staging buffer `Buffer<dtype>`.
     Buffer { dtype: ScalarTy },
+    /// `List<T>` (V4/M28) — fixed-length-at-construction sequence. Reference-counted
+    /// aggregate at runtime (ARC header + length word + N element slots), NOT the
+    /// headerless static-drop layout `Array` uses. See ADR-0034.
+    List { elem: Box<ResolvedTy> },
 }
 
 impl fmt::Display for ResolvedTy {
@@ -51,6 +55,7 @@ impl fmt::Display for ResolvedTy {
             ResolvedTy::Enum { name, .. } => write!(f, "{}", name),
             ResolvedTy::Array { elem, len } => write!(f, "Array<{}, {}>", elem, len),
             ResolvedTy::Buffer { dtype } => write!(f, "Buffer<{}>", scalar_ty_name(dtype)),
+            ResolvedTy::List { elem } => write!(f, "List<{}>", elem),
         }
     }
 }
@@ -126,6 +131,17 @@ impl ResolvedTy {
 
     pub fn is_buffer(&self) -> bool {
         matches!(self, ResolvedTy::Buffer { .. })
+    }
+
+    pub fn is_list(&self) -> bool {
+        matches!(self, ResolvedTy::List { .. })
+    }
+
+    pub fn list_elem(&self) -> Option<&ResolvedTy> {
+        match self {
+            ResolvedTy::List { elem } => Some(elem),
+            _ => None,
+        }
     }
 }
 

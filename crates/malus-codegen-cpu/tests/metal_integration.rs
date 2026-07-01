@@ -1078,6 +1078,230 @@ fn test_gradient_check_all_ops() {
     );
 }
 
+// ── M28 canonical gate tests (ADR-0034): generic optimizer + List<T> ─────────
+//
+// M28 done-when #3 requires the M26 gate to still hold "under the new
+// abstraction" — i.e. `Module`/`impl`/generic `fn adamw<M: Module>`/`List<T>`
+// must not reintroduce CPU compute or break the loss-decreases property. These
+// mirror `nanogpt_train_src`/`test_v4_m3_full_step_zero_cpu_compute`/
+// `test_nanogpt_loss_decreases` exactly, but using the M28-style single `GPT`
+// struct + `List<Tensor<f32>>` params + trait/impl + one generic optimizer,
+// matching `examples/nanogpt.ml`'s actual shape (scaled to the same tiny dims
+// for test speed).
+
+fn nanogpt_m28_train_src(max_steps: i64, record_loss_at_last_step: bool) -> String {
+    let record_call = if record_loss_at_last_step {
+        "        if step == max_steps:\n            let flush_t = ones(1)\n            let flush_v = flush_t[0]\n            record_diff(loss.data[0])\n"
+    } else {
+        ""
+    };
+    format!(
+        r#"
+struct AdamW:
+    lr: f32
+    beta1: f32
+    beta2: f32
+    eps: f32
+    wd: f32
+
+struct GPT:
+    params: List<Tensor<f32>>
+
+trait Module:
+    fn parameters(self) -> List<Tensor<f32>>
+
+impl Module for GPT:
+    fn parameters(self) -> List<Tensor<f32>>:
+        return self.params
+
+fn forward(model: GPT, toks: Tensor<i32>, B: i64, T: i64, C: i64) -> Tensor<f32>:
+    let LN1_W = 0
+    let WQ = 1
+    let WK = 2
+    let WV = 3
+    let WO = 4
+    let LN2_W = 5
+    let W1 = 6
+    let W2 = 7
+    let WTE = 8
+    let WPE = 9
+    let LN_F = 10
+    let LM_HEAD = 11
+    let mut pos_buf = buffer_i32(B * T)
+    for b in range(B):
+        for t in range(T):
+            pos_buf[b * T + t] = t
+    let pos_toks = freeze(pos_buf)
+    let te = embedding(model.params[WTE], toks)
+    let pe = embedding(model.params[WPE], pos_toks)
+    let x = te + pe
+    let xn1 = layernorm(x, axis=1) * model.params[LN1_W]
+    let Q = reshape(xn1 @ model.params[WQ], B, T, C)
+    let K = reshape(xn1 @ model.params[WK], B, T, C)
+    let V = reshape(xn1 @ model.params[WV], B, T, C)
+    let Kt = permute(K, 0, 2, 1)
+    let scale = variable(ones(1, 1) * 0.35355)
+    let scores = (Q @ Kt) * scale
+    let mask = causal_mask(T)
+    let vmask = variable(mask)
+    let masked = scores + vmask
+    let attn = softmax(masked, axis=2)
+    let att_out = reshape(attn @ V, B * T, C)
+    let proj = att_out @ model.params[WO]
+    let x2 = x + proj
+    let xn2 = layernorm(x2, axis=1) * model.params[LN2_W]
+    let hidden = gelu(xn2 @ model.params[W1])
+    let mlp_out = hidden @ model.params[W2]
+    let x3 = x2 + mlp_out
+    let xf = layernorm(x3, axis=1) * model.params[LN_F]
+    return xf @ model.params[LM_HEAD]
+
+fn adamw<M: Module>(model: M, mut ms: List<Tensor<f32>>, mut vs: List<Tensor<f32>>,
+                     opt: AdamW, t: i64):
+    let bc1 = 1.0 - opt.beta1 ** t
+    let bc2 = 1.0 - opt.beta2 ** t
+    let mut ps = model.parameters()
+    for i in range(len(ps)):
+        let g = ps[i].grad + opt.wd * ps[i].data
+        ms[i] = opt.beta1 * ms[i] + (1.0 - opt.beta1) * g
+        vs[i] = opt.beta2 * vs[i] + (1.0 - opt.beta2) * g * g
+        let m_hat = ms[i] / bc1
+        let v_hat = vs[i] / bc2
+        ps[i] = variable(ps[i].data - opt.lr * m_hat / (sqrt(v_hat) + opt.eps))
+
+fn zeros_moments(C: i64, C4: i64, V: i64, T: i64) -> List<Tensor<f32>>:
+    return [zeros(C), zeros(C, C), zeros(C, C), zeros(C, C), zeros(C, C),
+            zeros(C), zeros(C, C4), zeros(C4, C),
+            zeros(V, C), zeros(T, C), zeros(C), zeros(C, V)]
+
+fn main():
+    let C = 8
+    let T = 4
+    let B = 2
+    let V = 8
+    let C4 = 32
+    let max_steps = {max_steps}
+    let init_scale = ones(1, 1) * 0.02
+    let gpt = GPT(params=[
+        variable(ones(C)),
+        variable(randn(C, C) * init_scale),
+        variable(randn(C, C) * init_scale),
+        variable(randn(C, C) * init_scale),
+        variable(randn(C, C) * init_scale),
+        variable(ones(C)),
+        variable(randn(C, C4) * init_scale),
+        variable(randn(C4, C) * init_scale),
+        variable(randn(V, C) * init_scale),
+        variable(randn(T, C) * init_scale),
+        variable(ones(C)),
+        variable(randn(C, V) * init_scale),
+    ])
+    let mut ms = zeros_moments(C, C4, V, T)
+    let mut vs = zeros_moments(C, C4, V, T)
+    let opt = AdamW(lr=0.01, beta1=0.9, beta2=0.999, eps=1e-8, wd=0.01)
+    for step in range(1, max_steps + 1):
+        let mut x_buf = buffer_i32(B * T)
+        let mut y_buf = buffer_i32(B * T)
+        x_buf[0] = 0
+        x_buf[1] = 1
+        x_buf[2] = 2
+        x_buf[3] = 3
+        y_buf[0] = 1
+        y_buf[1] = 2
+        y_buf[2] = 3
+        y_buf[3] = 4
+        x_buf[4] = 4
+        x_buf[5] = 5
+        x_buf[6] = 6
+        x_buf[7] = 7
+        y_buf[4] = 5
+        y_buf[5] = 6
+        y_buf[6] = 7
+        y_buf[7] = 0
+        let x_toks = freeze(x_buf)
+        let y_toks = freeze(y_buf)
+        let mut ps = gpt.parameters()
+        zero_grad(ps[0], ps[1], ps[2], ps[3], ps[4], ps[5],
+                  ps[6], ps[7], ps[8], ps[9], ps[10], ps[11])
+        let logits = forward(gpt, x_toks, B, T, C)
+        let loss = cross_entropy(logits, y_toks)
+{record_call}        backward(loss)
+        adamw(gpt, ms, vs, opt, step)
+"#,
+        max_steps = max_steps,
+        record_call = record_call,
+    )
+}
+
+/// M28 done-when #3: the M26 canonical gate (zero CPU compute over a full
+/// train step) must still hold under the generic-optimizer/`List<T>`/trait
+/// abstraction — not just the V3-style hand-unrolled `adamw_block`/
+/// `adamw_gpt_params` pattern `test_v4_m3_full_step_zero_cpu_compute` covers.
+/// Generics/traits/`List` are pure frontend/orchestration (ADR-0034); nothing
+/// about monomorphization, method dispatch, or List's RC touches per-element
+/// compute, so this must be exactly as GPU-only as the pre-M28 pattern.
+#[test]
+fn test_v4_m28_full_step_zero_cpu_compute() {
+    let _guard = METAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let src = nanogpt_m28_train_src(2, false);
+    let user_program = parse(malus_syntax::FileId(0), &src).expect("parse failed");
+    let mut stdlib = malus_stdlib::stdlib_items();
+    stdlib.extend(user_program.items.into_iter());
+    let program = malus_syntax::ast::Program { items: stdlib };
+    let aliases = HashMap::new();
+    let typed = check(&program, &aliases).expect("type check failed");
+    let (registry, kernel_ids) =
+        malus_codegen_gpu::compile_kernels(&typed).expect("kernel compilation failed");
+    malus_runtime::runtime_init(&registry.into_hashmap());
+    let symbols = real_symbols();
+    malus_runtime::malus_cpu_compute_reset();
+    compile_and_run(&typed, &symbols, &kernel_ids).expect("JIT compile and run failed");
+    let cpu_count = malus_runtime::malus_cpu_compute_count();
+    assert_eq!(
+        cpu_count, 0,
+        "M28: full nanoGPT train step via generic adamw<M: Module> + List<T> \
+         must use 0 CPU compute ops, got {cpu_count}"
+    );
+}
+
+/// M28 done-when #3, loss half: same deterministic-Philox two-compile
+/// comparison as `test_nanogpt_loss_decreases`, but through the M28
+/// generic-optimizer/`List<T>` pattern.
+#[test]
+fn test_v4_m28_loss_decreases() {
+    let _guard = METAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    fn typecheck(max_steps: i64) -> malus_sema::TypedProgram {
+        let src = nanogpt_m28_train_src(max_steps, true);
+        let mut user_program = parse(malus_syntax::FileId(0), &src).expect("parse failed");
+        let mut stdlib = malus_stdlib::stdlib_items();
+        stdlib.extend(user_program.items.drain(..));
+        let program = malus_syntax::ast::Program { items: stdlib };
+        let aliases = HashMap::new();
+        check(&program, &aliases).expect("type check failed")
+    }
+
+    let typed_1 = typecheck(1);
+    let typed_10 = typecheck(10);
+    let (registry, kernel_ids) =
+        malus_codegen_gpu::compile_kernels(&typed_1).expect("kernel compilation failed");
+    malus_runtime::runtime_init(&registry.into_hashmap());
+    let symbols = real_symbols();
+
+    malus_runtime::malus_gradcheck_reset();
+    compile_and_run(&typed_1, &symbols, &kernel_ids).expect("JIT compile and run failed");
+    let loss_first = malus_runtime::malus_gradcheck_max_diff();
+
+    malus_runtime::malus_gradcheck_reset();
+    compile_and_run(&typed_10, &symbols, &kernel_ids).expect("JIT compile and run failed");
+    let loss_last = malus_runtime::malus_gradcheck_max_diff();
+
+    assert!(
+        loss_last < loss_first * 0.9,
+        "M28: loss did not decrease by the expected margin: loss[0]={loss_first}, loss[9]={loss_last}"
+    );
+}
+
 /// M26 done-when: training loss decreases (deterministic Philox seed, no
 /// user-supplied RNG seed — see ADR-0024) over a 10-step regression run.
 /// Two independent compiles (truncated at step 1 and step 10) are

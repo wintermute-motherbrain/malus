@@ -29,6 +29,11 @@ pub enum BuiltinKind {
     /// Kernel-only intrinsic or scalar-math helper.  Only callable inside a
     /// kernel body (`in_kernel`).  Zero or fixed scalar args; scalar return.
     KernelOnly { params: Vec<ResolvedTy>, ret: ResolvedTy },
+    /// `len(lst)` (M28) — one `List<T>` arg (any element type), returns `i64`.
+    /// A dedicated kind rather than `Fixed` because `Fixed`'s param types are a
+    /// concrete `Vec<ResolvedTy>` fixed at registration time; `len` must accept
+    /// any `List<T>`, so it validates `arg.ty.is_list()` at the call site instead.
+    ListLen,
 }
 
 #[derive(Debug, Clone)]
@@ -282,6 +287,15 @@ pub fn register_builtins() -> HashMap<String, BuiltinSig> {
         kind: BuiltinKind::Fixed(vec![ResolvedTy::Buffer { dtype: ScalarTy::I32 }]),
         return_ty: ResolvedTy::Tensor { dtype: ScalarTy::I32 },
         return_placement: Some(Placement::Gpu),
+    });
+
+    // M28: len(lst: List<T>) -> i64 — reads the length word (ADR-0034). Needed so
+    // the generic optimizer can iterate `ps[i]`/`ms[i]`/`vs[i]` in lockstep; bare
+    // `for p in list` gives neither an index nor access to the parallel state.
+    m.insert("len".to_string(), BuiltinSig {
+        kind: BuiltinKind::ListLen,
+        return_ty: ResolvedTy::Scalar(ScalarTy::I64),
+        return_placement: None,
     });
 
     m

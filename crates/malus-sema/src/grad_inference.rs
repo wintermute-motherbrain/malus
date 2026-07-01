@@ -162,6 +162,9 @@ impl<'p> Pass<'p> {
                     TypedAssignTarget::BufferIndex { index, .. } => {
                         self.infer_expr(index, locals, local_types);
                     }
+                    TypedAssignTarget::ListIndex { index, .. } => {
+                        self.infer_expr(index, locals, local_types);
+                    }
                 }
             }
             TypedStmt::Return { expr } => {
@@ -192,10 +195,12 @@ impl<'p> Pass<'p> {
             }
             TypedStmt::ForIn { var, iter, body } => {
                 self.infer_expr(iter, locals, local_types);
-                let ety = if let ResolvedTy::Array { elem, .. } = &iter.ty {
-                    (**elem).clone()
-                } else {
-                    ResolvedTy::Unit
+                let ety = match &iter.ty {
+                    ResolvedTy::Array { elem, .. } => (**elem).clone(),
+                    // M28: `for x in list_of_tensors` — same element-grad propagation
+                    // as Array; the container's own RC (ADR-0034) is orthogonal.
+                    ResolvedTy::List { elem } => (**elem).clone(),
+                    _ => ResolvedTy::Unit,
                 };
                 self.infer_scoped(body, locals, local_types, &[(var.clone(), ety)]);
             }
@@ -228,6 +233,7 @@ impl<'p> Pass<'p> {
             | TypedStmt::DropEnum { .. }
             | TypedStmt::DropArray { .. }
             | TypedStmt::DropTuple { .. }
+            | TypedStmt::DropList { .. }
             | TypedStmt::DropBuffer { .. } => {}
         }
     }

@@ -28,6 +28,8 @@ pub enum TokenKind {
     Enum,
     Inout,
     With,
+    Trait,
+    Impl,
 
     // Boolean keyword-operators
     And,

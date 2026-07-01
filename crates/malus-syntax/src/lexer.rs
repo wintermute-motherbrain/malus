@@ -398,6 +398,8 @@ impl<'src> Lexer<'src> {
             "struct" => TokenKind::Struct,
             "enum"   => TokenKind::Enum,
             "inout"  => TokenKind::Inout,
+            "trait"  => TokenKind::Trait,
+            "impl"   => TokenKind::Impl,
             "and"    => TokenKind::And,
             "or"     => TokenKind::Or,
             "not"    => TokenKind::Not,
@@ -1090,6 +1092,12 @@ mod tests {
 
     #[test]
     fn kw_inout() { assert_eq!(kinds("inout"), vec![Inout, Newline, Eof]); }
+
+    #[test]
+    fn kw_trait() { assert_eq!(kinds("trait"), vec![Trait, Newline, Eof]); }
+
+    #[test]
+    fn kw_impl() { assert_eq!(kinds("impl"), vec![Impl, Newline, Eof]); }
 
     #[test]
     fn kw_import() { assert_eq!(kinds("import"), vec![Import, Newline, Eof]); }

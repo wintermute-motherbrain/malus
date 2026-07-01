@@ -30,6 +30,14 @@ pub enum Ty {
     Array { elem: Box<Ty>, len: usize },
     /// `Buffer<dtype>` — runtime-length mutable staging buffer.
     Buffer { dtype: ScalarTy },
+    /// `List<T>` (V4/M28) — fixed-length-at-construction sequence, reference-counted
+    /// aggregate at runtime (ADR-0034). Special-cased in the parser like `Array`/`Buffer`;
+    /// no general `Ty::Named { args }` machinery exists (generic structs are deferred).
+    List { elem: Box<Ty> },
+    /// `self` in a trait method signature or `impl` method parameter list (M28).
+    /// Resolved to the enclosing trait's concrete implementing type in sema; illegal
+    /// anywhere else.
+    SelfType,
 }
 
 // ── Operators ─────────────────────────────────────────────────────────────────
@@ -80,6 +88,18 @@ pub enum Lit {
     Float(f64),
     Bool(bool),
     Str(String),
+}
+
+// ── Generics (M28) ────────────────────────────────────────────────────────────
+
+/// A type parameter on a generic `fn`, e.g. the `T` in `fn f<T: Trait>(x: T)`.
+/// V4 scope: one type parameter per item, one optional trait bound (checked in sema,
+/// not enforced by this grammar node — see `docs/milestones/m28-module-trait.md`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypeParam {
+    pub name: String,
+    pub bound: Option<String>,
+    pub span: Span,
 }
 
 // ── Aggregate type definitions ────────────────────────────────────────────────
@@ -267,6 +287,10 @@ pub struct Item {
 pub enum ItemKind {
     Fn {
         name: String,
+        /// M28: type parameters for a generic fn (`fn adamw<M: Module>`, `fn id<T>`).
+        /// Empty for non-generic fns. `struct`/`enum` do NOT gain this field in M28 —
+        /// generic structs are deferred post-V4 (ADR-0034).
+        type_params: Vec<TypeParam>,
         params: Vec<Param>,
         return_ty: Option<Ty>,
         body: Vec<Stmt>,
@@ -296,6 +320,30 @@ pub enum ItemKind {
         path: ModulePath,
         names: Vec<(String, Span)>,
     },
+    /// `trait Name: fn method(self, ...) -> T ...` (M28). Method bodies are not present —
+    /// only signatures. V4 scope: exactly one built-in trait (`Module`) is exercised, but
+    /// the mechanism itself is general.
+    Trait {
+        name: String,
+        methods: Vec<TraitMethodSig>,
+    },
+    /// `impl Trait for Type: fn method(self, ...) -> T: body ...` (M28). Each method is a
+    /// full `ItemKind::Fn` item (reusing the fn grammar/AST shape) whose first parameter is
+    /// the bare `self` receiver.
+    Impl {
+        trait_name: String,
+        for_type: String,
+        methods: Vec<Item>,
+    },
+}
+
+/// A method signature inside a `trait` block — no body, unlike `impl` methods (M28).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TraitMethodSig {
+    pub name: String,
+    pub params: Vec<Param>,
+    pub return_ty: Option<Ty>,
+    pub span: Span,
 }
 
 // ── Program ───────────────────────────────────────────────────────────────────

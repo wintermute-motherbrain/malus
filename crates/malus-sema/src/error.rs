@@ -89,6 +89,26 @@ pub enum SemaError {
     InvalidLaunchConfigShape { key: String, span: Span },
     /// Kernel launch called from inside a kernel body (not allowed).
     KernelLaunchInsideKernel { span: Span },
+    // ── M28: generics, trait/impl, List<T> ───────────────────────────────────
+    /// `Self` type used outside a `trait`/`impl` method signature.
+    SelfOutsideImpl { span: Span },
+    /// A generic `fn` declares more than one type parameter (V4 fence: exactly one).
+    TooManyTypeParams { name: String, span: Span },
+    /// A generic fn's type parameter never appears as a bare parameter type, so
+    /// its concrete type cannot be inferred from the call site (V4 fence: no
+    /// nested generic positions like `Array<T,N>`).
+    GenericTypeParamUnresolved { name: String, span: Span },
+    /// A concrete type passed to a bounded generic fn does not have a matching
+    /// `impl Trait for Type`.
+    TraitBoundNotSatisfied { ty: String, trait_name: String, span: Span },
+    /// `impl Trait for Type` references an undefined trait.
+    UnknownTrait { name: String, span: Span },
+    /// `x.method(...)` where `x`'s type has no matching trait-impl method.
+    UnknownMethod { type_name: String, method: String, span: Span },
+    /// An `impl` method's signature doesn't match its trait's declared signature.
+    ImplMethodMismatch { trait_name: String, method: String, span: Span },
+    /// A `trait`/`impl` method is missing the required `self` receiver parameter.
+    ImplMethodMissingSelf { method: String, span: Span },
 }
 
 impl SemaError {
@@ -142,7 +162,15 @@ impl SemaError {
             | UnknownKernel { span, .. }
             | MissingLaunchConfig { span, .. }
             | InvalidLaunchConfigShape { span, .. }
-            | KernelLaunchInsideKernel { span } => Some(*span),
+            | KernelLaunchInsideKernel { span }
+            | SelfOutsideImpl { span }
+            | TooManyTypeParams { span, .. }
+            | GenericTypeParamUnresolved { span, .. }
+            | TraitBoundNotSatisfied { span, .. }
+            | UnknownTrait { span, .. }
+            | UnknownMethod { span, .. }
+            | ImplMethodMismatch { span, .. }
+            | ImplMethodMissingSelf { span, .. } => Some(*span),
             DuplicateDefinition { second, .. } | DuplicateTypeDefinition { second, .. } => Some(*second),
             MainNotFound => None,
         }
@@ -209,6 +237,14 @@ impl SemaError {
             MissingLaunchConfig { .. } => "required launch config key missing",
             InvalidLaunchConfigShape { .. } => "launch config must be a 3-element array literal",
             KernelLaunchInsideKernel { .. } => "kernel launches not allowed inside a kernel body",
+            SelfOutsideImpl { .. } => "`Self` is only valid inside a trait or impl method signature",
+            TooManyTypeParams { .. } => "at most one type parameter per generic fn (V4 scope)",
+            GenericTypeParamUnresolved { .. } => "type parameter does not appear in a bare parameter position",
+            TraitBoundNotSatisfied { .. } => "trait not implemented for this type",
+            UnknownTrait { .. } => "no such trait",
+            UnknownMethod { .. } => "no such method",
+            ImplMethodMismatch { .. } => "signature does not match the trait method",
+            ImplMethodMissingSelf { .. } => "method must take `self` as its first parameter",
             MainNotFound => "",
         }
     }
@@ -337,6 +373,22 @@ impl fmt::Display for SemaError {
                 write!(f, "launch config `{}` must be an array literal with exactly 3 elements", key),
             SemaError::KernelLaunchInsideKernel { .. } =>
                 write!(f, "kernel launch expressions are only valid inside `fn` bodies, not inside `kernel` bodies"),
+            SemaError::SelfOutsideImpl { .. } =>
+                write!(f, "`Self` may only be used as a parameter/return type inside a `trait` or `impl` method"),
+            SemaError::TooManyTypeParams { name, .. } =>
+                write!(f, "generic fn '{}' declares more than one type parameter — V4 scope allows exactly one", name),
+            SemaError::GenericTypeParamUnresolved { name, .. } =>
+                write!(f, "type parameter '{}' must appear as a bare parameter type to be inferred from the call site", name),
+            SemaError::TraitBoundNotSatisfied { ty, trait_name, .. } =>
+                write!(f, "type '{}' does not implement trait '{}'", ty, trait_name),
+            SemaError::UnknownTrait { name, .. } =>
+                write!(f, "no trait named '{}'", name),
+            SemaError::UnknownMethod { type_name, method, .. } =>
+                write!(f, "type '{}' has no method '{}'", type_name, method),
+            SemaError::ImplMethodMismatch { trait_name, method, .. } =>
+                write!(f, "method '{}' does not match trait '{}'s declared signature", method, trait_name),
+            SemaError::ImplMethodMissingSelf { method, .. } =>
+                write!(f, "method '{}' must take `self` as its first parameter", method),
         }
     }
 }

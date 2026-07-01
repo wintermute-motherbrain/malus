@@ -633,6 +633,7 @@ fn flat_stmt_kinds(stmts: &[TypedStmt]) -> Vec<&'static str> {
             TypedStmt::NoGrad { .. }     => "NoGrad",
             TypedStmt::DropBuffer { .. } => "DropBuffer",
             TypedStmt::LetShared { .. }  => "LetShared",
+            TypedStmt::DropList { .. }   => "DropList",
         };
         out.push(tag);
     }
@@ -1405,4 +1406,319 @@ fn main():
         "reading a grad-carrying struct field should be RC-released; got releases: {:?}",
         release_names
     );
+}
+
+// ── M28: generics, trait/impl, List<T> ───────────────────────────────────────
+
+/// Done-when #4: `fn id<T>(x: T) -> T: return x` called with `Tensor<f32>` and
+/// `i32` produces distinct, correctly-typed monomorphizations — not the generic
+/// item itself (erased before codegen, ADR-0034).
+#[test]
+fn test_generic_fn_monomorphization_distinct_instantiations() {
+    let src = r#"
+fn id<T>(x: T) -> T:
+    return x
+
+fn use_i32(v: i32) -> i32:
+    return id(v)
+
+fn main():
+    let t = Tensor.gpu<f32>([1.0, 2.0])
+    let b = id(t)
+    let r = use_i32(7)
+    print(b)
+    print(r)
+"#;
+    let typed = check_src(src).expect("generic fn should monomorphize and type-check");
+    let names: Vec<&str> = typed.fns.iter().map(|f| f.name.as_str()).collect();
+    assert!(names.contains(&"id__i32"), "expected id__i32 in {:?}", names);
+    assert!(names.contains(&"id__Tensor_f32"), "expected id__Tensor_f32 in {:?}", names);
+    assert!(!names.iter().any(|n| *n == "id"), "the generic item itself must not reach the typed IR");
+
+    let id_i32 = typed.fns.iter().find(|f| f.name == "id__i32").unwrap();
+    assert_eq!(id_i32.params[0].ty, crate::ty::ResolvedTy::Scalar(malus_syntax::ast::ScalarTy::I32));
+    assert_eq!(id_i32.return_ty, crate::ty::ResolvedTy::Scalar(malus_syntax::ast::ScalarTy::I32));
+
+    let id_tensor = typed.fns.iter().find(|f| f.name == "id__Tensor_f32").unwrap();
+    assert!(id_tensor.params[0].ty.is_tensor());
+    assert!(id_tensor.return_ty.is_tensor());
+}
+
+/// Calling the same generic fn twice with the same concrete type memoizes to
+/// one instantiation (mono_cache), not two.
+#[test]
+fn test_generic_fn_monomorphization_memoized() {
+    let src = r#"
+fn id<T>(x: T) -> T:
+    return x
+
+fn main():
+    let a = id(1)
+    let b = id(2)
+    print(a)
+    print(b)
+"#;
+    let typed = check_src(src).expect("check failed");
+    let count = typed.fns.iter().filter(|f| f.name == "id__i64").count();
+    assert_eq!(count, 1, "second call with the same concrete type must reuse the cached instantiation");
+}
+
+/// Trait + impl + method-call dispatch: `model.parameters()` resolves through
+/// the trait-impl registry to the monomorphized `Type__method` fn.
+#[test]
+fn test_trait_impl_method_call_dispatch() {
+    let src = r#"
+struct GPT:
+    params: List<Tensor<f32>>
+
+trait Module:
+    fn parameters(self) -> List<Tensor<f32>>
+
+impl Module for GPT:
+    fn parameters(self) -> List<Tensor<f32>>:
+        return self.params
+
+fn main():
+    let gpt = GPT(params=[Tensor.gpu<f32>([1.0]), Tensor.gpu<f32>([2.0])])
+    let out = gpt.parameters()
+    print(out)
+"#;
+    let typed = check_src(src).expect("trait/impl/method-call should type-check");
+    let names: Vec<&str> = typed.fns.iter().map(|f| f.name.as_str()).collect();
+    assert!(names.contains(&"GPT__parameters"), "expected GPT__parameters in {:?}", names);
+    let method = typed.fns.iter().find(|f| f.name == "GPT__parameters").unwrap();
+    assert!(method.return_ty.is_list());
+}
+
+/// A generic fn bounded by a trait the concrete arg's type doesn't implement
+/// is a sema error, not a panic.
+#[test]
+fn test_generic_fn_trait_bound_not_satisfied() {
+    let src = r#"
+struct GPT:
+    params: List<Tensor<f32>>
+
+trait Module:
+    fn parameters(self) -> List<Tensor<f32>>
+
+fn adamw<M: Module>(model: M) -> i64:
+    return 0
+
+fn main():
+    let gpt = GPT(params=[Tensor.gpu<f32>([1.0])])
+    let r = adamw(gpt)
+    print(r)
+"#;
+    let errs = check_src(src).expect_err("GPT does not implement Module — must be a sema error");
+    assert!(
+        errs.iter().any(|e| matches!(e, SemaError::TraitBoundNotSatisfied { .. })),
+        "expected TraitBoundNotSatisfied, got {:?}", errs
+    );
+}
+
+/// `List<T>` literal disambiguation: a `[e1, e2]` literal assigned into a
+/// `List<T>`-typed struct field is inferred as `List`, not `Array` (ADR-0034).
+/// Indexing and `len()` both work on the result.
+#[test]
+fn test_list_literal_disambiguation_index_and_len() {
+    let src = r#"
+struct GPT:
+    params: List<Tensor<f32>>
+
+fn main():
+    let gpt = GPT(params=[Tensor.gpu<f32>([1.0]), Tensor.gpu<f32>([2.0])])
+    let n = len(gpt.params)
+    let first = gpt.params[0]
+    print(n)
+    print(first)
+"#;
+    let typed = check_src(src).expect("List literal/index/len should type-check");
+    let main = typed.fns.iter().find(|f| f.name == "main").unwrap();
+    let gpt_let = main.body.iter().find_map(|s| match s {
+        TypedStmt::Let { name, expr } if name == "gpt" => Some(expr),
+        _ => None,
+    }).unwrap();
+    assert!(matches!(&gpt_let.kind, crate::typed_ir::TypedExprKind::StructInit { .. }));
+    assert!(gpt_let.ty.is_struct());
+}
+
+/// `for p in list` iterates a `List<Tensor<f32>>` binding it results correctly.
+#[test]
+fn test_list_for_in() {
+    let src = r#"
+struct GPT:
+    params: List<Tensor<f32>>
+
+fn main():
+    let gpt = GPT(params=[Tensor.gpu<f32>([1.0]), Tensor.gpu<f32>([2.0])])
+    for p in gpt.params:
+        print(p)
+"#;
+    check_src(src).expect("ForIn over List should type-check");
+}
+
+/// `ps[i] = variable(...)` — slot reassignment on a `mut List<Tensor<f32>>`
+/// parameter, the write-back mechanism the generic optimizer relies on
+/// (ADR-0034 D1).
+#[test]
+fn test_list_index_assign() {
+    let src = r#"
+fn bump(mut ps: List<Tensor<f32>>):
+    ps[0] = variable(ps[0])
+
+fn main():
+    bump([Tensor.gpu<f32>([1.0])])
+"#;
+    check_src(src).expect("List slot reassignment should type-check");
+}
+
+/// Grad-inference (ADR-0030) is content-based and container-agnostic: reading an
+/// element out of a `List` containing a grad-tracked tensor is itself
+/// grad-tracked, propagating through `StructInit` -> `struct_field_grad` ->
+/// `FieldAccess` -> `Index`, exactly like `Array`/`Tuple` already do.
+#[test]
+fn test_list_element_grad_tracked_propagates_through_index() {
+    let src = r#"
+struct GPT:
+    params: List<Tensor<f32>>
+
+fn main():
+    let t = Tensor.gpu<f32>([1.0])
+    let v = variable(t)
+    let gpt = GPT(params=[v])
+    let first = gpt.params[0]
+    print(first)
+"#;
+    let typed = check_src(src).expect("check failed");
+    let main = typed.fns.iter().find(|f| f.name == "main").unwrap();
+    let first_grad = main.body.iter().find_map(|s| match s {
+        TypedStmt::Let { name, expr } if name == "first" => Some(expr.grad_tracked),
+        _ => None,
+    });
+    assert_eq!(
+        first_grad, Some(true),
+        "reading an element of a List containing a grad-tracked tensor should itself be grad-tracked"
+    );
+}
+
+/// The core M28/ADR-0034 aliasing risk: `let gpt = GPT(params=ps)` aliases the
+/// existing `ps` local into a struct field. Without a retain, `ps`'s own
+/// `DropList` (inserted at its last use — this very statement) would drop the
+/// shared box's refcount from 1 to 0, freeing the element tensors + box out
+/// from under `gpt.params`. CTMM must emit `RetainAgg{ps}` immediately before
+/// the `let gpt = ...` statement, and `DropList{ps}` immediately after —
+/// net balanced (1 -> 2 -> 1), leaving exactly one live reference, now owned
+/// by the struct field.
+#[test]
+fn test_list_struct_field_alias_retain_release_balanced() {
+    let src = r#"
+struct GPT:
+    params: List<Tensor<f32>>
+
+fn make_params() -> List<Tensor<f32>>:
+    return [Tensor.gpu<f32>([1.0])]
+
+fn main():
+    let ps = make_params()
+    let gpt = GPT(params=ps)
+    print(gpt)
+"#;
+    let typed = check_src(src).expect("check failed");
+    let main = typed.fns.iter().find(|f| f.name == "main").unwrap();
+    let tags = flat_stmt_kinds(&main.body);
+
+    let gpt_let_idx = main.body.iter().position(|s| matches!(s,
+        TypedStmt::Let { name, .. } if name == "gpt"
+    )).expect("expected `let gpt = ...` statement");
+
+    assert_eq!(
+        tags.get(gpt_let_idx.wrapping_sub(1)), Some(&"RetainAgg"),
+        "expected RetainAgg immediately before `let gpt = GPT(params=ps)`; got tags: {:?}", tags
+    );
+    let retain_name = match &main.body[gpt_let_idx - 1] {
+        TypedStmt::RetainAgg { name } => name.as_str(),
+        _ => unreachable!(),
+    };
+    assert_eq!(retain_name, "ps");
+
+    assert_eq!(
+        tags.get(gpt_let_idx + 1), Some(&"DropList"),
+        "expected DropList immediately after `let gpt = GPT(params=ps)` (ps's last use); got tags: {:?}", tags
+    );
+    let drop_name = match &main.body[gpt_let_idx + 1] {
+        TypedStmt::DropList { name, .. } => name.as_str(),
+        _ => unreachable!(),
+    };
+    assert_eq!(drop_name, "ps");
+}
+
+/// CAPSTONE DESIGN CONSTRAINT (not an M28 bug, a pre-existing CTMM property
+/// this milestone's nanoGPT rewrite must respect): binding `let x =
+/// model.params[i]` — a plain alias of a grad-tracked tensor read out of a
+/// `List` — gets its OWN `Release` at `x`'s last use, exactly as if `x` had
+/// been freshly allocated. Since `x` is really an ALIAS of the tensor still
+/// owned by `model.params`, that `Release` would incorrectly decrement (and,
+/// on a repeated call with the same model, eventually free) the shared
+/// tensor out from under the caller. `forward()` must therefore reference
+/// `model.params[i]` INLINE at each use site (matching the existing,
+/// already-correct V3 pattern of writing `blk.wq` inline rather than binding
+/// `let wq = blk.wq`) — never bind a struct/list tensor read to a persistent
+/// local name. Index-typed scalar constants (`let WQ = 1`) are fine, since
+/// they're plain i64 values with no ownership.
+#[test]
+fn test_list_indexed_tensor_alias_gets_release_capstone_design_constraint() {
+    let src = r#"
+struct GPT:
+    params: List<Tensor<f32>>
+
+fn forward(model: GPT) -> Tensor<f32>:
+    let ln1_w = model.params[0]
+    let scaled = ln1_w * 2.0
+    return scaled
+
+fn main():
+    let gpt = GPT(params=[variable(Tensor.gpu<f32>([1.0]))])
+    let out = forward(gpt)
+    print(out)
+"#;
+    let typed = check_src(src).expect("check failed");
+    let forward = typed.fns.iter().find(|f| f.name == "forward").unwrap();
+    // `ln1_w` escapes via `return`, so per ADR-0030 it's Release'd (RC), not
+    // statically Dropped — but the point stands regardless of which: `forward`
+    // believes it owns (or must RC-manage) a reference that `model.params`
+    // still needs. This test documents the property the capstone must design
+    // around, not asserts it's "fixed" (fixing it generally is M29 borrow-
+    // inference territory — proving `ln1_w`'s lifetime nests inside `model`'s
+    // requires interprocedural analysis this milestone doesn't have).
+    let releases = releases_in(&forward.body);
+    assert!(
+        releases.contains(&"ln1_w"),
+        "expected ln1_w to be RC-managed (documenting the aliasing risk), got: {:?}", releases
+    );
+}
+
+/// A plain (non-aliased) `List` local — never read out of a struct field and
+/// never itself aliased — still gets exactly one `DropList` at its own last
+/// use, with no spurious retain (the common, non-risky case).
+#[test]
+fn test_list_plain_local_gets_single_droplist_no_retain() {
+    let src = r#"
+fn main():
+    let ps = [Tensor.gpu<f32>([1.0]), Tensor.gpu<f32>([2.0])]
+    print(ps[0])
+"#;
+    // `ps` resolves to Array here (no List-context) — use a helper fn return
+    // type instead, matching the pattern the capstone actually uses.
+    let src = src.replace(
+        "let ps = [Tensor.gpu<f32>([1.0]), Tensor.gpu<f32>([2.0])]",
+        "let ps = make_params()",
+    );
+    let src = format!(
+        "fn make_params() -> List<Tensor<f32>>:\n    return [Tensor.gpu<f32>([1.0]), Tensor.gpu<f32>([2.0])]\n\n{src}"
+    );
+    let typed = check_src(&src).expect("check failed");
+    let main = typed.fns.iter().find(|f| f.name == "main").unwrap();
+    let tags = flat_stmt_kinds(&main.body);
+    assert_eq!(tags.iter().filter(|t| **t == "RetainAgg").count(), 0, "no aliasing occurred; got tags: {:?}", tags);
+    assert_eq!(tags.iter().filter(|t| **t == "DropList").count(), 1, "expected exactly one DropList; got tags: {:?}", tags);
 }

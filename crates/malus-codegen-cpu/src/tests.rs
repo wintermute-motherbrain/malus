@@ -1694,3 +1694,133 @@ fn main():
 "#;
     run_src(src).expect("rand_uniform should compile and run");
 }
+
+// ── M28: generics, trait/impl, List<T> ───────────────────────────────────────
+
+/// End-to-end: both monomorphizations of `fn id<T>(x: T) -> T` JIT-compile as
+/// distinct Cranelift symbols and run correctly (done-when #4).
+#[test]
+fn test_m28_generic_fn_monomorphization_runs() {
+    let src = r#"
+fn id<T>(x: T) -> T:
+    return x
+
+fn main():
+    let n = id(7)
+    let t = Tensor.gpu<f32>([1.0, 2.0])
+    let t2 = id(t)
+    println("{}", n)
+    print(t2)
+"#;
+    run_src(src).expect("distinct generic-fn instantiations should compile and run");
+}
+
+/// End-to-end: `model.parameters()` dispatches through the trait-impl registry
+/// to the monomorphized `GPT__parameters` fn and returns a usable `List`.
+#[test]
+fn test_m28_trait_impl_method_call_runs() {
+    let src = r#"
+struct GPT:
+    params: List<Tensor<f32>>
+
+trait Module:
+    fn parameters(self) -> List<Tensor<f32>>
+
+impl Module for GPT:
+    fn parameters(self) -> List<Tensor<f32>>:
+        return self.params
+
+fn main():
+    let gpt = GPT(params=[Tensor.gpu<f32>([1.0]), Tensor.gpu<f32>([2.0])])
+    let ps = gpt.parameters()
+    print(ps[0])
+    print(ps[1])
+"#;
+    run_src(src).expect("trait/impl method-call dispatch should compile and run");
+}
+
+/// End-to-end: `List<T>` construction, `len()`, indexing, and `for x in list`
+/// iteration all JIT-compile and run correctly.
+#[test]
+fn test_m28_list_literal_index_len_forin_runs() {
+    let src = r#"
+fn make_list() -> List<Tensor<f32>>:
+    return [Tensor.gpu<f32>([1.0]), Tensor.gpu<f32>([2.0]), Tensor.gpu<f32>([3.0])]
+
+fn main():
+    let ps = make_list()
+    let n = len(ps)
+    println("{}", n)
+    for p in ps:
+        print(p)
+    print(ps[0])
+"#;
+    run_src(src).expect("List literal/len/index/ForIn should compile and run");
+}
+
+/// The core ADR-0034 CTMM correctness proof, end-to-end: `let qs = ps` aliases
+/// an existing `List` local. Both `ps` and `qs` get their own `DropList` at
+/// their own last use; the retain inserted before the alias keeps the box
+/// alive until BOTH are done, and the tensors are released exactly once each
+/// when the truly-last reference drops — never leaked, never double-freed.
+/// `live_tensor_count() == 0` is the end-to-end regression guard for the
+/// highest-risk change in M28 (retain/release balance under aliasing).
+#[test]
+fn test_m28_list_alias_retain_release_no_leak() {
+    let src = r#"
+fn make_params() -> List<Tensor<f32>>:
+    return [Tensor.gpu<f32>([1.0]), Tensor.gpu<f32>([2.0])]
+
+fn main():
+    let ps = make_params()
+    let qs = ps
+    print(qs[0])
+    print(ps[1])
+"#;
+    run_src(src).expect("List aliasing should compile and run without leaking or double-freeing");
+    assert_eq!(
+        live_tensor_count(), 0,
+        "both tensor elements must be released exactly once when the last List reference drops"
+    );
+}
+
+/// A `List<Tensor<f32>>` struct field, constructed from an existing aliased
+/// local (`GPT(params=ps)`), compiles and runs without crashing. Known
+/// limitation (pre-existing pattern, not introduced by M28): `DropStruct`'s
+/// `droppable_struct_fields` doesn't recurse into `Array`-or-`List`-typed
+/// fields (same gap already exists for `Array` struct fields), so `gpt`'s
+/// eventual drop does not itself release `params` — only `ps`'s own
+/// retain/release balance (proven above) is guaranteed. Not exercised by the
+/// M28 capstone, whose `GPT` binding lives for the whole program.
+#[test]
+fn test_m28_list_struct_field_construction_runs() {
+    let src = r#"
+struct GPT:
+    params: List<Tensor<f32>>
+
+fn make_params() -> List<Tensor<f32>>:
+    return [Tensor.gpu<f32>([1.0]), Tensor.gpu<f32>([2.0])]
+
+fn main():
+    let ps = make_params()
+    let gpt = GPT(params=ps)
+    print(gpt.params[0])
+"#;
+    run_src(src).expect("List-typed struct field construction should compile and run");
+}
+
+/// `ps[i] = variable(...)` slot reassignment — the generic optimizer's
+/// write-back mechanism (ADR-0034 D1) — compiles and runs, releasing the old
+/// element before storing the new one.
+#[test]
+fn test_m28_list_index_assign_runs() {
+    let src = r#"
+fn bump(mut ps: List<Tensor<f32>>):
+    ps[0] = Tensor.gpu<f32>([99.0])
+    print(ps[0])
+
+fn main():
+    bump([Tensor.gpu<f32>([1.0])])
+"#;
+    run_src(src).expect("List slot reassignment should compile and run");
+}

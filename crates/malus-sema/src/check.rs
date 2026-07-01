@@ -30,6 +30,12 @@ struct BodyCtx<'a> {
     in_kernel: bool,
     loop_depth: usize,
     no_grad_depth: usize,
+    /// M28: generic fns and `impl` methods are monomorphized/checked lazily —
+    /// this is a shared handle to the same `typed_fns` output vec the top-level
+    /// `check()` returns, so a fn instantiated deep inside some other fn's body
+    /// (e.g. `main` calling `adamw<GPT>` which calls `model.parameters()`) lands
+    /// in the same program-wide list without a separate merge step.
+    monomorphized: &'a mut Vec<TypedFn>,
 }
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -142,12 +148,34 @@ pub fn check(
     for item in &program.items {
         let nominals = NominalMaps { structs: &local_structs, enums: &local_enums };
         match &item.kind {
-            ItemKind::Fn { name, params, return_ty, .. } => {
-                if let Some(existing) = env.functions.get(name) {
+            ItemKind::Fn { name, type_params, params, return_ty, body } => {
+                if env.functions.contains_key(name) || env.generic_fns.contains_key(name) {
+                    let first = env.functions.get(name).map(|s| s.defined_at)
+                        .or_else(|| env.generic_fns.get(name).map(|g| g.defined_at))
+                        .unwrap_or(item.span);
                     errors.push(SemaError::DuplicateDefinition {
                         name: name.clone(),
-                        first: existing.defined_at,
+                        first,
                         second: item.span,
+                    });
+                    continue;
+                }
+                // M28: generic fn — one type parameter (V4 fence), registered
+                // separately; its param/return types aren't resolvable until a
+                // call site substitutes a concrete type (ADR-0034).
+                if !type_params.is_empty() {
+                    if type_params.len() > 1 {
+                        errors.push(SemaError::TooManyTypeParams { name: name.clone(), span: item.span });
+                        continue;
+                    }
+                    let tp = &type_params[0];
+                    env.generic_fns.insert(name.clone(), crate::env::GenericFnDef {
+                        type_param: tp.name.clone(),
+                        bound: tp.bound.clone(),
+                        params: params.clone(),
+                        return_ty: return_ty.clone(),
+                        body: body.clone(),
+                        defined_at: item.span,
                     });
                     continue;
                 }
@@ -198,6 +226,140 @@ pub fn check(
             ItemKind::Struct { .. } | ItemKind::Enum { .. } => {}
             // Imports are already resolved by the loader — ignore them.
             ItemKind::Import { .. } | ItemKind::FromImport { .. } => {}
+            // M28: `trait Name: fn method(self, ...) -> T ...` — signature-only.
+            ItemKind::Trait { name, methods } => {
+                if env.traits.contains_key(name.as_str()) {
+                    errors.push(SemaError::DuplicateDefinition {
+                        name: name.clone(),
+                        first: env.traits[name.as_str()].defined_at,
+                        second: item.span,
+                    });
+                    continue;
+                }
+                let mut sigs = Vec::new();
+                let mut ok = true;
+                for m in methods {
+                    if m.params.first().map(|p| p.name.as_str()) != Some("self")
+                        || !m.params.first().map(|p| matches!(p.ty, Ty::SelfType)).unwrap_or(false)
+                    {
+                        errors.push(SemaError::ImplMethodMissingSelf { method: m.name.clone(), span: m.span });
+                        ok = false;
+                        continue;
+                    }
+                    let mut param_tys = Vec::new();
+                    let mut m_ok = true;
+                    for p in &m.params[1..] {
+                        match resolve_ty(&p.ty, p.span, &nominals, &mut errors) {
+                            Some(t) => param_tys.push(t),
+                            None => { m_ok = false; }
+                        }
+                    }
+                    let return_ty = match &m.return_ty {
+                        Some(t) => match resolve_ty(t, m.span, &nominals, &mut errors) {
+                            Some(rt) => rt,
+                            None => { m_ok = false; ResolvedTy::Unit }
+                        },
+                        None => ResolvedTy::Unit,
+                    };
+                    if !m_ok { ok = false; continue; }
+                    sigs.push(crate::env::TraitMethodSig { name: m.name.clone(), param_tys, return_ty });
+                }
+                if ok {
+                    env.traits.insert(name.clone(), crate::env::TraitDef { methods: sigs, defined_at: item.span });
+                }
+            }
+            // M28: `impl Trait for Type: fn method(self, ...) -> T: body ...`.
+            // Deferred to below — needs struct/enum field resolution (already done
+            // in Pass 1b) AND (for cross-referencing) every trait registered above,
+            // so impls are processed in a second sub-pass after this loop.
+            ItemKind::Impl { .. } => {}
+        }
+    }
+
+    // ── Pass 1c.5: register `impl` methods ────────────────────────────────────
+    //
+    // Runs after every `trait` is registered (order-independent w.r.t. other
+    // `impl` blocks) so an impl's methods can be checked against their trait's
+    // declared signature regardless of textual order in the file.
+    for item in &program.items {
+        let nominals = NominalMaps { structs: &local_structs, enums: &local_enums };
+        if let ItemKind::Impl { trait_name, for_type, methods } = &item.kind {
+            let self_ty = if let Some(def) = local_structs.get(for_type.as_str()) {
+                ResolvedTy::Struct { name: for_type.clone(), fields: def.fields.clone() }
+            } else if let Some(def) = local_enums.get(for_type.as_str()) {
+                let variants = def.variants.iter().map(|v| (v.name.clone(), v.fields.clone())).collect();
+                ResolvedTy::Enum { name: for_type.clone(), variants }
+            } else {
+                errors.push(SemaError::UnknownType { name: for_type.clone(), span: item.span });
+                continue;
+            };
+            let trait_def = match env.traits.get(trait_name.as_str()).cloned() {
+                Some(t) => t,
+                None => {
+                    errors.push(SemaError::UnknownTrait { name: trait_name.clone(), span: item.span });
+                    continue;
+                }
+            };
+            let mut impl_methods: HashMap<String, crate::env::ImplMethod> = HashMap::new();
+            for m in methods {
+                let ItemKind::Fn { name: mname, type_params, params, return_ty, .. } = &m.kind else {
+                    continue;
+                };
+                if !type_params.is_empty() {
+                    errors.push(SemaError::TooManyTypeParams { name: mname.clone(), span: m.span });
+                    continue;
+                }
+                if params.first().map(|p| p.name.as_str()) != Some("self")
+                    || !params.first().map(|p| matches!(p.ty, Ty::SelfType)).unwrap_or(false)
+                {
+                    errors.push(SemaError::ImplMethodMissingSelf { method: mname.clone(), span: m.span });
+                    continue;
+                }
+                let resolved_params = match resolve_params_with_self(params, &self_ty, &nominals, &mut errors) {
+                    Some(p) => p,
+                    None => continue,
+                };
+                let resolved_return = match return_ty {
+                    Some(ty) => match resolve_ty_with_self(ty, &self_ty, m.span, &nominals, &mut errors) {
+                        Some(t) => t,
+                        None => continue,
+                    },
+                    None => ResolvedTy::Unit,
+                };
+                // Check against the trait's declared signature (param types excluding
+                // self, and return type, must match exactly).
+                let sig_matches = trait_def.methods.iter().any(|ts| {
+                    ts.name == *mname
+                        && ts.param_tys.len() == resolved_params.len() - 1
+                        && ts.param_tys.iter().zip(resolved_params[1..].iter())
+                            .all(|(a, b)| *a == b.ty)
+                        && ts.return_ty == resolved_return
+                });
+                if !sig_matches {
+                    errors.push(SemaError::ImplMethodMismatch {
+                        trait_name: trait_name.clone(),
+                        method: mname.clone(),
+                        span: m.span,
+                    });
+                    continue;
+                }
+                let mangled_name = format!("{for_type}__{mname}");
+                if env.functions.contains_key(&mangled_name) {
+                    errors.push(SemaError::DuplicateDefinition {
+                        name: mangled_name.clone(),
+                        first: env.functions[&mangled_name].defined_at,
+                        second: m.span,
+                    });
+                    continue;
+                }
+                env.functions.insert(mangled_name.clone(), FnSig {
+                    params: resolved_params,
+                    return_ty: resolved_return,
+                    defined_at: m.span,
+                });
+                impl_methods.insert(mname.clone(), crate::env::ImplMethod { mangled_name });
+            }
+            env.impls.insert((trait_name.clone(), for_type.clone()), impl_methods);
         }
     }
 
@@ -216,7 +378,7 @@ pub fn check(
 
     for item in &program.items {
         match &item.kind {
-            ItemKind::Fn { name, params: _, return_ty: _, body } => {
+            ItemKind::Fn { name, type_params: _, params: _, return_ty: _, body } => {
                 let sig = match env.functions.get(name) {
                     Some(s) => s.clone(),
                     None => continue, // had a signature error above
@@ -239,6 +401,7 @@ pub fn check(
                     in_kernel: false,
                     loop_depth: 0,
                     no_grad_depth: 0,
+                    monomorphized: &mut typed_fns,
                 };
                 let typed_body = check_body(body, &mut ctx);
                 env.pop_scope();
@@ -309,6 +472,7 @@ pub fn check(
                     in_kernel: true,
                     loop_depth: 0,
                     no_grad_depth: 0,
+                    monomorphized: &mut typed_fns,
                 };
                 let typed_body = check_body(body, &mut ctx);
                 env.pop_scope();
@@ -328,7 +492,60 @@ pub fn check(
                     is_implicit_map: implicit,
                 });
             }
-            _ => {}
+            // M28: `trait` items carry no body — nothing to check.
+            ItemKind::Trait { .. } => {}
+            // M28: check each `impl` method's body, binding `self` to the concrete
+            // implementing type. The signature was already resolved + validated in
+            // Pass 1c.5; here we just look it up by mangled name (mirrors the
+            // ordinary `ItemKind::Fn` arm above).
+            ItemKind::Impl { for_type, methods, .. } => {
+                for m in methods {
+                    let ItemKind::Fn { name: mname, body, .. } = &m.kind else { continue };
+                    let mangled_name = format!("{for_type}__{mname}");
+                    let sig = match env.functions.get(&mangled_name) {
+                        Some(s) => s.clone(),
+                        None => continue, // had a signature error above
+                    };
+
+                    env.push_scope();
+                    for p in &sig.params {
+                        if p.is_mut {
+                            env.bind_mut_param(p.name.clone(), p.ty.clone(), None);
+                        } else {
+                            env.bind(p.name.clone(), p.ty.clone(), None);
+                        }
+                    }
+
+                    let mut body_errors: Vec<SemaError> = Vec::new();
+                    let mut ctx = BodyCtx {
+                        env: &mut env,
+                        errors: &mut body_errors,
+                        return_ty: sig.return_ty.clone(),
+                        in_kernel: false,
+                        loop_depth: 0,
+                        no_grad_depth: 0,
+                        monomorphized: &mut typed_fns,
+                    };
+                    let typed_body = check_body(body, &mut ctx);
+                    env.pop_scope();
+
+                    errors.extend(body_errors);
+
+                    let typed_params = sig.params.iter().map(|s| {
+                        TypedParam { name: s.name.clone(), ty: s.ty.clone(), is_mut: s.is_mut }
+                    }).collect();
+
+                    typed_fns.push(TypedFn {
+                        name: mangled_name,
+                        params: typed_params,
+                        return_ty: sig.return_ty.clone(),
+                        body: typed_body,
+                        span: m.span,
+                    });
+                }
+            }
+            ItemKind::Struct { .. } | ItemKind::Enum { .. }
+            | ItemKind::Import { .. } | ItemKind::FromImport { .. } => {}
         }
     }
 
@@ -534,13 +751,15 @@ fn check_body(
                 typed.push(TypedStmt::For { var: var.clone(), start: tstart, end: tend, body: tbody });
             }
             StmtKind::ForIn { var, iter, body } => {
-                // `iter` must resolve to Array<T, N>; `var` is bound to T inside body.
+                // `iter` must resolve to Array<T, N> or List<T> (M28); `var` is
+                // bound to T inside body.
                 let titer = match check_expr(iter, None, ctx) {
                     Some(e) => e,
                     None => return typed,
                 };
-                let (elem_ty, _len) = match &titer.ty {
-                    ResolvedTy::Array { elem, len } => (*elem.clone(), *len),
+                let elem_ty = match &titer.ty {
+                    ResolvedTy::Array { elem, .. } => *elem.clone(),
+                    ResolvedTy::List { elem } => *elem.clone(),
                     other => {
                         ctx.errors.push(SemaError::TypeMismatch {
                             expected: ResolvedTy::Array {
@@ -700,7 +919,7 @@ fn check_expr(
         ExprKind::TensorLiteral { placement, dtype, elements, shape } =>
             check_tensor_literal(placement, dtype, elements, shape, expr.span, ctx),
         ExprKind::ArrayLiteral { elements } =>
-            check_array_literal(elements, expr.span, ctx),
+            check_array_literal(elements, expected, expr.span, ctx),
         ExprKind::Index { base, indices } => check_index(base, indices, expr.span, ctx),
         ExprKind::FieldAccess { base, field } => check_field_access(base, field, expr.span, ctx),
         ExprKind::Tuple(elements) => check_tuple(elements, expr.span, ctx),
@@ -889,6 +1108,15 @@ fn check_call(
     span: Span,
     ctx: &mut BodyCtx<'_>,
 ) -> Option<TypedExpr> {
+    // ── Generic fn call: adamw<M: Module>(model, ...) / id<T>(x) (M28) ────────
+    // Checked before struct/enum-variant/regular-call resolution — generic fn
+    // names live in `env.generic_fns`, disjoint from `env.functions`/structs/enums.
+    if let ExprKind::Ident(name) = &callee_expr.kind {
+        if let Some(gdef) = ctx.env.generic_fns.get(name.as_str()).cloned() {
+            return check_generic_call(name, &gdef, args, span, ctx);
+        }
+    }
+
     // ── Struct constructor: Layer(weights=w, bias=b) ──────────────────────────
     if let ExprKind::Ident(type_name) = &callee_expr.kind {
         if let Some(sdef) = ctx.env.structs.get(type_name.as_str()).cloned() {
@@ -1033,6 +1261,67 @@ fn check_call(
         }
     }
 
+    // ── Method call: model.parameters() (M28) ─────────────────────────────────
+    // `x.method(args)` parses identically to any other FieldAccess-callee call —
+    // no dedicated method-call AST node exists. Dispatch through the trait-impl
+    // registry when `base` isn't a module alias (`ops.add`, handled below by
+    // `resolve_callee_name`) or an enum name (`Activation.Relu`, handled above).
+    // Receiver type is always statically known, so dispatch is a direct lookup —
+    // no vtable.
+    if let ExprKind::FieldAccess { base, field } = &callee_expr.kind {
+        let is_module_alias = matches!(&base.kind, ExprKind::Ident(n) if ctx.env.module_aliases.contains_key(n.as_str()));
+        let is_enum_name = matches!(&base.kind, ExprKind::Ident(n) if ctx.env.enums.contains_key(n.as_str()));
+        if !is_module_alias && !is_enum_name {
+            if let Some(base_texpr) = check_expr(base, None, ctx) {
+                if let Some(type_name) = nominal_name(&base_texpr.ty).map(str::to_string) {
+                    let mangled = ctx.env.impls.iter()
+                        .find(|((_, ty), methods)| *ty == type_name && methods.contains_key(field))
+                        .map(|(_, methods)| methods[field].mangled_name.clone());
+                    let Some(mangled_name) = mangled else {
+                        ctx.errors.push(SemaError::UnknownMethod {
+                            type_name,
+                            method: field.clone(),
+                            span,
+                        });
+                        return None;
+                    };
+                    let sig = ctx.env.functions.get(&mangled_name)?.clone();
+                    let expected_argc = sig.params.len().saturating_sub(1);
+                    if args.len() != expected_argc {
+                        ctx.errors.push(SemaError::ArgCountMismatch {
+                            callee: mangled_name,
+                            expected: expected_argc,
+                            found: args.len(),
+                            span,
+                        });
+                        return None;
+                    }
+                    let mut typed_args: Vec<TypedExpr> = vec![base_texpr];
+                    for (arg, param) in args.iter().zip(sig.params[1..].iter()) {
+                        let ta = check_expr(&arg.value, Some(&param.ty), ctx)?;
+                        if ta.ty != param.ty {
+                            ctx.errors.push(SemaError::TypeMismatch {
+                                expected: param.ty.clone(),
+                                found: ta.ty.clone(),
+                                span: arg.value.span,
+                            });
+                            return None;
+                        }
+                        typed_args.push(ta);
+                    }
+                    let return_ty = sig.return_ty.clone();
+                    let placement = if return_ty.is_tensor() { Some(Placement::Gpu) } else { None };
+                    return Some(typed_expr(
+                        TypedExprKind::Call { callee: mangled_name, args: typed_args },
+                        return_ty,
+                        placement,
+                        span,
+                    ));
+                }
+            }
+        }
+    }
+
     // ── Regular function/kernel/builtin call (positional) ─────────────────────
     // Returns an owned enum so we can release the borrow on ctx.env before
     // calling check_expr (which needs &mut ctx).
@@ -1122,6 +1411,33 @@ fn check_call(
             // and return early via a dedicated checker.
             if let BuiltinKind::Reduction = &sig.kind {
                 return check_reduction_call(&callee_name, args, span, ctx);
+            }
+            // len(lst) (M28) — one List<T> arg, any element type.
+            if let BuiltinKind::ListLen = &sig.kind {
+                if positional.len() != 1 {
+                    ctx.errors.push(SemaError::ArgCountMismatch {
+                        callee: callee_name.clone(),
+                        expected: 1,
+                        found: positional.len(),
+                        span,
+                    });
+                    return None;
+                }
+                let ta = check_expr(positional[0], None, ctx)?;
+                if !ta.ty.is_list() {
+                    ctx.errors.push(SemaError::TypeMismatch {
+                        expected: ResolvedTy::List { elem: Box::new(ResolvedTy::Unit) },
+                        found: ta.ty.clone(),
+                        span: positional[0].span,
+                    });
+                    return None;
+                }
+                return Some(typed_expr(
+                    TypedExprKind::Call { callee: callee_name, args: vec![ta] },
+                    ResolvedTy::Scalar(ScalarTy::I64),
+                    None,
+                    span,
+                ));
             }
             // TensorThenShapeArgs builtins (reshape/transpose/permute) return early
             // via a dedicated checker.
@@ -1216,6 +1532,7 @@ fn check_call(
                 BuiltinKind::TensorThenShapeArgs => unreachable!("TensorThenShapeArgs handled above"),
                 BuiltinKind::AxisOnly => unreachable!("AxisOnly handled above"),
                 BuiltinKind::KernelOnly { .. } => unreachable!("KernelOnly handled above"),
+                BuiltinKind::ListLen => unreachable!("ListLen handled above"),
             };
             // Validate format string arg count for print/println.
             if is_print_call {
@@ -1263,6 +1580,175 @@ fn check_call(
             ))
         }
     }
+}
+
+// ── Generic fn monomorphization (M28) ─────────────────────────────────────────
+//
+// Sema-level, name-mangled, erase-before-CTMM (ADR-0034): each (fn, concrete
+// type) instantiation compiles to its own concrete `TypedFn` under a mangled
+// name, memoized in `env.mono_cache`. Every downstream pass (grad_inference,
+// ctmm, codegen-cpu) sees only ordinary concrete `TypedFn`s — no type-variable
+// concept exists past this point.
+
+fn check_generic_call(
+    fn_name: &str,
+    gdef: &crate::env::GenericFnDef,
+    args: &[CallArg],
+    span: Span,
+    ctx: &mut BodyCtx<'_>,
+) -> Option<TypedExpr> {
+    if args.len() != gdef.params.len() {
+        ctx.errors.push(SemaError::ArgCountMismatch {
+            callee: fn_name.to_string(),
+            expected: gdef.params.len(),
+            found: args.len(),
+            span,
+        });
+        return None;
+    }
+
+    // Type-check every arg with no hint — the concrete signature doesn't exist
+    // yet (that's exactly what we're about to infer).
+    let mut typed_args: Vec<TypedExpr> = Vec::new();
+    for arg in args {
+        typed_args.push(check_expr(&arg.value, None, ctx)?);
+    }
+
+    // Infer the type-parameter substitution from the position(s) where the raw
+    // declared param type is a bare reference to it (V4 fence: no nested generic
+    // positions like `Array<T, N>`).
+    let mut concrete: Option<ResolvedTy> = None;
+    for (p, ta) in gdef.params.iter().zip(typed_args.iter()) {
+        if matches!(&p.ty, Ty::Named(n) if *n == gdef.type_param) {
+            match &concrete {
+                None => concrete = Some(ta.ty.clone()),
+                Some(existing) if *existing != ta.ty => {
+                    ctx.errors.push(SemaError::TypeMismatch {
+                        expected: existing.clone(),
+                        found: ta.ty.clone(),
+                        span: ta.span,
+                    });
+                    return None;
+                }
+                _ => {}
+            }
+        }
+    }
+    let concrete = match concrete {
+        Some(t) => t,
+        None => {
+            ctx.errors.push(SemaError::GenericTypeParamUnresolved {
+                name: gdef.type_param.clone(),
+                span,
+            });
+            return None;
+        }
+    };
+
+    // Bound check: the concrete type must have a matching `impl Trait for Type`.
+    if let Some(bound) = &gdef.bound {
+        let satisfied = nominal_name(&concrete)
+            .map(|tn| ctx.env.impls.contains_key(&(bound.clone(), tn.to_string())))
+            .unwrap_or(false);
+        if !satisfied {
+            ctx.errors.push(SemaError::TraitBoundNotSatisfied {
+                ty: concrete.to_string(),
+                trait_name: bound.clone(),
+                span,
+            });
+            return None;
+        }
+    }
+
+    let mangled_name = format!("{fn_name}__{}", mangle_ty(&concrete));
+
+    if !ctx.env.mono_cache.contains(&mangled_name) {
+        let nominals = NominalMaps { structs: &ctx.env.structs, enums: &ctx.env.enums };
+        let mut sig_errors: Vec<SemaError> = Vec::new();
+        let mut resolved_params: Vec<ParamSig> = Vec::new();
+        let mut ok = true;
+        for p in &gdef.params {
+            match resolve_ty_with_subst(&p.ty, &gdef.type_param, &concrete, p.span, &nominals, &mut sig_errors) {
+                Some(t) => resolved_params.push(ParamSig { name: p.name.clone(), ty: t, is_mut: p.is_mut }),
+                None => ok = false,
+            }
+        }
+        let resolved_return = match &gdef.return_ty {
+            Some(t) => match resolve_ty_with_subst(t, &gdef.type_param, &concrete, gdef.defined_at, &nominals, &mut sig_errors) {
+                Some(rt) => rt,
+                None => { ok = false; ResolvedTy::Unit }
+            },
+            None => ResolvedTy::Unit,
+        };
+        ctx.errors.extend(sig_errors);
+        if !ok {
+            return None;
+        }
+
+        ctx.env.functions.insert(mangled_name.clone(), FnSig {
+            params: resolved_params.clone(),
+            return_ty: resolved_return.clone(),
+            defined_at: gdef.defined_at,
+        });
+        ctx.env.mono_cache.insert(mangled_name.clone());
+
+        let mut body_errors: Vec<SemaError> = Vec::new();
+        {
+            let mut sub_ctx = BodyCtx {
+                env: &mut *ctx.env,
+                errors: &mut body_errors,
+                return_ty: resolved_return.clone(),
+                in_kernel: false,
+                loop_depth: 0,
+                no_grad_depth: 0,
+                monomorphized: &mut *ctx.monomorphized,
+            };
+            sub_ctx.env.push_scope();
+            for p in &resolved_params {
+                if p.is_mut {
+                    sub_ctx.env.bind_mut_param(p.name.clone(), p.ty.clone(), None);
+                } else {
+                    sub_ctx.env.bind(p.name.clone(), p.ty.clone(), None);
+                }
+            }
+            let typed_body = check_body(&gdef.body, &mut sub_ctx);
+            sub_ctx.env.pop_scope();
+            let typed_params = resolved_params.iter().map(|s| {
+                TypedParam { name: s.name.clone(), ty: s.ty.clone(), is_mut: s.is_mut }
+            }).collect();
+            sub_ctx.monomorphized.push(TypedFn {
+                name: mangled_name.clone(),
+                params: typed_params,
+                return_ty: resolved_return,
+                body: typed_body,
+                span: gdef.defined_at,
+            });
+        }
+        ctx.errors.extend(body_errors);
+    }
+
+    // Dispatch like an ordinary fn call against the (now-registered) concrete sig.
+    let sig = ctx.env.functions.get(&mangled_name)?.clone();
+    let mut final_args: Vec<TypedExpr> = Vec::new();
+    for (ta, param) in typed_args.into_iter().zip(sig.params.iter()) {
+        if ta.ty != param.ty {
+            ctx.errors.push(SemaError::TypeMismatch {
+                expected: param.ty.clone(),
+                found: ta.ty.clone(),
+                span,
+            });
+            return None;
+        }
+        final_args.push(ta);
+    }
+    let return_ty = sig.return_ty.clone();
+    let placement = if return_ty.is_tensor() { Some(Placement::Gpu) } else { None };
+    Some(typed_expr(
+        TypedExprKind::Call { callee: mangled_name, args: final_args },
+        return_ty,
+        placement,
+        span,
+    ))
 }
 
 // ── Shape-op call checking ────────────────────────────────────────────────────
@@ -1566,9 +2052,18 @@ fn check_tensor_literal(
 
 fn check_array_literal(
     elements: &[malus_syntax::ast::Expr],
+    expected: Option<&ResolvedTy>,
     span: Span,
     ctx: &mut BodyCtx<'_>,
 ) -> Option<TypedExpr> {
+    // M28: `[e1, e2, ...]` is a `List<T>` literal when the context expects
+    // `List<T>` (e.g. a struct field typed `List<Tensor<f32>>`); otherwise it's
+    // the V1 fixed-length `Array<T, N>` literal (backward compat). See ADR-0034.
+    let want_list = matches!(expected, Some(ResolvedTy::List { .. }));
+    let elem_hint = match expected {
+        Some(ResolvedTy::List { elem }) => Some((**elem).clone()),
+        _ => None,
+    };
     if elements.is_empty() {
         ctx.errors.push(SemaError::TypeMismatch {
             expected: ResolvedTy::Array { elem: Box::new(ResolvedTy::Unit), len: 0 },
@@ -1577,7 +2072,7 @@ fn check_array_literal(
         });
         return None;
     }
-    let first = check_expr(&elements[0], None, ctx)?;
+    let first = check_expr(&elements[0], elem_hint.as_ref(), ctx)?;
     let elem_ty = first.ty.clone();
     let placement = first.placement;
     let mut typed: Vec<TypedExpr> = vec![first];
@@ -1594,9 +2089,14 @@ fn check_array_literal(
         typed.push(te);
     }
     let len = typed.len();
+    let result_ty = if want_list {
+        ResolvedTy::List { elem: Box::new(elem_ty) }
+    } else {
+        ResolvedTy::Array { elem: Box::new(elem_ty), len }
+    };
     Some(typed_expr(
         TypedExprKind::ArrayLiteral { elements: typed },
-        ResolvedTy::Array { elem: Box::new(elem_ty), len },
+        result_ty,
         placement,
         span,
     ))
@@ -1611,6 +2111,22 @@ fn check_index(
     let tbase = check_expr(base, None, ctx)?;
     // Array<T, N>[i] → T
     if let ResolvedTy::Array { elem, .. } = &tbase.ty.clone() {
+        let elem_ty = *elem.clone();
+        let placement = tbase.placement;
+        let mut typed_indices: Vec<TypedExpr> = Vec::new();
+        for idx in indices {
+            typed_indices.push(check_expr(idx, Some(&ResolvedTy::Scalar(ScalarTy::I64)), ctx)?);
+        }
+        return Some(typed_expr(
+            TypedExprKind::Index { base: Box::new(tbase), indices: typed_indices },
+            elem_ty,
+            placement,
+            span,
+        ));
+    }
+    // List<T>[i] → T (M28). Same read shape as Array; codegen distinguishes the
+    // two by `base.ty` (List has a length word after the ARC header — ADR-0034).
+    if let ResolvedTy::List { elem } = &tbase.ty.clone() {
         let elem_ty = *elem.clone();
         let placement = tbase.placement;
         let mut typed_indices: Vec<TypedExpr> = Vec::new();
@@ -2086,6 +2602,23 @@ pub fn resolve_ty(
             Some(ResolvedTy::Array { elem: Box::new(resolved_elem), len: *len })
         }
         Ty::Buffer { dtype } => Some(ResolvedTy::Buffer { dtype: dtype.clone() }),
+        Ty::List { elem } => {
+            let resolved_elem = resolve_ty(elem, span, nominals, errors)?;
+            if resolved_elem.is_tuple() {
+                errors.push(SemaError::TupleInArrayElement { span });
+                return None;
+            }
+            Some(ResolvedTy::List { elem: Box::new(resolved_elem) })
+        }
+        // `Self` is substituted away before reaching this generic resolver — see
+        // `resolve_ty_with_self` (impl/trait method signatures) and
+        // `resolve_ty_with_subst` (generic fn signatures). Reaching this arm means
+        // `Self`/a bare type-parameter name was used somewhere neither substitutor
+        // covers (V4 fence: one type param, no nested generic positions).
+        Ty::SelfType => {
+            errors.push(SemaError::SelfOutsideImpl { span });
+            None
+        }
         Ty::Named(name) if name == "None" => Some(ResolvedTy::Unit),
         Ty::Named(name) if name == "str" => Some(ResolvedTy::Str),
         Ty::Named(name) => {
@@ -2104,6 +2637,85 @@ pub fn resolve_ty(
             errors.push(SemaError::UnknownType { name: name.clone(), span });
             None
         }
+    }
+}
+
+/// Resolve a type, substituting a bare `Self` reference with `self_ty` (M28: `impl`
+/// method signatures). Shallow only — `Self` nested inside a compound type
+/// (`Array<Self, N>`) is not substituted; not needed for the V4 fence (`Module`'s
+/// only method is `parameters(self) -> List<Tensor<f32>>`, no nested `Self`).
+fn resolve_ty_with_self(
+    ty: &Ty,
+    self_ty: &ResolvedTy,
+    span: Span,
+    nominals: &NominalMaps<'_>,
+    errors: &mut Vec<SemaError>,
+) -> Option<ResolvedTy> {
+    if matches!(ty, Ty::SelfType) {
+        return Some(self_ty.clone());
+    }
+    resolve_ty(ty, span, nominals, errors)
+}
+
+/// Resolve a type, substituting a bare `Ty::Named(subst_name)` reference with
+/// `subst_val` (M28: generic fn signatures, e.g. `T` in `fn id<T>(x: T) -> T`).
+/// Shallow only, matching the V4 fence (one type parameter, no nested generic
+/// positions like `Array<T, N>`).
+fn resolve_ty_with_subst(
+    ty: &Ty,
+    subst_name: &str,
+    subst_val: &ResolvedTy,
+    span: Span,
+    nominals: &NominalMaps<'_>,
+    errors: &mut Vec<SemaError>,
+) -> Option<ResolvedTy> {
+    if let Ty::Named(n) = ty {
+        if n == subst_name {
+            return Some(subst_val.clone());
+        }
+    }
+    resolve_ty(ty, span, nominals, errors)
+}
+
+/// Resolve a `self`-taking method's parameter list, substituting `Ty::SelfType`
+/// with `self_ty` (M28 `impl` methods).
+fn resolve_params_with_self(
+    params: &[malus_syntax::ast::Param],
+    self_ty: &ResolvedTy,
+    nominals: &NominalMaps<'_>,
+    errors: &mut Vec<SemaError>,
+) -> Option<Vec<ParamSig>> {
+    let mut out = Vec::new();
+    for p in params {
+        let ty = resolve_ty_with_self(&p.ty, self_ty, p.span, nominals, errors)?;
+        out.push(ParamSig { name: p.name.clone(), ty, is_mut: p.is_mut });
+    }
+    Some(out)
+}
+
+/// Returns the nominal name of a struct/enum type, or `None` for non-nominal
+/// types (M28: trait impls are only defined for struct/enum `for_type`s).
+fn nominal_name(ty: &ResolvedTy) -> Option<&str> {
+    match ty {
+        ResolvedTy::Struct { name, .. } => Some(name.as_str()),
+        ResolvedTy::Enum { name, .. } => Some(name.as_str()),
+        _ => None,
+    }
+}
+
+/// Produce a mangled, linker-safe suffix identifying a concrete type for generic
+/// fn monomorphization (M28). V4 fence: only struct/enum, Tensor, and Scalar types
+/// are ever substituted for a type parameter in the capstone.
+fn mangle_ty(ty: &ResolvedTy) -> String {
+    match ty {
+        ResolvedTy::Struct { name, .. } | ResolvedTy::Enum { name, .. } => name.clone(),
+        ResolvedTy::Tensor { dtype } => format!("Tensor_{}", scalar_ty_name(dtype)),
+        ResolvedTy::Scalar(s) => scalar_ty_name(s).to_string(),
+        other => other
+            .to_string()
+            .chars()
+            .map(|c| if c.is_alphanumeric() { c } else { '_' })
+            .collect(),
     }
 }
 
@@ -2205,6 +2817,27 @@ fn check_lvalue(
                     }
                     Some(TypedStmt::Assign {
                         target: TypedAssignTarget::Index { base: base_name, index: Box::new(tidx), elem_ty },
+                        expr: texpr,
+                    })
+                }
+                // `ps[i] = variable(...)` — the generic optimizer's slot-reassignment
+                // write-back mechanism (ADR-0034 D1). Distinct target variant from
+                // `Index` because List's runtime layout offsets elements by 16 bytes
+                // (ARC header + length word), not Array's 0.
+                ResolvedTy::List { elem } => {
+                    let elem_ty = *elem.clone();
+                    let tidx = check_expr(&indices[0], Some(&ResolvedTy::Scalar(ScalarTy::I64)), ctx)?;
+                    let texpr = check_expr(rhs, Some(&elem_ty), ctx)?;
+                    if texpr.ty != elem_ty {
+                        ctx.errors.push(SemaError::TypeMismatch {
+                            expected: elem_ty.clone(),
+                            found: texpr.ty.clone(),
+                            span: rhs.span,
+                        });
+                        return None;
+                    }
+                    Some(TypedStmt::Assign {
+                        target: TypedAssignTarget::ListIndex { base: base_name, index: Box::new(tidx), elem_ty },
                         expr: texpr,
                     })
                 }

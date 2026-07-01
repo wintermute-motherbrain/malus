@@ -86,6 +86,30 @@ extern "C" fn aggregate_release(ptr: i64) {
     }
 }
 
+// M28: `List<T>` release, returning the PREVIOUS refcount (unlike
+// `aggregate_release`'s `()`) so codegen can conditionally release element
+// tensors only when this was genuinely the last reference (ADR-0034). Every
+// existing `aggregate_release` call site is reached only where CTMM has
+// already statically proven single ownership (struct/tuple/enum fields are
+// unconditionally released right before it, since refcount is always exactly
+// 1 there) — `List` cannot make that same static guarantee (it may alias
+// across a call boundary, e.g. `Module::parameters` returning a model's own
+// field), so its codegen must check the *result* of the decrement instead of
+// assuming it. Frees the box itself here (same as `aggregate_release`); the
+// caller must read any data it needs (length, element handles) BEFORE calling
+// this, since the box may no longer exist once it returns.
+extern "C" fn list_release(ptr: i64) -> i64 {
+    if ptr == 0 { return 0; }
+    let prev = unsafe {
+        (*(ptr as *mut std::sync::atomic::AtomicUsize))
+            .fetch_sub(1, std::sync::atomic::Ordering::Release)
+    };
+    if prev == 1 {
+        unsafe { libc_dealloc(ptr as *mut u8); }
+    }
+    prev as i64
+}
+
 // ── Runtime symbol injection ─────────────────────────────────────────────────
 
 #[repr(C)]
@@ -360,6 +384,9 @@ fn cranelift_type(ty: &ResolvedTy) -> Result<Option<cranelift_codegen::ir::Type>
         ResolvedTy::Struct { .. } | ResolvedTy::Enum { .. } | ResolvedTy::Array { .. } => Ok(Some(I64)),
         // Buffer is a heap-allocated BufferData; opaque i64 pointer.
         ResolvedTy::Buffer { .. } => Ok(Some(I64)),
+        // M28: List<T> is a reference-counted aggregate box (ARC header + length
+        // word + elements); opaque i64 pointer, same as Struct/Array. ADR-0034.
+        ResolvedTy::List { .. } => Ok(Some(I64)),
     }
 }
 
@@ -406,6 +433,8 @@ struct Codegen<'m> {
     rt_aggregate_alloc: FuncId,
     rt_aggregate_retain: FuncId,
     rt_aggregate_release: FuncId,
+    // M28: List<T> release (returns previous refcount — ADR-0034).
+    rt_list_release: FuncId,
     // M14: tape ABI.
     rt_tape_record_binop:  FuncId,
     rt_tape_record_unary:  FuncId,
@@ -570,6 +599,18 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
 
             TypedStmt::Return { expr } => {
                 let val = self.lower_expr(expr)?;
+                // M28: `return self.field` where `field: List<T>` hands the caller
+                // an independent owned reference to a value `self` (a borrow —
+                // ADR-0025) still owns. Retain here so the aliasing is genuine
+                // (the caller's eventual `DropList` release balances this),
+                // rather than leaving `self`'s field as the value's only owner
+                // while the caller believes it holds its own reference
+                // (ADR-0034). Scoped to exactly this shape — a bare struct-field
+                // read in return position — since that's the only List-aliasing
+                // return site the V4 fence exercises (`Module::parameters`).
+                if expr.ty.is_list() && matches!(&expr.kind, TypedExprKind::FieldAccess { .. }) {
+                    self.call_aggregate_retain(val);
+                }
                 self.builder.ins().return_(&[val]);
                 Ok(true)
             }
@@ -608,6 +649,24 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                         let slot_addr = self.builder.ins().iadd(arr_ptr, byte_off);
                         let new_val = self.lower_expr(expr)?;
                         // Release old slot element (reuse emit_drop_field: slot_addr + offset 0).
+                        self.emit_drop_field(slot_addr, 0, elem_ty)?;
+                        self.builder.ins().store(
+                            cranelift_codegen::ir::MemFlags::trusted(), new_val, slot_addr, 0,
+                        );
+                    }
+                    TypedAssignTarget::ListIndex { base, index, elem_ty } => {
+                        // M28: List element assign — same shape as Array's Index arm,
+                        // but elements start at offset 16 (8-byte ARC header + 8-byte
+                        // length word), not 0 (ADR-0034). The container's own
+                        // retain/release lifecycle (DropList) is independent of this
+                        // per-slot element release.
+                        let list_ptr = self.use_var(base)?;
+                        let idx_val = self.lower_expr(index)?;
+                        let eight = self.builder.ins().iconst(I64, 8);
+                        let byte_off = self.builder.ins().imul(idx_val, eight);
+                        let elem_off = self.builder.ins().iadd_imm(byte_off, 16);
+                        let slot_addr = self.builder.ins().iadd(list_ptr, elem_off);
+                        let new_val = self.lower_expr(expr)?;
                         self.emit_drop_field(slot_addr, 0, elem_ty)?;
                         self.builder.ins().store(
                             cranelift_codegen::ir::MemFlags::trusted(), new_val, slot_addr, 0,
@@ -779,15 +838,28 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
 
             // ── M11: for-in loop over fixed arrays ────────────────────────────────
             TypedStmt::ForIn { var, iter, body } => {
-                // Load the array pointer and determine the element type + length.
+                // Load the array/list pointer and determine the element type,
+                // length, and element base offset. `Array` is headerless (offset
+                // 0, compile-time length); `List` (M28) has an ARC header +
+                // length word (offset 16, runtime length read from the box —
+                // ADR-0034).
                 let arr_ptr = self.lower_expr(iter)?;
-                let (elem_ty, len) = match &iter.ty {
-                    malus_sema::ResolvedTy::Array { elem, len } => (*elem.clone(), *len),
-                    _ => return Err(CodegenError::UnsupportedExpr("ForIn requires Array type".into())),
+                let (elem_ty, len_val, elem_base_offset) = match &iter.ty {
+                    malus_sema::ResolvedTy::Array { elem, len } => {
+                        let len_val = self.builder.ins().iconst(I64, *len as i64);
+                        (*elem.clone(), len_val, 0i32)
+                    }
+                    malus_sema::ResolvedTy::List { elem } => {
+                        let len_val = self.builder.ins().load(
+                            I64, cranelift_codegen::ir::MemFlags::trusted(), arr_ptr, 8,
+                        );
+                        (*elem.clone(), len_val, 16i32)
+                    }
+                    _ => return Err(CodegenError::UnsupportedExpr("ForIn requires Array or List type".into())),
                 };
                 let cl_ty = match cranelift_type(&elem_ty)? {
                     Some(t) => t,
-                    None => return Err(CodegenError::UnsupportedExpr("ForIn: unit-typed array element".into())),
+                    None => return Err(CodegenError::UnsupportedExpr("ForIn: unit-typed element".into())),
                 };
 
                 // Declare the loop variable (the element binding).
@@ -814,18 +886,18 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                 // Header: test i < len.
                 self.builder.switch_to_block(header_blk);
                 let cur_idx = self.builder.use_var(idx_var);
-                let len_val = self.builder.ins().iconst(I64, len as i64);
                 let cmp = self.builder.ins().icmp(
                     cranelift_codegen::ir::condcodes::IntCC::SignedLessThan, cur_idx, len_val,
                 );
                 self.builder.ins().brif(cmp, body_blk, &[], exit_blk, &[]);
 
-                // Body: load element at arr_ptr + idx * 8.
+                // Body: load element at arr_ptr + elem_base_offset + idx * 8.
                 self.builder.switch_to_block(body_blk);
                 let body_idx = self.builder.use_var(idx_var);
                 let eight = self.builder.ins().iconst(I64, 8);
                 let byte_offset_val = self.builder.ins().imul(body_idx, eight);
-                let elem_ptr = self.builder.ins().iadd(arr_ptr, byte_offset_val);
+                let elem_off = self.builder.ins().iadd_imm(byte_offset_val, elem_base_offset as i64);
+                let elem_ptr = self.builder.ins().iadd(arr_ptr, elem_off);
                 let elem_val = self.builder.ins().load(cl_ty, cranelift_codegen::ir::MemFlags::trusted(), elem_ptr, 0);
                 self.builder.def_var(elem_var, elem_val);
 
@@ -924,6 +996,50 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                     self.emit_counted_drop_loop(ptr, &elem_ty, len)?;
                 }
                 self.call_heap_free(ptr);
+                Ok(false)
+            }
+
+            // M28: `List<T>` release (ADR-0034). Unlike `DropArray`, this is a
+            // genuine reference count, not an unconditional free — `List` values
+            // may alias across a call boundary (e.g. `Module::parameters`
+            // returning a model's own field by identity) that neither CTMM nor
+            // M29's (intraprocedural-only) borrow-inference can prove safe to
+            // free unconditionally.
+            //
+            // Ordering is load-bearing: we PEEK the refcount (a plain read, safe
+            // under this single-threaded JIT execution model — no other malus
+            // code can concurrently mutate the same box), and if it looks like 1
+            // (we're about to be the last reference), release each element
+            // *before* the one call that actually performs the atomic decrement
+            // (`call_list_release`, at the very end, common to both branches).
+            // That call may deallocate the box, so nothing after it may read
+            // through `ptr` again — reading the length and releasing elements
+            // must happen strictly before it.
+            TypedStmt::DropList { name, elem_ty } => {
+                let ptr = self.use_var(name)?;
+                let elem_ty = elem_ty.clone();
+                let refcount = self.builder.ins().load(I64, cranelift_codegen::ir::MemFlags::trusted(), ptr, 0);
+                let one = self.builder.ins().iconst(I64, 1);
+                let is_last = self.builder.ins().icmp(cranelift_codegen::ir::condcodes::IntCC::Equal, refcount, one);
+
+                let last_blk = self.builder.create_block();
+                let merge_blk = self.builder.create_block();
+                self.builder.ins().brif(is_last, last_blk, &[], merge_blk, &[]);
+
+                self.builder.switch_to_block(last_blk);
+                self.builder.seal_block(last_blk);
+                if elem_ty.is_tensor() {
+                    let len_val = self.builder.ins().load(I64, cranelift_codegen::ir::MemFlags::trusted(), ptr, 8);
+                    self.emit_list_element_drop_loop(ptr, len_val)?;
+                }
+                // Struct/Enum/Array-typed List elements are out of V4 scope (ADR-0034
+                // — the capstone only ever instantiates `List<Tensor<f32>>`); silently
+                // skipped rather than attempted, matching the documented fence.
+                self.builder.ins().jump(merge_blk, &[]);
+
+                self.builder.switch_to_block(merge_blk);
+                self.builder.seal_block(merge_blk);
+                self.call_list_release(ptr);
                 Ok(false)
             }
 
@@ -1333,6 +1449,61 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
         Ok(())
     }
 
+    /// M28: emit a loop that releases each `Tensor`-typed element of a
+    /// `List<Tensor<f32>>` at `list_ptr`, for a RUNTIME-known `len_val` (unlike
+    /// `emit_counted_drop_loop`'s compile-time `len: usize` — `List` carries its
+    /// length in the box, not the type). Elements start at offset 16 (ARC header
+    /// + length word), not `Array`'s 0. Only called when the caller has already
+    /// confirmed `elem_ty.is_tensor()` — V4 scope is `List<Tensor<f32>>` only
+    /// (ADR-0034); non-tensor List elements are not released here.
+    fn emit_list_element_drop_loop(
+        &mut self,
+        list_ptr: cranelift_codegen::ir::Value,
+        len_val: cranelift_codegen::ir::Value,
+    ) -> Result<(), CodegenError> {
+        let idx_var = Variable::from_u32(self.next_var as u32);
+        self.next_var += 1;
+        self.builder.declare_var(idx_var, I64);
+        let zero = self.builder.ins().iconst(I64, 0);
+        self.builder.def_var(idx_var, zero);
+
+        let header_blk = self.builder.create_block();
+        let body_blk   = self.builder.create_block();
+        let exit_blk   = self.builder.create_block();
+
+        self.builder.ins().jump(header_blk, &[]);
+
+        self.builder.switch_to_block(header_blk);
+        let cur = self.builder.use_var(idx_var);
+        let cmp = self.builder.ins().icmp(
+            cranelift_codegen::ir::condcodes::IntCC::SignedLessThan, cur, len_val,
+        );
+        self.builder.ins().brif(cmp, body_blk, &[], exit_blk, &[]);
+
+        self.builder.switch_to_block(body_blk);
+        self.builder.seal_block(body_blk);
+        let body_cur = self.builder.use_var(idx_var);
+        let eight = self.builder.ins().iconst(I64, 8);
+        let byte_off = self.builder.ins().imul(body_cur, eight);
+        let elem_off = self.builder.ins().iadd_imm(byte_off, 16);
+        let elem_ptr = self.builder.ins().iadd(list_ptr, elem_off);
+        let handle = self.builder.ins().load(
+            I64, cranelift_codegen::ir::MemFlags::trusted(), elem_ptr, 0,
+        );
+        self.call_runtime_release(handle);
+        let cur2 = self.builder.use_var(idx_var);
+        let one = self.builder.ins().iconst(I64, 1);
+        let next = self.builder.ins().iadd(cur2, one);
+        self.builder.def_var(idx_var, next);
+        self.builder.ins().jump(header_blk, &[]);
+        self.builder.seal_block(header_blk);
+
+        self.builder.switch_to_block(exit_blk);
+        self.builder.seal_block(exit_blk);
+
+        Ok(())
+    }
+
     fn import_func(&mut self, func_id: FuncId) -> cranelift_codegen::ir::FuncRef {
         self.codegen.module.declare_func_in_func(func_id, self.builder.func)
     }
@@ -1629,6 +1800,12 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                     let func_ref = self.import_func(self.codegen.rt_malus_str_len);
                     let call = self.builder.ins().call(func_ref, &[s]);
                     Ok(self.builder.inst_results(call).to_vec()[0])
+                } else if callee == "len" {
+                    // M28: len(lst) — the length word lives inline in the box at
+                    // offset 8 (ARC header + length — ADR-0034); no runtime call
+                    // needed.
+                    let list_ptr = self.lower_expr(&args[0])?;
+                    Ok(self.builder.ins().load(I64, cranelift_codegen::ir::MemFlags::trusted(), list_ptr, 8))
                 } else if callee == "str_char_at" {
                     let s = self.lower_expr(&args[0])?;
                     let i = self.lower_expr(&args[1])?;
@@ -1784,12 +1961,51 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                         let call = self.builder.ins().call(func_ref, &[ten_handle, idx_val]);
                         Ok(self.builder.inst_results(call).to_vec()[0])
                     }
-                    _ => Err(CodegenError::UnsupportedExpr("Index: only Array, Buffer, or Tensor<f32> indexing is supported".into())),
+                    // M28: List<T>[i] — same read shape as Array, but elements start
+                    // at offset 16 (ARC header + length word), not 0 (ADR-0034).
+                    ResolvedTy::List { .. } => {
+                        let list_ptr = self.lower_expr(base)?;
+                        let idx_val = self.lower_expr(&indices[0])?;
+                        let eight = self.builder.ins().iconst(I64, 8);
+                        let byte_off = self.builder.ins().imul(idx_val, eight);
+                        let elem_off = self.builder.ins().iadd_imm(byte_off, 16);
+                        let elem_ptr = self.builder.ins().iadd(list_ptr, elem_off);
+                        let cl_ty = match cranelift_type(&expr.ty)? {
+                            Some(t) => t,
+                            None => return Err(CodegenError::UnsupportedExpr("Index: unit element type".into())),
+                        };
+                        let val = self.builder.ins().load(cl_ty, cranelift_codegen::ir::MemFlags::trusted(), elem_ptr, 0);
+                        Ok(val)
+                    }
+                    _ => Err(CodegenError::UnsupportedExpr("Index: only Array, Buffer, Tensor<f32>, or List indexing is supported".into())),
                 }
             }
 
             TypedExprKind::ArrayLiteral { elements } => {
                 let n = elements.len();
+                // M28: a List<T> literal is a reference-counted aggregate — ARC
+                // header (8 bytes) + length word (8 bytes) + N element slots
+                // (ADR-0034) — NOT Array's headerless `[e0, e1, ...]` layout.
+                // Disambiguated purely by this expr's resolved type (List vs
+                // Array); both share the same `ArrayLiteral` typed-IR node.
+                if expr.ty.is_list() {
+                    let size = (16 + n * 8) as i64;
+                    let list_ptr = self.call_aggregate_alloc(size);
+                    let len_val = self.builder.ins().iconst(I64, n as i64);
+                    self.builder.ins().store(
+                        cranelift_codegen::ir::MemFlags::trusted(), len_val, list_ptr, 8,
+                    );
+                    for (i, elem_expr) in elements.iter().enumerate() {
+                        let val = self.lower_expr(elem_expr)?;
+                        self.builder.ins().store(
+                            cranelift_codegen::ir::MemFlags::trusted(),
+                            val,
+                            list_ptr,
+                            16 + (i as i32) * 8,
+                        );
+                    }
+                    return Ok(list_ptr);
+                }
                 // Heap-allocate N * 8 bytes (uniform 8-byte slots like structs).
                 let size = (n * 8) as i64;
                 let size_val = self.builder.ins().iconst(self.codegen.ptr_type(), size);
@@ -2483,6 +2699,14 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
         self.builder.ins().call(func_ref, &[ptr]);
     }
 
+    /// M28: `List<T>` release — returns the refcount *before* the decrement, so
+    /// callers can branch on whether this was the last reference (ADR-0034).
+    fn call_list_release(&mut self, ptr: cranelift_codegen::ir::Value) -> cranelift_codegen::ir::Value {
+        let func_ref = self.import_func(self.codegen.rt_list_release);
+        let call = self.builder.ins().call(func_ref, &[ptr]);
+        self.builder.inst_results(call).to_vec()[0]
+    }
+
     // M14 tape helpers.
 
     fn call_tape_record_binop(
@@ -2910,6 +3134,8 @@ pub fn compile_and_run(
     jit_builder.symbol("aggregate_alloc",        aggregate_alloc                as *const u8);
     jit_builder.symbol("aggregate_retain",       aggregate_retain               as *const u8);
     jit_builder.symbol("aggregate_release",      aggregate_release              as *const u8);
+    // M28 List<T> release (returns previous refcount — ADR-0034).
+    jit_builder.symbol("list_release",           list_release                   as *const u8);
     // M14 tape ABI — from RuntimeSymbols (live in malus-runtime).
     jit_builder.symbol("tape_record_binop",      symbols.tape_record_binop      as *const u8);
     jit_builder.symbol("tape_record_unary",      symbols.tape_record_unary      as *const u8);
@@ -3103,6 +3329,15 @@ pub fn compile_and_run(
     let rt_aggregate_retain = module.declare_function("aggregate_retain", Linkage::Import, &sig_agg_rc)
         .map_err(|e| CodegenError::JitError(e.to_string()))?;
     let rt_aggregate_release = module.declare_function("aggregate_release", Linkage::Import, &sig_agg_rc)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
+    // M28: list_release(ptr: i64) -> i64  (previous refcount — ADR-0034)
+    let sig_list_release = {
+        let mut s = Signature::new(call_conv);
+        s.params.push(AbiParam::new(I64));
+        s.returns.push(AbiParam::new(I64));
+        s
+    };
+    let rt_list_release = module.declare_function("list_release", Linkage::Import, &sig_list_release)
         .map_err(|e| CodegenError::JitError(e.to_string()))?;
 
     // M14 tape ABI signatures.
@@ -3430,6 +3665,7 @@ pub fn compile_and_run(
         rt_aggregate_alloc,
         rt_aggregate_retain,
         rt_aggregate_release,
+        rt_list_release,
         rt_tape_record_binop,
         rt_tape_record_unary,
         rt_tape_register_leaf,

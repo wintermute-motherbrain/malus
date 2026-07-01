@@ -24,10 +24,10 @@
 //   8. `insert_drops`                — outer body only
 //   9. `insert_barriers`             — outer body with precise recursive boundary check
 
-use std::collections::{HashMap, HashSet};
-use malus_syntax::ast::Placement;
 use crate::ty::ResolvedTy;
 use crate::typed_ir::{TypedExpr, TypedExprKind, TypedProgram, TypedStmt};
+use malus_syntax::ast::Placement;
+use std::collections::{HashMap, HashSet};
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
@@ -53,7 +53,9 @@ pub fn annotate_fns(program: &mut TypedProgram) {
     let fn_param_grad = program.fn_param_grad.clone();
     for f in program.fns.iter_mut() {
         let grad_flags = fn_param_grad.get(&f.name).cloned().unwrap_or_default();
-        let grad_params: Vec<(String, ResolvedTy)> = f.params.iter()
+        let grad_params: Vec<(String, ResolvedTy)> = f
+            .params
+            .iter()
             .zip(grad_flags.iter().chain(std::iter::repeat(&false)))
             .filter(|(p, g)| **g && p.ty.is_tensor())
             .map(|(p, _)| (p.name.clone(), p.ty.clone()))
@@ -80,6 +82,7 @@ fn annotate_body_seeded(body: &mut Vec<TypedStmt>, seed: &[(String, ResolvedTy)]
     // will be hoisted in step 3 when `annotate_body` recurses into them.
     hoist_gpu_subexprs(body);
     insert_variable_arc_retains(body);
+    insert_list_retains(body);
     hoist_gpu_producing_returns(body);
 
     // Step 3: recurse into each inner scope *before* running the outer passes.
@@ -153,12 +156,19 @@ fn fold_assign_grad(body: &[TypedStmt], out: &mut HashSet<String>) {
     use crate::typed_ir::TypedAssignTarget;
     for s in body {
         match s {
-            TypedStmt::Assign { target: TypedAssignTarget::Ident(name), expr } => {
+            TypedStmt::Assign {
+                target: TypedAssignTarget::Ident(name),
+                expr,
+            } => {
                 if expr.grad_tracked {
                     out.insert(name.clone());
                 }
             }
-            TypedStmt::If { then_body, else_body, .. } => {
+            TypedStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
                 fold_assign_grad(then_body, out);
                 if let Some(eb) = else_body {
                     fold_assign_grad(eb, out);
@@ -185,9 +195,15 @@ fn fold_assign_grad(body: &[TypedStmt], out: &mut HashSet<String>) {
 fn recurse_into_inner_scopes(body: &mut Vec<TypedStmt>) {
     for stmt in body.iter_mut() {
         match stmt {
-            TypedStmt::If { then_body, else_body, .. } => {
+            TypedStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
                 annotate_body(then_body);
-                if let Some(eb) = else_body { annotate_body(eb); }
+                if let Some(eb) = else_body {
+                    annotate_body(eb);
+                }
             }
             TypedStmt::For { body, .. }
             | TypedStmt::While { body, .. }
@@ -213,7 +229,9 @@ fn annotate_match_arms(body: &mut Vec<TypedStmt>) {
     for stmt in body.iter_mut() {
         if let TypedStmt::Match { arms, .. } = stmt {
             for arm in arms.iter_mut() {
-                let tensor_binds: Vec<(String, ResolvedTy)> = arm.bindings.iter()
+                let tensor_binds: Vec<(String, ResolvedTy)> = arm
+                    .bindings
+                    .iter()
                     .filter(|(_, t)| t.is_tensor())
                     .cloned()
                     .collect();
@@ -282,7 +300,10 @@ fn hoist_gpu_subexprs(body: &mut Vec<TypedStmt>) {
                     let placement = expr.placement;
                     let span = expr.span;
                     let grad_tracked = expr.grad_tracked;
-                    hoisted.push(TypedStmt::Let { name: tmp_name.clone(), expr });
+                    hoisted.push(TypedStmt::Let {
+                        name: tmp_name.clone(),
+                        expr,
+                    });
                     TypedExpr {
                         kind: TypedExprKind::Ident(tmp_name),
                         ty,
@@ -326,15 +347,26 @@ fn hoist_gpu_in_expr(
         TypedExprKind::Call { callee, args } => {
             let new_args = hoist_args(args, hoisted, counter);
             TypedExpr {
-                kind: TypedExprKind::Call { callee, args: new_args },
+                kind: TypedExprKind::Call {
+                    callee,
+                    args: new_args,
+                },
                 span,
                 ..expr
             }
         }
-        TypedExprKind::KernelCall { callee, args, in_flight } => {
+        TypedExprKind::KernelCall {
+            callee,
+            args,
+            in_flight,
+        } => {
             let new_args = hoist_args(args, hoisted, counter);
             TypedExpr {
-                kind: TypedExprKind::KernelCall { callee, args: new_args, in_flight },
+                kind: TypedExprKind::KernelCall {
+                    callee,
+                    args: new_args,
+                    in_flight,
+                },
                 span,
                 ..expr
             }
@@ -347,7 +379,11 @@ fn hoist_gpu_in_expr(
             let lhs = hoist_if_gpu_tensor(lhs, hoisted, counter);
             let rhs = hoist_if_gpu_tensor(rhs, hoisted, counter);
             TypedExpr {
-                kind: TypedExprKind::BinOp { op, lhs: Box::new(lhs), rhs: Box::new(rhs) },
+                kind: TypedExprKind::BinOp {
+                    op,
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                },
                 span,
                 ..expr
             }
@@ -356,18 +392,31 @@ fn hoist_gpu_in_expr(
             let operand = hoist_gpu_in_expr(*operand, hoisted, counter);
             let operand = hoist_if_gpu_tensor(operand, hoisted, counter);
             TypedExpr {
-                kind: TypedExprKind::Unary { op, operand: Box::new(operand) },
+                kind: TypedExprKind::Unary {
+                    op,
+                    operand: Box::new(operand),
+                },
                 span,
                 ..expr
             }
         }
-        TypedExprKind::TensorLiteral { placement, dtype, elements, shape } => {
+        TypedExprKind::TensorLiteral {
+            placement,
+            dtype,
+            elements,
+            shape,
+        } => {
             let new_elements = elements
                 .into_iter()
                 .map(|e| hoist_gpu_in_expr(e, hoisted, counter))
                 .collect();
             TypedExpr {
-                kind: TypedExprKind::TensorLiteral { placement, dtype, elements: new_elements, shape },
+                kind: TypedExprKind::TensorLiteral {
+                    placement,
+                    dtype,
+                    elements: new_elements,
+                    shape,
+                },
                 span,
                 ..expr
             }
@@ -379,28 +428,31 @@ fn hoist_gpu_in_expr(
                 .map(|i| hoist_gpu_in_expr(i, hoisted, counter))
                 .collect();
             TypedExpr {
-                kind: TypedExprKind::Index { base: new_base, indices: new_indices },
-                span,
-                ..expr
-            }
-        }
-        TypedExprKind::FieldAccess { base, field } => {
-            TypedExpr {
-                kind: TypedExprKind::FieldAccess {
-                    base: Box::new(hoist_gpu_in_expr(*base, hoisted, counter)),
-                    field,
+                kind: TypedExprKind::Index {
+                    base: new_base,
+                    indices: new_indices,
                 },
                 span,
                 ..expr
             }
         }
+        TypedExprKind::FieldAccess { base, field } => TypedExpr {
+            kind: TypedExprKind::FieldAccess {
+                base: Box::new(hoist_gpu_in_expr(*base, hoisted, counter)),
+                field,
+            },
+            span,
+            ..expr
+        },
         TypedExprKind::ArrayLiteral { elements } => {
             let new_elements = elements
                 .into_iter()
                 .map(|e| hoist_gpu_in_expr(e, hoisted, counter))
                 .collect();
             TypedExpr {
-                kind: TypedExprKind::ArrayLiteral { elements: new_elements },
+                kind: TypedExprKind::ArrayLiteral {
+                    elements: new_elements,
+                },
                 span,
                 ..expr
             }
@@ -411,21 +463,21 @@ fn hoist_gpu_in_expr(
                 .map(|e| hoist_gpu_in_expr(e, hoisted, counter))
                 .collect();
             TypedExpr {
-                kind: TypedExprKind::TupleInit { elements: new_elements },
-                span,
-                ..expr
-            }
-        }
-        TypedExprKind::TupleIndex { base, index } => {
-            TypedExpr {
-                kind: TypedExprKind::TupleIndex {
-                    base: Box::new(hoist_gpu_in_expr(*base, hoisted, counter)),
-                    index,
+                kind: TypedExprKind::TupleInit {
+                    elements: new_elements,
                 },
                 span,
                 ..expr
             }
         }
+        TypedExprKind::TupleIndex { base, index } => TypedExpr {
+            kind: TypedExprKind::TupleIndex {
+                base: Box::new(hoist_gpu_in_expr(*base, hoisted, counter)),
+                index,
+            },
+            span,
+            ..expr
+        },
         _ => expr,
     }
 }
@@ -445,8 +497,17 @@ fn hoist_if_gpu_tensor(
         let placement = operand.placement;
         let span = operand.span;
         let grad_tracked = operand.grad_tracked;
-        hoisted.push(TypedStmt::Let { name: name.clone(), expr: operand });
-        TypedExpr { kind: TypedExprKind::Ident(name), ty, placement, span, grad_tracked }
+        hoisted.push(TypedStmt::Let {
+            name: name.clone(),
+            expr: operand,
+        });
+        TypedExpr {
+            kind: TypedExprKind::Ident(name),
+            ty,
+            placement,
+            span,
+            grad_tracked,
+        }
     } else {
         operand
     }
@@ -467,7 +528,10 @@ fn hoist_args(
             let placement = arg.placement;
             let span = arg.span;
             let grad_tracked = arg.grad_tracked;
-            hoisted.push(TypedStmt::Let { name: name.clone(), expr: arg });
+            hoisted.push(TypedStmt::Let {
+                name: name.clone(),
+                expr: arg,
+            });
             new_args.push(TypedExpr {
                 kind: TypedExprKind::Ident(name),
                 ty,
@@ -490,22 +554,35 @@ fn hoist_gpu_producing_returns(body: &mut Vec<TypedStmt>) {
     while i < body.len() {
         if let TypedStmt::Return { expr } = &body[i] {
             if is_gpu_producing(expr) && expr.ty.is_tensor() {
-                let expr = if let TypedStmt::Return { expr } = body.remove(i) { expr } else { unreachable!() };
+                let expr = if let TypedStmt::Return { expr } = body.remove(i) {
+                    expr
+                } else {
+                    unreachable!()
+                };
                 let name = format!("__malus_ret_{}", counter);
                 counter += 1;
                 let ret_ty = expr.ty.clone();
                 let span = expr.span;
                 let grad_tracked = expr.grad_tracked;
-                body.insert(i, TypedStmt::Let { name: name.clone(), expr });
-                body.insert(i + 1, TypedStmt::Return {
-                    expr: TypedExpr {
-                        kind: TypedExprKind::Ident(name.clone()),
-                        ty: ret_ty,
-                        placement: None,
-                        span,
-                        grad_tracked,
+                body.insert(
+                    i,
+                    TypedStmt::Let {
+                        name: name.clone(),
+                        expr,
                     },
-                });
+                );
+                body.insert(
+                    i + 1,
+                    TypedStmt::Return {
+                        expr: TypedExpr {
+                            kind: TypedExprKind::Ident(name.clone()),
+                            ty: ret_ty,
+                            placement: None,
+                            span,
+                            grad_tracked,
+                        },
+                    },
+                );
                 i += 2;
                 continue;
             }
@@ -524,16 +601,23 @@ fn hoist_gpu_producing_returns(body: &mut Vec<TypedStmt>) {
 ///
 /// Must run after `hoist_gpu_subexprs` (D6 guard ensures the RHS no longer
 /// references the target, making the early Drop safe).
-fn insert_assign_drops(body: &mut Vec<TypedStmt>, escaping: &HashSet<String>, grad_names: &HashSet<String>) {
+fn insert_assign_drops(
+    body: &mut Vec<TypedStmt>,
+    escaping: &HashSet<String>,
+    grad_names: &HashSet<String>,
+) {
     use crate::typed_ir::TypedAssignTarget;
     let mut i = 0;
     while i < body.len() {
         match &body[i] {
             // Ident target: drop the old binding value (same as before).
-            TypedStmt::Assign { target: TypedAssignTarget::Ident(name), expr }
-                if !escaping.contains(name) =>
-            {
-                if let Some(drop_stmt) = make_drop_stmt_for_ty(name, &expr.ty, grad_names.contains(name.as_str())) {
+            TypedStmt::Assign {
+                target: TypedAssignTarget::Ident(name),
+                expr,
+            } if !escaping.contains(name) => {
+                if let Some(drop_stmt) =
+                    make_drop_stmt_for_ty(name, &expr.ty, grad_names.contains(name.as_str()))
+                {
                     body.insert(i, drop_stmt);
                     i += 1;
                 }
@@ -542,15 +626,27 @@ fn insert_assign_drops(body: &mut Vec<TypedStmt>, escaping: &HashSet<String>, gr
             // The codegen handles the old-element-release inline (load old slot →
             // tensor_release/tensor_free → store new), after the RHS has been fully
             // evaluated into a temp by `hoist_gpu_subexprs`.
-            TypedStmt::Assign { target: TypedAssignTarget::Index { .. } | TypedAssignTarget::Field { .. } | TypedAssignTarget::BufferIndex { .. }, .. } => {}
+            TypedStmt::Assign {
+                target:
+                    TypedAssignTarget::Index { .. }
+                    | TypedAssignTarget::Field { .. }
+                    | TypedAssignTarget::BufferIndex { .. },
+                ..
+            } => {}
             _ => {}
         }
         // Recurse into inner bodies so outer-scope `let mut` bindings reassigned
         // inside a loop get a Drop before each inner Assign.
         match &mut body[i] {
-            TypedStmt::If { then_body, else_body, .. } => {
+            TypedStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
                 insert_assign_drops(then_body, escaping, grad_names);
-                if let Some(eb) = else_body { insert_assign_drops(eb, escaping, grad_names); }
+                if let Some(eb) = else_body {
+                    insert_assign_drops(eb, escaping, grad_names);
+                }
             }
             TypedStmt::For { body: inner, .. }
             | TypedStmt::While { body: inner, .. }
@@ -575,28 +671,42 @@ fn make_drop_stmt_for_ty(name: &str, ty: &ResolvedTy, grad_tracked: bool) -> Opt
     match ty {
         ResolvedTy::Tensor { .. } => {
             if grad_tracked {
-                Some(TypedStmt::Release { name: name.to_string() })
+                Some(TypedStmt::Release {
+                    name: name.to_string(),
+                })
             } else {
-                Some(TypedStmt::Drop { name: name.to_string() })
+                Some(TypedStmt::Drop {
+                    name: name.to_string(),
+                })
             }
         }
         // Str is a leaked whole-program-lifetime buffer (ADR-0018). No drop needed.
         ResolvedTy::Str => None,
         ResolvedTy::Struct { fields, .. } => {
             let droppable_fields = droppable_struct_fields(fields);
-            Some(TypedStmt::DropStruct { name: name.to_string(), droppable_fields, retained_agg_slots: vec![] })
+            Some(TypedStmt::DropStruct {
+                name: name.to_string(),
+                droppable_fields,
+                retained_agg_slots: vec![],
+            })
         }
         ResolvedTy::Enum { variants, .. } => {
             let drop_variants = droppable_enum_variants(variants);
-            Some(TypedStmt::DropEnum { name: name.to_string(), variants: drop_variants })
+            Some(TypedStmt::DropEnum {
+                name: name.to_string(),
+                variants: drop_variants,
+            })
         }
         // All arrays own heap memory (the box itself), so always emit DropArray.
         // Codegen handles whether to loop and release elements (only for owned types).
-        ResolvedTy::Array { elem, len } => {
-            Some(TypedStmt::DropArray { name: name.to_string(), elem_ty: *elem.clone(), len: *len })
-        }
+        ResolvedTy::Array { elem, len } => Some(TypedStmt::DropArray {
+            name: name.to_string(),
+            elem_ty: *elem.clone(),
+            len: *len,
+        }),
         ResolvedTy::Tuple(elements) => {
-            let droppable_fields: Vec<(usize, ResolvedTy)> = elements.iter()
+            let droppable_fields: Vec<(usize, ResolvedTy)> = elements
+                .iter()
                 .enumerate()
                 .filter_map(|(i, ty)| {
                     if ty.is_tensor() {
@@ -606,15 +716,32 @@ fn make_drop_stmt_for_ty(name: &str, ty: &ResolvedTy, grad_tracked: bool) -> Opt
                     }
                 })
                 .collect();
-            Some(TypedStmt::DropTuple { name: name.to_string(), droppable_fields })
+            Some(TypedStmt::DropTuple {
+                name: name.to_string(),
+                droppable_fields,
+            })
         }
-        ResolvedTy::Buffer { .. } => Some(TypedStmt::DropBuffer { name: name.to_string() }),
+        ResolvedTy::Buffer { .. } => Some(TypedStmt::DropBuffer {
+            name: name.to_string(),
+        }),
+        // M28: `List<T>` is ALWAYS reference-counted (ADR-0034) — never a static
+        // Drop, regardless of `grad_tracked` (that flag is about element content,
+        // orthogonal to the container's own lifetime; see the ADR-0030 gotcha).
+        // Identity-returning a struct's List field (e.g. `Module::parameters`)
+        // creates aliasing across a call boundary that neither this pass nor
+        // M29's (intraprocedural-only) borrow-inference can prove safe to
+        // statically free — RC is the sound fallback.
+        ResolvedTy::List { elem } => Some(TypedStmt::DropList {
+            name: name.to_string(),
+            elem_ty: *elem.clone(),
+        }),
         _ => None,
     }
 }
 
 fn droppable_struct_fields(fields: &[(String, ResolvedTy)]) -> Vec<(usize, ResolvedTy)> {
-    fields.iter()
+    fields
+        .iter()
         .enumerate()
         .filter_map(|(i, (_, ty))| {
             if ty.is_tensor() || ty.is_struct() || ty.is_enum() {
@@ -629,10 +756,12 @@ fn droppable_struct_fields(fields: &[(String, ResolvedTy)]) -> Vec<(usize, Resol
 fn droppable_enum_variants(
     variants: &[(String, Vec<(String, ResolvedTy)>)],
 ) -> Vec<(u32, Vec<(usize, ResolvedTy)>, Vec<usize>)> {
-    variants.iter()
+    variants
+        .iter()
         .enumerate()
         .map(|(tag, (_, fields))| {
-            let droppable = fields.iter()
+            let droppable = fields
+                .iter()
                 .enumerate()
                 .filter_map(|(i, (_, ty))| {
                     if ty.is_tensor() || ty.is_struct() || ty.is_enum() {
@@ -718,7 +847,8 @@ fn inject_early_return_unwinds(
     // For each control-flow node at outer position i, any binding whose Drop
     // is after i is "live" there and needs unwinding at any early Return inside.
     for i in 0..body.len() {
-        let live_here: HashSet<String> = drop_positions.iter()
+        let live_here: HashSet<String> = drop_positions
+            .iter()
             .filter(|(_, &pos)| pos > i)
             .map(|(name, _)| name.clone())
             .collect();
@@ -727,15 +857,24 @@ fn inject_early_return_unwinds(
         }
         // We can't hold a mutable borrow to body[i] via index while also
         // having live_here referencing drop_positions — use an index match.
-        let is_cf = matches!(&body[i],
-            TypedStmt::If { .. } | TypedStmt::For { .. }
-            | TypedStmt::While { .. } | TypedStmt::ForIn { .. }
-            | TypedStmt::Match { .. } | TypedStmt::NoGrad { .. });
+        let is_cf = matches!(
+            &body[i],
+            TypedStmt::If { .. }
+                | TypedStmt::For { .. }
+                | TypedStmt::While { .. }
+                | TypedStmt::ForIn { .. }
+                | TypedStmt::Match { .. }
+                | TypedStmt::NoGrad { .. }
+        );
         if !is_cf {
             continue;
         }
         match &mut body[i] {
-            TypedStmt::If { then_body, else_body, .. } => {
+            TypedStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
                 inject_unwind_in_body(then_body, &live_here, local_types, grad_names);
                 if let Some(eb) = else_body {
                     inject_unwind_in_body(eb, &live_here, local_types, grad_names);
@@ -783,12 +922,19 @@ fn inject_unwind_in_body(
                 }
                 // Skip past the Return (no inner scopes inside it).
             }
-            TypedStmt::If { .. } | TypedStmt::For { .. }
-            | TypedStmt::While { .. } | TypedStmt::ForIn { .. }
-            | TypedStmt::Match { .. } | TypedStmt::NoGrad { .. } => {
+            TypedStmt::If { .. }
+            | TypedStmt::For { .. }
+            | TypedStmt::While { .. }
+            | TypedStmt::ForIn { .. }
+            | TypedStmt::Match { .. }
+            | TypedStmt::NoGrad { .. } => {
                 // Recurse into nested control flow.
                 match &mut body[i] {
-                    TypedStmt::If { then_body, else_body, .. } => {
+                    TypedStmt::If {
+                        then_body,
+                        else_body,
+                        ..
+                    } => {
                         inject_unwind_in_body(then_body, live_outer, local_types, grad_names);
                         if let Some(eb) = else_body {
                             inject_unwind_in_body(eb, live_outer, local_types, grad_names);
@@ -802,7 +948,12 @@ fn inject_unwind_in_body(
                     }
                     TypedStmt::Match { arms, .. } => {
                         for arm in arms.iter_mut() {
-                            inject_unwind_in_body(&mut arm.body, live_outer, local_types, grad_names);
+                            inject_unwind_in_body(
+                                &mut arm.body,
+                                live_outer,
+                                local_types,
+                                grad_names,
+                            );
                         }
                     }
                     _ => {}
@@ -819,7 +970,9 @@ fn make_unwind_drop(
     local_types: &HashMap<String, ResolvedTy>,
     grad_names: &HashSet<String>,
 ) -> Option<TypedStmt> {
-    local_types.get(name).and_then(|ty| make_drop_stmt_for_ty(name, ty, grad_names.contains(name)))
+    local_types
+        .get(name)
+        .and_then(|ty| make_drop_stmt_for_ty(name, ty, grad_names.contains(name)))
 }
 
 // ── Phase 1.6 (M12): Break/Continue unwind ────────────────────────────────────
@@ -866,7 +1019,8 @@ fn inject_break_continue_unwinds(
     let mut i = 0;
     while i < body.len() {
         // Compute the set of locals whose Drop is after position i (live at i).
-        let live_here: HashSet<String> = drop_positions.iter()
+        let live_here: HashSet<String> = drop_positions
+            .iter()
             .filter(|(_, &pos)| pos > i)
             .map(|(name, _)| name.clone())
             .collect();
@@ -879,7 +1033,8 @@ fn inject_break_continue_unwinds(
         match &body[i] {
             TypedStmt::Break | TypedStmt::Continue => {
                 // Insert drops for all live locals immediately before the jump.
-                let mut to_drop: Vec<String> = live_here.into_iter()
+                let mut to_drop: Vec<String> = live_here
+                    .into_iter()
                     .filter(|n| local_types.contains_key(n.as_str()))
                     .collect();
                 to_drop.sort();
@@ -915,7 +1070,8 @@ fn inject_bc_unwind_in_body(
     while i < inner.len() {
         match &inner[i] {
             TypedStmt::Break | TypedStmt::Continue => {
-                let mut to_drop: Vec<String> = live_outer.iter()
+                let mut to_drop: Vec<String> = live_outer
+                    .iter()
                     .filter(|n| local_types.contains_key(n.as_str()))
                     .cloned()
                     .collect();
@@ -932,7 +1088,11 @@ fn inject_bc_unwind_in_body(
             }
             TypedStmt::If { .. } | TypedStmt::Match { .. } | TypedStmt::NoGrad { .. } => {
                 match &mut inner[i] {
-                    TypedStmt::If { then_body, else_body, .. } => {
+                    TypedStmt::If {
+                        then_body,
+                        else_body,
+                        ..
+                    } => {
                         inject_bc_unwind_in_body(then_body, live_outer, local_types, grad_names);
                         if let Some(eb) = else_body {
                             inject_bc_unwind_in_body(eb, live_outer, local_types, grad_names);
@@ -940,7 +1100,12 @@ fn inject_bc_unwind_in_body(
                     }
                     TypedStmt::Match { arms, .. } => {
                         for arm in arms.iter_mut() {
-                            inject_bc_unwind_in_body(&mut arm.body, live_outer, local_types, grad_names);
+                            inject_bc_unwind_in_body(
+                                &mut arm.body,
+                                live_outer,
+                                local_types,
+                                grad_names,
+                            );
                         }
                     }
                     TypedStmt::NoGrad { body: inner_body } => {
@@ -966,7 +1131,11 @@ fn inject_bc_unwind_in_body_mut(
     grad_names: &HashSet<String>,
 ) {
     match &mut body[idx] {
-        TypedStmt::If { then_body, else_body, .. } => {
+        TypedStmt::If {
+            then_body,
+            else_body,
+            ..
+        } => {
             inject_bc_unwind_in_body(then_body, live_here, local_types, grad_names);
             if let Some(eb) = else_body {
                 inject_bc_unwind_in_body(eb, live_here, local_types, grad_names);
@@ -1022,9 +1191,14 @@ fn insert_barriers(body: &mut Vec<TypedStmt>) {
         // Control-flow nodes: if any pending tensor is referenced anywhere inside
         // the node, emit a barrier before it and clear pending.  The inner bodies
         // already received their own barrier pass in `annotate_body` step 3.
-        if matches!(&body[i], TypedStmt::If { .. } | TypedStmt::For { .. }
-                | TypedStmt::While { .. } | TypedStmt::ForIn { .. }
-                | TypedStmt::NoGrad { .. }) {
+        if matches!(
+            &body[i],
+            TypedStmt::If { .. }
+                | TypedStmt::For { .. }
+                | TypedStmt::While { .. }
+                | TypedStmt::ForIn { .. }
+                | TypedStmt::NoGrad { .. }
+        ) {
             if !pending.is_empty() {
                 let mut referenced = HashSet::new();
                 collect_idents_in_stmt(&body[i], &mut referenced);
@@ -1075,6 +1249,7 @@ fn extract_gpu_producing_expr(stmt: &TypedStmt) -> Option<(Vec<String>, Option<S
         | TypedStmt::DropEnum { .. }
         | TypedStmt::DropArray { .. }
         | TypedStmt::DropTuple { .. }
+        | TypedStmt::DropList { .. }
         | TypedStmt::DropBuffer { .. }
         | TypedStmt::GpuBarrier
         | TypedStmt::Assign { .. }
@@ -1094,9 +1269,7 @@ fn extract_gpu_producing_expr(stmt: &TypedStmt) -> Option<(Vec<String>, Option<S
         | TypedStmt::LetShared { .. } => return None,
     };
     match &expr.kind {
-        TypedExprKind::KernelCall { in_flight, .. } => {
-            Some((in_flight.clone(), output_name))
-        }
+        TypedExprKind::KernelCall { in_flight, .. } => Some((in_flight.clone(), output_name)),
         TypedExprKind::BinOp { lhs, .. } if lhs.ty.is_tensor() => {
             let mut idents = HashSet::new();
             collect_idents_in_expr(expr, &mut idents);
@@ -1123,9 +1296,13 @@ fn collect_local_bindings(body: &[TypedStmt]) -> HashSet<String> {
     let mut out = HashSet::new();
     for s in body {
         match s {
-            TypedStmt::Let { name, .. } => { out.insert(name.clone()); }
+            TypedStmt::Let { name, .. } => {
+                out.insert(name.clone());
+            }
             TypedStmt::LetTuple { names, .. } => {
-                for (n, _) in names { out.insert(n.clone()); }
+                for (n, _) in names {
+                    out.insert(n.clone());
+                }
             }
             _ => {}
         }
@@ -1138,9 +1315,13 @@ fn collect_local_types(body: &[TypedStmt]) -> HashMap<String, ResolvedTy> {
     let mut out = HashMap::new();
     for s in body {
         match s {
-            TypedStmt::Let { name, expr } => { out.insert(name.clone(), expr.ty.clone()); }
+            TypedStmt::Let { name, expr } => {
+                out.insert(name.clone(), expr.ty.clone());
+            }
             TypedStmt::LetTuple { names, .. } => {
-                for (n, ty) in names { out.insert(n.clone(), ty.clone()); }
+                for (n, ty) in names {
+                    out.insert(n.clone(), ty.clone());
+                }
             }
             _ => {}
         }
@@ -1167,9 +1348,15 @@ fn collect_escaping_in(body: &[TypedStmt], out: &mut HashSet<String>) {
             TypedStmt::Assign { expr, .. } if expr.ty.is_tensor() => {
                 collect_idents_in_expr(expr, out);
             }
-            TypedStmt::If { then_body, else_body, .. } => {
+            TypedStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
                 collect_escaping_in(then_body, out);
-                if let Some(eb) = else_body { collect_escaping_in(eb, out); }
+                if let Some(eb) = else_body {
+                    collect_escaping_in(eb, out);
+                }
             }
             TypedStmt::For { body, .. }
             | TypedStmt::While { body, .. }
@@ -1217,6 +1404,7 @@ fn collect_idents_in_stmt(stmt: &TypedStmt, out: &mut HashSet<String>) {
         | TypedStmt::DropEnum { .. }
         | TypedStmt::DropArray { .. }
         | TypedStmt::DropTuple { .. }
+        | TypedStmt::DropList { .. }
         | TypedStmt::DropBuffer { .. }
         | TypedStmt::GpuBarrier
         | TypedStmt::Retain { .. }
@@ -1226,34 +1414,54 @@ fn collect_idents_in_stmt(stmt: &TypedStmt, out: &mut HashSet<String>) {
         | TypedStmt::Break
         | TypedStmt::Continue => {}
         TypedStmt::LetTuple { expr, .. } => collect_idents_in_expr(expr, out),
-        TypedStmt::If { condition, then_body, else_body } => {
+        TypedStmt::If {
+            condition,
+            then_body,
+            else_body,
+        } => {
             collect_idents_in_expr(condition, out);
-            for s in then_body { collect_idents_in_stmt(s, out); }
+            for s in then_body {
+                collect_idents_in_stmt(s, out);
+            }
             if let Some(eb) = else_body {
-                for s in eb { collect_idents_in_stmt(s, out); }
+                for s in eb {
+                    collect_idents_in_stmt(s, out);
+                }
             }
         }
-        TypedStmt::For { start, end, body, .. } => {
+        TypedStmt::For {
+            start, end, body, ..
+        } => {
             collect_idents_in_expr(start, out);
             collect_idents_in_expr(end, out);
-            for s in body { collect_idents_in_stmt(s, out); }
+            for s in body {
+                collect_idents_in_stmt(s, out);
+            }
         }
         TypedStmt::While { condition, body } => {
             collect_idents_in_expr(condition, out);
-            for s in body { collect_idents_in_stmt(s, out); }
+            for s in body {
+                collect_idents_in_stmt(s, out);
+            }
         }
         TypedStmt::ForIn { iter, body, .. } => {
             collect_idents_in_expr(iter, out);
-            for s in body { collect_idents_in_stmt(s, out); }
+            for s in body {
+                collect_idents_in_stmt(s, out);
+            }
         }
         TypedStmt::Match { scrutinee, arms } => {
             collect_idents_in_expr(scrutinee, out);
             for arm in arms {
-                for s in &arm.body { collect_idents_in_stmt(s, out); }
+                for s in &arm.body {
+                    collect_idents_in_stmt(s, out);
+                }
             }
         }
         TypedStmt::NoGrad { body } => {
-            for s in body { collect_idents_in_stmt(s, out); }
+            for s in body {
+                collect_idents_in_stmt(s, out);
+            }
         }
         TypedStmt::LetShared { .. } => {}
     }
@@ -1270,20 +1478,21 @@ fn insert_variable_arc_retains(body: &mut Vec<TypedStmt>) {
     let mut i = 0;
     while i < body.len() {
         let retain_names: Vec<String> = match &body[i] {
-            TypedStmt::Let { expr, .. }
-            | TypedStmt::LetTuple { expr, .. } => {
+            TypedStmt::Let { expr, .. } | TypedStmt::LetTuple { expr, .. } => {
                 variable_arc_retains_for_expr(expr)
             }
-            TypedStmt::Assign { expr, .. } => {
-                variable_arc_retains_for_expr(expr)
-            }
+            TypedStmt::Assign { expr, .. } => variable_arc_retains_for_expr(expr),
             TypedStmt::Expr(expr) | TypedStmt::Return { expr } => {
                 // For non-binding positions only emit retains for call args.
                 if let TypedExprKind::Call { args, .. } = &expr.kind {
                     args.iter()
                         .filter(|a| a.grad_tracked && a.ty.is_tensor())
                         .filter_map(|a| {
-                            if let TypedExprKind::Ident(n) = &a.kind { Some(n.clone()) } else { None }
+                            if let TypedExprKind::Ident(n) = &a.kind {
+                                Some(n.clone())
+                            } else {
+                                None
+                            }
                         })
                         .collect()
                 } else {
@@ -1311,7 +1520,9 @@ fn insert_variable_arc_retains(body: &mut Vec<TypedStmt>) {
 fn variable_arc_retains_for_expr(expr: &TypedExpr) -> Vec<String> {
     match &expr.kind {
         // let b = a — grad-tracked alias: retain a so b is a genuine co-owner.
-        TypedExprKind::Ident(name) if expr.grad_tracked && expr.ty.is_tensor() => vec![name.clone()],
+        TypedExprKind::Ident(name) if expr.grad_tracked && expr.ty.is_tensor() => {
+            vec![name.clone()]
+        }
         // let t = v.data — .data let-bind: retain v's handle so t is a genuine Tensor owner.
         TypedExprKind::FieldAccess { base, field }
             if field == "data" && base.grad_tracked && base.ty.is_tensor() =>
@@ -1327,7 +1538,11 @@ fn variable_arc_retains_for_expr(expr: &TypedExpr) -> Vec<String> {
             .iter()
             .filter(|a| a.grad_tracked && a.ty.is_tensor())
             .filter_map(|a| {
-                if let TypedExprKind::Ident(n) = &a.kind { Some(n.clone()) } else { None }
+                if let TypedExprKind::Ident(n) = &a.kind {
+                    Some(n.clone())
+                } else {
+                    None
+                }
             })
             .collect(),
         // Array literal: retain grad-tracked ident elements so the slot is a genuine
@@ -1336,7 +1551,11 @@ fn variable_arc_retains_for_expr(expr: &TypedExpr) -> Vec<String> {
             .iter()
             .filter(|e| e.grad_tracked && e.ty.is_tensor())
             .filter_map(|e| {
-                if let TypedExprKind::Ident(n) = &e.kind { Some(n.clone()) } else { None }
+                if let TypedExprKind::Ident(n) = &e.kind {
+                    Some(n.clone())
+                } else {
+                    None
+                }
             })
             .collect(),
         // Struct literal: retain grad-tracked ident fields so the struct slot is a genuine
@@ -1346,7 +1565,76 @@ fn variable_arc_retains_for_expr(expr: &TypedExpr) -> Vec<String> {
             .iter()
             .filter(|f| f.grad_tracked && f.ty.is_tensor())
             .filter_map(|f| {
-                if let TypedExprKind::Ident(n) = &f.kind { Some(n.clone()) } else { None }
+                if let TypedExprKind::Ident(n) = &f.kind {
+                    Some(n.clone())
+                } else {
+                    None
+                }
+            })
+            .collect(),
+        _ => vec![],
+    }
+}
+
+/// M28: insert `RetainAgg { name }` before any `Let`/`LetMut`/`Assign`/`Return`
+/// statement whose top-level expression aliases an existing `List<T>` binding —
+/// either a bare `let b = a` rebind, or an ident used as a `List`-typed field in
+/// a `StructInit` (e.g. `GPT(params=params)`). Mirrors
+/// `insert_variable_arc_retains` above but is unconditional on type (`List` RC
+/// is structural, not content/grad-tracked-based — ADR-0034) and emits
+/// `RetainAgg` (the existing, already-wired struct/tuple/enum aggregate-RC
+/// primitive) rather than the tensor-specific `Retain`.
+///
+/// Without this, `let gpt = GPT(params=params)` would leave `params`'s
+/// `DropList` (inserted at its last-use — this very statement) as the box's
+/// *only* release, dropping the refcount from 1 to 0 and freeing the element
+/// tensors + box out from under `gpt.params`, which now holds the identical
+/// pointer. The retain here (1→2) plus `params`'s own release (2→1) leaves
+/// exactly one live reference, now owned by the struct field — the same
+/// retain-before/release-after dance `insert_variable_arc_retains` already uses
+/// for grad-tracked tensor fields.
+///
+/// Scope note: only `Ident`-shaped aliasing sites are handled (matching every
+/// List construction site in the V4 capstone). A `List` passed as a plain
+/// (non-`mut`) call argument would need the same treatment if ever added —
+/// `mut` params are unaffected (borrows, never separately dropped; ADR-0025).
+fn insert_list_retains(body: &mut Vec<TypedStmt>) {
+    let mut i = 0;
+    while i < body.len() {
+        let retain_names: Vec<String> = match &body[i] {
+            TypedStmt::Let { expr, .. } | TypedStmt::LetTuple { expr, .. } => {
+                list_retains_for_expr(expr)
+            }
+            TypedStmt::Assign { expr, .. } => list_retains_for_expr(expr),
+            TypedStmt::Return { expr } => {
+                if let TypedExprKind::Ident(n) = &expr.kind {
+                    if expr.ty.is_list() { vec![n.clone()] } else { vec![] }
+                } else {
+                    vec![]
+                }
+            }
+            _ => vec![],
+        };
+        for name in retain_names.into_iter().rev() {
+            body.insert(i, TypedStmt::RetainAgg { name });
+            i += 1;
+        }
+        i += 1;
+    }
+}
+
+fn list_retains_for_expr(expr: &TypedExpr) -> Vec<String> {
+    match &expr.kind {
+        TypedExprKind::Ident(name) if expr.ty.is_list() => vec![name.clone()],
+        TypedExprKind::StructInit { fields, .. } => fields
+            .iter()
+            .filter(|f| f.ty.is_list())
+            .filter_map(|f| {
+                if let TypedExprKind::Ident(n) = &f.kind {
+                    Some(n.clone())
+                } else {
+                    None
+                }
             })
             .collect(),
         _ => vec![],
@@ -1355,45 +1643,76 @@ fn variable_arc_retains_for_expr(expr: &TypedExpr) -> Vec<String> {
 
 fn collect_idents_in_expr(expr: &crate::typed_ir::TypedExpr, out: &mut HashSet<String>) {
     match &expr.kind {
-        TypedExprKind::Ident(name) => { out.insert(name.clone()); }
+        TypedExprKind::Ident(name) => {
+            out.insert(name.clone());
+        }
         TypedExprKind::BinOp { lhs, rhs, .. } => {
             collect_idents_in_expr(lhs, out);
             collect_idents_in_expr(rhs, out);
         }
         TypedExprKind::Unary { operand, .. } => collect_idents_in_expr(operand, out),
         TypedExprKind::Call { args, .. } => {
-            for a in args { collect_idents_in_expr(a, out); }
+            for a in args {
+                collect_idents_in_expr(a, out);
+            }
         }
         TypedExprKind::KernelCall { args, .. } => {
-            for a in args { collect_idents_in_expr(a, out); }
+            for a in args {
+                collect_idents_in_expr(a, out);
+            }
         }
         TypedExprKind::TensorLiteral { elements, .. } => {
-            for e in elements { collect_idents_in_expr(e, out); }
+            for e in elements {
+                collect_idents_in_expr(e, out);
+            }
         }
         TypedExprKind::Index { base, indices } => {
             collect_idents_in_expr(base, out);
-            for i in indices { collect_idents_in_expr(i, out); }
+            for i in indices {
+                collect_idents_in_expr(i, out);
+            }
         }
         TypedExprKind::FieldAccess { base, .. } => collect_idents_in_expr(base, out),
         TypedExprKind::StructInit { fields, .. } => {
-            for f in fields { collect_idents_in_expr(f, out); }
+            for f in fields {
+                collect_idents_in_expr(f, out);
+            }
         }
         TypedExprKind::EnumInit { payload, .. } => {
-            for p in payload { collect_idents_in_expr(p, out); }
+            for p in payload {
+                collect_idents_in_expr(p, out);
+            }
         }
         TypedExprKind::ArrayLiteral { elements } => {
-            for e in elements { collect_idents_in_expr(e, out); }
+            for e in elements {
+                collect_idents_in_expr(e, out);
+            }
         }
         TypedExprKind::TupleInit { elements } => {
-            for e in elements { collect_idents_in_expr(e, out); }
+            for e in elements {
+                collect_idents_in_expr(e, out);
+            }
         }
         TypedExprKind::TupleIndex { base, .. } => collect_idents_in_expr(base, out),
-        TypedExprKind::KernelLaunch { grid, tg, out_shape, tensor_args, scalar_args, .. } => {
+        TypedExprKind::KernelLaunch {
+            grid,
+            tg,
+            out_shape,
+            tensor_args,
+            scalar_args,
+            ..
+        } => {
             collect_idents_in_expr(grid, out);
             collect_idents_in_expr(tg, out);
-            if let Some(s) = out_shape { collect_idents_in_expr(s, out); }
-            for a in tensor_args { collect_idents_in_expr(a, out); }
-            for a in scalar_args { collect_idents_in_expr(a, out); }
+            if let Some(s) = out_shape {
+                collect_idents_in_expr(s, out);
+            }
+            for a in tensor_args {
+                collect_idents_in_expr(a, out);
+            }
+            for a in scalar_args {
+                collect_idents_in_expr(a, out);
+            }
         }
         TypedExprKind::Lit(_) => {}
     }

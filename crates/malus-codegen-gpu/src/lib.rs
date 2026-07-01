@@ -166,6 +166,7 @@ fn collect_binops_in_stmt(
         TypedStmt::Expr(expr) => collect_binops_in_expr(expr, tensor_ops, scalar_ops),
         TypedStmt::Drop { .. } | TypedStmt::DropStruct { .. } | TypedStmt::DropEnum { .. }
         | TypedStmt::DropArray { .. } | TypedStmt::DropTuple { .. } | TypedStmt::DropBuffer { .. }
+        | TypedStmt::DropList { .. }
         | TypedStmt::GpuBarrier
         | TypedStmt::Retain { .. } | TypedStmt::Release { .. }
         | TypedStmt::RetainAgg { .. } | TypedStmt::ReleaseAgg { .. } => {}
@@ -277,6 +278,7 @@ fn collect_unary_builtins_in_stmt(stmt: &TypedStmt, out: &mut BTreeSet<String>) 
         TypedStmt::Expr(expr) => collect_unary_builtins_in_expr(expr, out),
         TypedStmt::Drop { .. } | TypedStmt::DropStruct { .. } | TypedStmt::DropEnum { .. }
         | TypedStmt::DropArray { .. } | TypedStmt::DropTuple { .. } | TypedStmt::DropBuffer { .. }
+        | TypedStmt::DropList { .. }
         | TypedStmt::GpuBarrier
         | TypedStmt::Retain { .. } | TypedStmt::Release { .. }
         | TypedStmt::RetainAgg { .. } | TypedStmt::ReleaseAgg { .. } => {}
@@ -849,6 +851,7 @@ fn lower_kernel_body_explicit(
             | TypedStmt::DropEnum { .. }
             | TypedStmt::DropArray { .. }
             | TypedStmt::DropTuple { .. }
+            | TypedStmt::DropList { .. }
             | TypedStmt::DropBuffer { .. }
             | TypedStmt::NoGrad { .. }
             | TypedStmt::Break

@@ -88,6 +88,16 @@ pub enum TypedAssignTarget {
         index: Box<TypedExpr>,
         dtype: malus_syntax::ast::ScalarTy,
     },
+    /// `base[index] = e` — `List<T>` element assignment (M28). Distinct from `Index`
+    /// because `List`'s runtime layout has a length word after the ARC header
+    /// (`[refcount | len | elem0 | elem1 | ...]`), offsetting elements by 16 bytes
+    /// instead of `Array`'s 0. Codegen releases the old element (if tensor-typed)
+    /// before storing. See ADR-0034.
+    ListIndex {
+        base: String,
+        index: Box<TypedExpr>,
+        elem_ty: ResolvedTy,
+    },
 }
 
 // ── Statements ────────────────────────────────────────────────────────────────
@@ -169,6 +179,15 @@ pub enum TypedStmt {
     DropEnum { name: String, variants: Vec<(u32, Vec<(usize, ResolvedTy)>, Vec<usize>)> },
     /// CTMM (M11): release each element of a fixed array (Phase 4 implementation).
     DropArray { name: String, elem_ty: ResolvedTy, len: usize },
+    /// CTMM (M28): release a `List<T>` binding. Unlike `DropArray`, this is ALWAYS
+    /// reference-counted, never a static free — `List` values may alias across a
+    /// call boundary (e.g. `Module::parameters(self) -> List<Tensor<f32>>` returning
+    /// a model's own field by identity) that neither M28's nor M29's (intraprocedural
+    /// -only) static analysis can prove safe to free unconditionally. Codegen: read
+    /// the length word, decrement the refcount, and only if that was the last
+    /// reference release each element (tensor-typed elements only in V4 scope) then
+    /// free the box. See ADR-0034.
+    DropList { name: String, elem_ty: ResolvedTy },
     /// Exhaustive `match` on an enum binding.
     Match { scrutinee: TypedExpr, arms: Vec<TypedMatchArm> },
     // ── M12: loop control ─────────────────────────────────────────────────────

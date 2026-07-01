@@ -220,8 +220,8 @@ A compile-time-sized sequence: `[expr1, expr2, ...]`. Type is `Array<T, N>` wher
 _Avoid_: List, dynamic array, vector
 
 **`List<T>`** (V4):
-A growable sequence type added in V4-M5. Length is not statically known. Used as the return type of `Module.parameters()`. Supports indexing and `for x in list` iteration. Tensor elements use escape-analysis RC (same as `Array`). `Dict` is post-V4.
-_Avoid_: Vec, dynamic array, vector (fine informally; List is the canonical term)
+A sequence type added in V4-M5, fixed-length at construction (`lst.push` deferred post-V4). Used as the return type of `Module.parameters()` — critically, `parameters()` returns a model's stored list **by identity** (a borrow of the model's own field), not a fresh literal, so that a generic optimizer's slot reassignment (`ps[i] = variable(...)`) is visible on the model's next use. That identity-return creates aliasing across a call boundary, which is why `List<T>` is itself a **reference-counted aggregate** — an ARC header (`RetainAgg`/`ReleaseAgg`, the same dormant-until-M28 mechanism structs/tuples/enums use) plus a length word, NOT `Array`'s headerless escape-analysis-only static drop. Tensor *elements* inside a `List` still use the ordinary tensor lifetime rules (tape-RC / static-free), unaffected by the container's own RC. Supports indexing, `for x in list` iteration, and `len(lst)`. `Dict` is post-V4. See ADR-0034.
+_Avoid_: Vec, dynamic array, vector (fine informally; List is the canonical term); "escape-analysis RC same as Array" (wrong — List is container-RC, Array is not)
 
 **Trait**:
 A named protocol (`trait Name: fn method(self, ...) -> T`) that types can implement with `impl Name for Type`. Exactly one trait mechanism in V4; no inheritance. The primary built-in trait is `Module`. See ADR-0007 (fenced scope).
@@ -232,7 +232,7 @@ The V4 trait for neural network components: `trait Module: fn parameters(self) -
 _Avoid_: nn.Module (PyTorch name; fine as analogy, not the canonical term)
 
 **Generics**:
-Type parameters on `fn`, `struct`, `enum`, and `kernel`. Constraint syntax: `fn f<T: Trait>(x: T)`. Monomorphized at the JIT call site. V4 scope: one type parameter per item, one trait bound, no higher-kinded types, no associated types.
+Type parameters on `fn` (`fn f<T: Trait>(x: T)`). Monomorphized in sema before grad-inference/CTMM/codegen run — every downstream pass sees only concrete, mangled-name `TypedFn`s (compiler-internal detail, not observable syntax). V4 scope: one type parameter per item, one trait bound, no higher-kinded types, no associated types. **User-defined generic `struct`/`enum` are deferred post-V4** (ADR-0034) — V4 generics apply to `fn` only.
 _Avoid_: templates, polymorphism (fine informally)
 
 **`let mut` / reassignment** (V1):

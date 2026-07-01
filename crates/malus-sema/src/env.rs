@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use malus_syntax::ast::Placement;
+use malus_syntax::ast::{Param, Placement, Stmt, Ty};
 use malus_syntax::Span;
 use crate::builtins::BuiltinSig;
 use crate::ty::ResolvedTy;
@@ -57,6 +57,46 @@ pub struct KernelSig {
     pub defined_at: Span,
 }
 
+// ── Generics + trait/impl (M28) ────────────────────────────────────────────────
+
+/// A `fn` item with exactly one type parameter, registered separately from
+/// `Env::functions` because its param/return types are not resolvable until a
+/// call site substitutes a concrete type (ADR-0034: monomorphization happens in
+/// sema, at each call site, before grad-inference/CTMM/codegen ever run).
+#[derive(Debug, Clone)]
+pub struct GenericFnDef {
+    pub type_param: String,
+    pub bound: Option<String>,
+    pub params: Vec<Param>,
+    pub return_ty: Option<Ty>,
+    pub body: Vec<Stmt>,
+    pub defined_at: Span,
+}
+
+/// A trait method signature — `(name, param_types, return_type)`, excluding the
+/// implicit `self` receiver (M28 spec, `docs/milestones/m28-module-trait.md`).
+#[derive(Debug, Clone)]
+pub struct TraitMethodSig {
+    pub name: String,
+    pub param_tys: Vec<ResolvedTy>,
+    pub return_ty: ResolvedTy,
+}
+
+#[derive(Debug, Clone)]
+pub struct TraitDef {
+    pub methods: Vec<TraitMethodSig>,
+    pub defined_at: Span,
+}
+
+/// Registered once per `impl Trait for Type` method: the concrete `FnSig`
+/// (with `self` substituted to `for_type`'s `ResolvedTy`) is also inserted into
+/// `Env::functions` under the mangled name `"{for_type}__{method}"`, so ordinary
+/// call-checking machinery can look it up like any other fn.
+#[derive(Debug, Clone)]
+pub struct ImplMethod {
+    pub mangled_name: String,
+}
+
 // ── Callee resolution result ──────────────────────────────────────────────────
 
 pub enum Callee<'a> {
@@ -84,6 +124,17 @@ pub struct Env {
     pub structs: HashMap<String, StructDef>,
     /// User-defined enum types.
     pub enums: HashMap<String, EnumDef>,
+    /// M28: generic `fn` items, keyed by name — NOT inserted into `functions`
+    /// until monomorphized at a call site.
+    pub generic_fns: HashMap<String, GenericFnDef>,
+    /// M28: user-defined traits, keyed by name.
+    pub traits: HashMap<String, TraitDef>,
+    /// M28: `(trait_name, for_type_name) -> method_name -> ImplMethod`. The
+    /// concrete signature lives in `functions` under `ImplMethod::mangled_name`.
+    pub impls: HashMap<(String, String), HashMap<String, ImplMethod>>,
+    /// M28: mangled names already monomorphized (memoization cache), so a
+    /// generic fn called twice with the same concrete type compiles once.
+    pub mono_cache: HashSet<String>,
 }
 
 impl Env {
@@ -101,6 +152,10 @@ impl Env {
             module_aliases,
             structs: HashMap::new(),
             enums: HashMap::new(),
+            generic_fns: HashMap::new(),
+            traits: HashMap::new(),
+            impls: HashMap::new(),
+            mono_cache: HashSet::new(),
         }
     }
 
