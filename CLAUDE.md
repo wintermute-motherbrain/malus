@@ -203,6 +203,7 @@ The `i64` handle is a raw pointer to a heap-allocated `TensorBuffer { buffer: me
 | Cross-module structs/enums unsupported (loader `exported_names` gap) | Post-V4 | See `docs/milestones/cross-module-types.md` |
 | ScalarBroadcast IR node | Post-V4 | Inline scalar-broadcast BinOps work; dedicated IR node deferred |
 | CTMM barrier coalescing is conservative | Post-V4 | ADR-0009 "Consequences" |
+| `MetalContext` is single-consumer, not thread-safe under concurrent host access | By design | Metal-touching test files (`malus-runtime/src/tests.rs`, `malus-codegen-cpu/tests/metal_integration.rs`) must serialize via a per-file `Mutex<()>` test lock, held for the whole test body — not reentrant, don't nest acquisitions. See ADR-0033. |
 | `Variable` type (type-directed RC) | **M27** | To be eliminated; replaced by single `Tensor` type + static grad-inference (ADR-0030) |
 | Generics / `impl` / `Module` trait / `List<T>` | **M28** | ADR-0007 fenced scope; required for generic optimizer |
 | Lobster borrow-inference RC elimination | **M29** | The founding CTMM differentiator; ADR-0026 |

@@ -67,8 +67,11 @@ fn real_symbols() -> RuntimeSymbols {
     }
 }
 
-fn run_metal_src(src: &str) {
-    let _guard = METAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+// Callers that already hold METAL_TEST_LOCK (e.g. to atomically bracket this
+// with other locked state, like malus_gradcheck_reset/max_diff) must call
+// run_metal_src_locked directly — METAL_TEST_LOCK is not reentrant, so going
+// through run_metal_src while already holding the lock deadlocks the thread.
+fn run_metal_src_locked(src: &str) {
     let mut user_program = parse(malus_syntax::FileId(0), src).expect("parse failed");
     let mut stdlib = malus_stdlib::stdlib_items();
     stdlib.extend(user_program.items.drain(..));
@@ -80,6 +83,11 @@ fn run_metal_src(src: &str) {
     malus_runtime::runtime_init(&registry.into_hashmap());
     let symbols = real_symbols();
     compile_and_run(&typed, &symbols, &kernel_ids).expect("JIT compile and run failed");
+}
+
+fn run_metal_src(src: &str) {
+    let _guard = METAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    run_metal_src_locked(src);
 }
 
 #[test]
@@ -1062,7 +1070,7 @@ fn test_gradient_check_all_ops() {
     let _guard = METAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     malus_runtime::malus_gradcheck_reset();
     let src = include_str!("../../../examples/gradient_check.ml");
-    run_metal_src(src);
+    run_metal_src_locked(src);
     let max_diff = malus_runtime::malus_gradcheck_max_diff();
     assert!(
         max_diff < 1e-3,

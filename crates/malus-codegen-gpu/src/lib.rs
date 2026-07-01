@@ -1,9 +1,14 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use malus_sema::{ResolvedTy, TypedExpr, TypedExprKind, TypedKernel, TypedProgram, TypedStmt};
 use malus_syntax::ast::{
     elementwise_builtin_name, scalar_broadcast_builtin_name, BinOp, Lit, ScalarTy, UnaryOp,
 };
+
+// Process-global, never reset: guarantees kernel ids stay unique across every
+// compile_kernels() call in a process, not just within one. See ADR-0033.
+static NEXT_KERNEL_ID: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(test)]
 mod tests;
@@ -93,11 +98,8 @@ pub fn compile_kernels(
     let mut registry = KernelRegistry::new();
     let mut name_to_id = HashMap::new();
 
-    let mut next_id: u64 = 0;
-
     for kernel in &program.kernels {
-        let kernel_id = next_id;
-        next_id += 1;
+        let kernel_id = NEXT_KERNEL_ID.fetch_add(1, Ordering::SeqCst);
         let msl = lower_kernel(kernel, kernel_id)?;
         registry.insert(kernel_id, msl);
         name_to_id.insert(kernel.name.clone(), kernel_id);
@@ -120,8 +122,7 @@ pub fn compile_kernels(
     for op in &tensor_ops {
         let name = elementwise_builtin_name(op)
             .expect("collected op must have a builtin name");
-        let kernel_id = next_id;
-        next_id += 1;
+        let kernel_id = NEXT_KERNEL_ID.fetch_add(1, Ordering::SeqCst);
         let msl = synthesize_elementwise_builtin(*op, kernel_id)?;
         registry.insert(kernel_id, msl);
         name_to_id.insert(name.to_string(), kernel_id);
@@ -133,8 +134,7 @@ pub fn compile_kernels(
         if name_to_id.contains_key(name) {
             continue; // commutative: both orderings share the same kernel
         }
-        let kernel_id = next_id;
-        next_id += 1;
+        let kernel_id = NEXT_KERNEL_ID.fetch_add(1, Ordering::SeqCst);
         let msl = synthesize_scalar_builtin(*op, *scalar_on_right, kernel_id)?;
         registry.insert(kernel_id, msl);
         name_to_id.insert(name.to_string(), kernel_id);
@@ -145,8 +145,7 @@ pub fn compile_kernels(
         if name_to_id.contains_key(name.as_str()) {
             continue;
         }
-        let kernel_id = next_id;
-        next_id += 1;
+        let kernel_id = NEXT_KERNEL_ID.fetch_add(1, Ordering::SeqCst);
         let msl = synthesize_unary_builtin(name, kernel_id)?;
         registry.insert(kernel_id, msl);
         name_to_id.insert(name.to_string(), kernel_id);

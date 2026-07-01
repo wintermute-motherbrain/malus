@@ -35,10 +35,10 @@ kernel add(a: Tensor<f32>, b: Tensor<f32>) -> Tensor<f32>:
     let (registry, name_to_id) = compile_src(src).expect("should compile");
 
     assert_eq!(name_to_id.len(), 1);
-    assert_eq!(name_to_id["add"], 0);
+    let add_id = name_to_id["add"];
 
-    let msl = registry.msl_for(0).expect("kernel 0 should exist");
-    assert!(msl.contains("kernel void malus_kernel_0"));
+    let msl = registry.msl_for(add_id).expect("add kernel should exist");
+    assert!(msl.contains(&format!("kernel void malus_kernel_{add_id}")));
     assert!(msl.contains("device float* a [[buffer(0)]]"));
     assert!(msl.contains("device float* b [[buffer(1)]]"));
     assert!(msl.contains("device float* out [[buffer(2)]]"));
@@ -65,10 +65,14 @@ kernel sub(a: Tensor<f32>, b: Tensor<f32>) -> Tensor<f32>:
 "#;
     let (registry, name_to_id) = compile_src(src).expect("should compile");
 
-    assert_eq!(name_to_id["add"], 0);
-    assert_eq!(name_to_id["sub"], 1);
-    assert!(registry.msl_for(0).unwrap().contains("malus_kernel_0"));
-    assert!(registry.msl_for(1).unwrap().contains("malus_kernel_1"));
+    let add_id = name_to_id["add"];
+    let sub_id = name_to_id["sub"];
+    // Ids come from a process-global counter (ADR-0033), so concurrently-running
+    // tests' compilations may interleave and steal values in between — only the
+    // relative order within this one compilation is guaranteed, not adjacency.
+    assert!(sub_id > add_id, "kernel ids within one compilation must be assigned in order");
+    assert!(registry.msl_for(add_id).unwrap().contains(&format!("malus_kernel_{add_id}")));
+    assert!(registry.msl_for(sub_id).unwrap().contains(&format!("malus_kernel_{sub_id}")));
 }
 
 #[test]
@@ -93,11 +97,11 @@ kernel kmul(a: Tensor<f32>, b: Tensor<f32>) -> Tensor<f32>:
 kernel kdiv(a: Tensor<f32>, b: Tensor<f32>) -> Tensor<f32>:
     return a / b
 "#;
-    let (registry, _) = compile_src(src).expect("should compile");
+    let (registry, name_to_id) = compile_src(src).expect("should compile");
 
-    assert!(registry.msl_for(0).unwrap().contains("(a[tid] - b[tid])"));
-    assert!(registry.msl_for(1).unwrap().contains("(a[tid] * b[tid])"));
-    assert!(registry.msl_for(2).unwrap().contains("(a[tid] / b[tid])"));
+    assert!(registry.msl_for(name_to_id["ksub"]).unwrap().contains("(a[tid] - b[tid])"));
+    assert!(registry.msl_for(name_to_id["kmul"]).unwrap().contains("(a[tid] * b[tid])"));
+    assert!(registry.msl_for(name_to_id["kdiv"]).unwrap().contains("(a[tid] / b[tid])"));
 }
 
 #[test]
@@ -111,8 +115,8 @@ fn main():
 kernel neg(a: Tensor<f32>) -> Tensor<f32>:
     return -a
 "#;
-    let (registry, _) = compile_src(src).expect("should compile");
-    assert!(registry.msl_for(0).unwrap().contains("(-a[tid])"));
+    let (registry, name_to_id) = compile_src(src).expect("should compile");
+    assert!(registry.msl_for(name_to_id["neg"]).unwrap().contains("(-a[tid])"));
 }
 
 #[test]
@@ -127,8 +131,8 @@ fn main():
 kernel fma(a: Tensor<f32>, b: Tensor<f32>) -> Tensor<f32>:
     return (a + b) * a
 "#;
-    let (registry, _) = compile_src(src).expect("should compile");
-    let msl = registry.msl_for(0).unwrap();
+    let (registry, name_to_id) = compile_src(src).expect("should compile");
+    let msl = registry.msl_for(name_to_id["fma"]).unwrap();
     assert!(msl.contains("((a[tid] + b[tid]) * a[tid])"));
 }
 
@@ -143,8 +147,8 @@ fn main():
 kernel copy(a: Tensor<f32>) -> Tensor<f32>:
     return a
 "#;
-    let (registry, _) = compile_src(src).expect("should compile");
-    let msl = registry.msl_for(0).unwrap();
+    let (registry, name_to_id) = compile_src(src).expect("should compile");
+    let msl = registry.msl_for(name_to_id["copy"]).unwrap();
     assert!(msl.contains("device float* a [[buffer(0)]]"));
     assert!(msl.contains("device float* out [[buffer(1)]]"));
     assert!(msl.contains("out[tid] = a[tid];"));
@@ -180,8 +184,8 @@ fn main():
 kernel add(a: Tensor<f16>, b: Tensor<f16>) -> Tensor<f16>:
     return a + b
 "#;
-    let (registry, _) = compile_src(src).expect("should compile");
-    let msl = registry.msl_for(0).unwrap();
+    let (registry, name_to_id) = compile_src(src).expect("should compile");
+    let msl = registry.msl_for(name_to_id["add"]).unwrap();
     assert!(msl.contains("device half* a"));
     assert!(msl.contains("device half* out"));
 }
@@ -250,10 +254,12 @@ kernel ksub(a: Tensor<f32>, b: Tensor<f32>) -> Tensor<f32>:
     return a - b
 "#;
     let (registry, name_to_id) = compile_src(src).expect("should compile");
-    assert_eq!(name_to_id["ksub"], 0);
-    assert_eq!(name_to_id["malus_add"], 1);
-    assert!(registry.msl_for(0).unwrap().contains("malus_kernel_0"));
-    assert!(registry.msl_for(1).unwrap().contains("malus_kernel_1"));
+    let ksub_id = name_to_id["ksub"];
+    let add_id = name_to_id["malus_add"];
+    // Relative order only — see note in test_multiple_kernels_get_sequential_ids.
+    assert!(add_id > ksub_id, "builtin ids must append after user kernel ids (ADR-0010)");
+    assert!(registry.msl_for(ksub_id).unwrap().contains(&format!("malus_kernel_{ksub_id}")));
+    assert!(registry.msl_for(add_id).unwrap().contains(&format!("malus_kernel_{add_id}")));
 }
 
 #[test]
@@ -488,7 +494,7 @@ fn main():
     assert!(msl.contains("for(int j = 0; j < u.cols; j++)"), "for loop (range 0..cols) missing");
     assert!(msl.contains("uint _tgid [[threadgroup_position_in_grid]]"), "threadgroup_id attr missing");
     assert!(msl.contains("uint _lid [[thread_position_in_threadgroup]]"), "thread_in_threadgroup attr missing");
-    assert!(msl.contains("struct Uniforms_0"), "uniforms struct missing");
+    assert!(msl.contains(&format!("struct Uniforms_{kernel_id}")), "uniforms struct missing");
     assert!(msl.contains("int cols"), "cols field in uniforms missing");
     assert!(msl.contains("fmax("), "fmax call missing");
     assert!(msl.contains("exp("), "exp call missing");
@@ -548,7 +554,7 @@ fn main():
     let kernel_id = name_to_id["layernorm"];
     let msl = registry.msl_for(kernel_id).expect("MSL for layernorm not found");
 
-    assert!(msl.contains("struct Uniforms_0"), "uniforms struct missing");
+    assert!(msl.contains(&format!("struct Uniforms_{kernel_id}")), "uniforms struct missing");
     assert!(msl.contains("int cols"), "cols field missing");
     assert!(msl.contains("float inv_cols"), "inv_cols field missing");
     assert!(msl.contains("float eps"), "eps field missing");

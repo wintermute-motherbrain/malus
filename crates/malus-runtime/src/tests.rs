@@ -1,6 +1,13 @@
 use std::collections::HashMap;
+use std::sync::Mutex;
 
 use objc2_metal::MTLBuffer;
+
+// Serializes every test in this file against the single process-global
+// MetalContext (see ADR-0033) — cargo's default multi-threaded test harness
+// otherwise runs these concurrently, which races on shared kernel-id/command-
+// buffer state and can deadlock the GPU on a barrier() kernel.
+static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 use crate::{
     Dtype, TensorBuffer, runtime_init,
@@ -19,6 +26,7 @@ use crate::{
 
 #[test]
 fn test_dtype_from_tag_drift() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     assert_eq!(Dtype::from_tag(0),  Dtype::F32);
     assert_eq!(Dtype::from_tag(1),  Dtype::F16);
     assert_eq!(Dtype::from_tag(2),  Dtype::Bf16);
@@ -34,6 +42,7 @@ fn test_dtype_from_tag_drift() {
 
 #[test]
 fn test_dtype_to_tag_roundtrip() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     for tag in 0..=10 {
         assert_eq!(Dtype::from_tag(tag).to_tag(), tag);
     }
@@ -42,6 +51,7 @@ fn test_dtype_to_tag_roundtrip() {
 #[test]
 #[should_panic(expected = "unknown dtype")]
 fn test_dtype_unknown_tag_panics() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     Dtype::from_tag(99);
 }
 
@@ -75,6 +85,7 @@ fn read_f32(handle: i64) -> Vec<f32> {
 
 #[test]
 fn test_tensor_alloc_roundtrip() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let data = [1.0f32, 2.0, 3.0, 4.0];
     let handle = alloc_f32(&data);
     assert!(handle != 0, "handle should be non-null");
@@ -93,6 +104,7 @@ fn test_tensor_alloc_roundtrip() {
 
 #[test]
 fn test_tensor_alloc_null_data() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let shape = [4usize];
     let handle = tensor_alloc_gpu(0, shape.as_ptr(), 1, std::ptr::null());
     assert!(handle != 0);
@@ -107,6 +119,7 @@ fn test_tensor_alloc_null_data() {
 
 #[test]
 fn test_tensor_alloc_2d_shape() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let data = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
     let handle = alloc_2d(&data, 2, 3);
     let tb = unsafe { &*(handle as *const TensorBuffer) };
@@ -117,6 +130,7 @@ fn test_tensor_alloc_2d_shape() {
 
 #[test]
 fn test_tensor_print_no_panic() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let handle = alloc_f32(&[1.0f32, 2.0, 3.0, 4.0]);
     tensor_print(handle);
     println!();
@@ -125,12 +139,14 @@ fn test_tensor_print_no_panic() {
 
 #[test]
 fn test_tensor_free_no_crash() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let handle = alloc_f32(&[1.0f32, 2.0, 3.0]);
     tensor_free(handle);
 }
 
 #[test]
 fn test_tensor_len_returns_element_count() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let handle = alloc_f32(&[1.0f32, 2.0, 3.0, 4.0]);
     assert_eq!(tensor_len(handle), 4);
     tensor_free(handle);
@@ -138,11 +154,13 @@ fn test_tensor_len_returns_element_count() {
 
 #[test]
 fn test_gpu_barrier_noop_when_no_work() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     gpu_barrier();
 }
 
 #[test]
 fn test_massive_alloc_free() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut handles = Vec::with_capacity(10_000);
     for _ in 0..10_000 {
         handles.push(alloc_f32(&[1.0f32, 2.0, 3.0, 4.0]));
@@ -156,6 +174,7 @@ fn test_massive_alloc_free() {
 
 #[test]
 fn test_tensor_alloc_zeros_is_zero() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let shape = [2usize, 3];
     let handle = tensor_alloc_zeros_gpu(shape.as_ptr(), 2);
     let tb = unsafe { &*(handle as *const TensorBuffer) };
@@ -168,6 +187,7 @@ fn test_tensor_alloc_zeros_is_zero() {
 
 #[test]
 fn test_tensor_alloc_ones_is_one() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let shape = [3usize, 4];
     let handle = tensor_alloc_ones_gpu(shape.as_ptr(), 2);
     let tb = unsafe { &*(handle as *const TensorBuffer) };
@@ -182,6 +202,7 @@ fn test_tensor_alloc_ones_is_one() {
 
 #[test]
 fn test_tensor_matmul_2x3_3x2() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // [2,3] @ [3,2] -> [2,2]
     // a = [[1,2,3],[4,5,6]], b = [[1,0],[0,1],[1,0]]
     // out[0,0] = 1*1+2*0+3*1=4, out[0,1]=1*0+2*1+3*0=2
@@ -199,6 +220,7 @@ fn test_tensor_matmul_2x3_3x2() {
 
 #[test]
 fn test_tensor_matmul_ones() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // ones([2,3]) @ ones([3,4]) -> [2,4] of all 3.0
     let shape_23 = [2usize, 3];
     let shape_34 = [3usize, 4];
@@ -221,6 +243,7 @@ fn test_tensor_matmul_ones() {
 
 #[test]
 fn test_tensor_transpose_2x3() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // [[1,2,3],[4,5,6]] transposed -> [[1,4],[2,5],[3,6]]
     let h = alloc_2d(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 2, 3);
     let out = tensor_transpose(h);
@@ -233,6 +256,7 @@ fn test_tensor_transpose_2x3() {
 
 #[test]
 fn test_tensor_transpose_ones_shape() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let shape = [3usize, 4];
     let h = tensor_alloc_ones_gpu(shape.as_ptr(), 2);
     let out = tensor_transpose(h);
@@ -247,6 +271,7 @@ fn test_tensor_transpose_ones_shape() {
 
 #[test]
 fn test_tensor_sum_flat() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let h = alloc_f32(&[1.0, 2.0, 3.0, 4.0]);
     let out = tensor_sum(h);
     let tb = unsafe { &*(out as *const TensorBuffer) };
@@ -258,6 +283,7 @@ fn test_tensor_sum_flat() {
 
 #[test]
 fn test_tensor_sum_ones_2x4() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let shape = [2usize, 4];
     let h = tensor_alloc_ones_gpu(shape.as_ptr(), 2);
     let out = tensor_sum(h);
@@ -289,11 +315,13 @@ fn init_add_kernel() {
 
 #[test]
 fn test_msl_compiles_without_error() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     init_add_kernel();
 }
 
 #[test]
 fn test_kernel_dispatch_add() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     init_add_kernel();
 
     let a = alloc_f32(&[1.0f32, 2.0, 3.0, 4.0]);
@@ -321,6 +349,7 @@ fn test_kernel_dispatch_add() {
 
 #[test]
 fn test_kernel_dispatch_then_print() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     init_add_kernel();
 
     let a = alloc_f32(&[1.0f32, 2.0, 3.0, 4.0]);
@@ -342,6 +371,7 @@ fn test_kernel_dispatch_then_print() {
 
 #[test]
 fn test_kernel_dispatch_preserves_shape() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     init_add_kernel();
 
     let a = alloc_2d(&[1.0f32, 2.0, 3.0, 4.0], 2, 2);
@@ -363,6 +393,7 @@ fn test_kernel_dispatch_preserves_shape() {
 
 #[test]
 fn test_tensor_retain_keeps_alive() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let h = alloc_f32(&[1.0, 2.0, 3.0]);
     // ref_count = 1 after alloc; retain bumps to 2.
     tensor_retain(h);
@@ -377,6 +408,7 @@ fn test_tensor_retain_keeps_alive() {
 
 #[test]
 fn test_tensor_free_still_works() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // tensor_free now delegates to tensor_release.  Verify it still frees a fresh tensor.
     let h = alloc_f32(&[9.0, 8.0, 7.0]);
     tensor_free(h); // ref_count 1 → 0 → freed; must not crash
@@ -384,11 +416,13 @@ fn test_tensor_free_still_works() {
 
 #[test]
 fn test_tensor_retain_null_no_crash() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     tensor_retain(0); // guard: handle == 0 → no-op
 }
 
 #[test]
 fn test_tensor_release_null_no_crash() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     tensor_release(0); // guard: handle == 0 → no-op
 }
 
@@ -396,6 +430,7 @@ fn test_tensor_release_null_no_crash() {
 
 #[test]
 fn test_optag_from_tag_drift() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     assert_eq!(OpTag::from_tag(0),  OpTag::Matmul);
     assert_eq!(OpTag::from_tag(1),  OpTag::Add);
     assert_eq!(OpTag::from_tag(2),  OpTag::Sub);
@@ -425,12 +460,14 @@ fn test_optag_from_tag_drift() {
 
 #[test]
 fn test_tape_clear_empty_no_crash() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     tape_reset();
     tape_clear();
 }
 
 #[test]
 fn test_no_grad_records_nothing() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     tape_reset();
     let a = alloc_f32(&[1.0, 2.0]);
     let b = alloc_f32(&[3.0, 4.0]);
@@ -456,6 +493,7 @@ fn test_no_grad_records_nothing() {
 
 #[test]
 fn test_backward_add() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     tape_reset();
     let a = alloc_f32(&[1.0, 2.0]);
     let b = alloc_f32(&[3.0, 4.0]);
@@ -479,6 +517,7 @@ fn test_backward_add() {
 
 #[test]
 fn test_backward_sub() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     tape_reset();
     let a = alloc_f32(&[5.0, 6.0]);
     let b = alloc_f32(&[2.0, 1.0]);
@@ -498,6 +537,7 @@ fn test_backward_sub() {
 
 #[test]
 fn test_backward_mul() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     tape_reset();
     let a = alloc_f32(&[2.0, 3.0]);
     let b = alloc_f32(&[4.0, 5.0]);
@@ -517,6 +557,7 @@ fn test_backward_mul() {
 
 #[test]
 fn test_backward_neg() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     tape_reset();
     let a = alloc_f32(&[1.0, -2.0, 3.0]);
     tape_register_leaf(a);
@@ -531,6 +572,7 @@ fn test_backward_neg() {
 
 #[test]
 fn test_backward_relu() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     tape_reset();
     // relu(x): mask = x>0
     let x = alloc_f32(&[-1.0, 0.0, 2.0, 3.0]);
@@ -546,6 +588,7 @@ fn test_backward_relu() {
 
 #[test]
 fn test_backward_sigmoid() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     tape_reset();
     // s = sigmoid(0) = 0.5; ds/dx = s*(1-s) = 0.25
     let x = alloc_f32(&[0.0]);
@@ -563,6 +606,7 @@ fn test_backward_sigmoid() {
 
 #[test]
 fn test_backward_tanh() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     tape_reset();
     let x = alloc_f32(&[0.0]);
     tape_register_leaf(x);
@@ -578,6 +622,7 @@ fn test_backward_tanh() {
 
 #[test]
 fn test_backward_exp() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     tape_reset();
     let x = alloc_f32(&[1.0]);
     tape_register_leaf(x);
@@ -593,6 +638,7 @@ fn test_backward_exp() {
 
 #[test]
 fn test_backward_log() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     tape_reset();
     let x = alloc_f32(&[2.0]);
     tape_register_leaf(x);
@@ -607,6 +653,7 @@ fn test_backward_log() {
 
 #[test]
 fn test_backward_sqrt() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     tape_reset();
     let x = alloc_f32(&[4.0]);
     tape_register_leaf(x);
@@ -622,6 +669,7 @@ fn test_backward_sqrt() {
 
 #[test]
 fn test_backward_abs() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     tape_reset();
     let x = alloc_f32(&[-3.0, 0.0, 2.0]);
     tape_register_leaf(x);
@@ -636,6 +684,7 @@ fn test_backward_abs() {
 
 #[test]
 fn test_backward_div() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     tape_reset();
     // C = A / B; A=[6,8], B=[2,4]
     let a = alloc_f32(&[6.0, 8.0]);
@@ -661,6 +710,7 @@ fn test_backward_div() {
 
 #[test]
 fn test_backward_sum() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     tape_reset();
     let x = alloc_f32(&[1.0, 2.0, 3.0]);
     tape_register_leaf(x);
@@ -675,6 +725,7 @@ fn test_backward_sum() {
 
 #[test]
 fn test_backward_transpose() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     tape_reset();
     // [[1,2],[3,4]] transposed = [[1,3],[2,4]]
     let x = alloc_2d(&[1.0, 2.0, 3.0, 4.0], 2, 2);
@@ -692,6 +743,7 @@ fn test_backward_transpose() {
 
 #[test]
 fn test_backward_matmul() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     tape_reset();
     // A=[2,3] @ B=[3,2] -> C=[2,2]; finite-diff check
     let a_data = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0]; // 2x3
@@ -724,6 +776,7 @@ fn test_backward_matmul() {
 
 #[test]
 fn test_tape_clears_after_backward() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     tape_reset();
     let a = alloc_f32(&[1.0]);
     let b = alloc_f32(&[2.0]);
@@ -743,6 +796,7 @@ fn test_tape_clears_after_backward() {
 
 #[test]
 fn test_leaf_grad_accumulates_across_two_backward_calls() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     tape_reset();
     let a = alloc_f32(&[2.0]);
     tape_register_leaf(a);
@@ -767,6 +821,7 @@ fn test_leaf_grad_accumulates_across_two_backward_calls() {
 
 #[test]
 fn test_chain_sum_sigmoid_matmul() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // Smoke test: loss = sum(sigmoid(x @ w)); backward works without panic.
     tape_reset();
     let x_data = [1.0f32, 2.0, 3.0, 4.0];
@@ -805,6 +860,7 @@ fn alloc_like_vec(template: i64, data: &[f32]) -> i64 {
 
 #[test]
 fn test_zero_grad_clears_leaf_grad() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     tape_reset();
     let x = alloc_f32(&[3.0]);
     tape_register_leaf(x);
@@ -832,6 +888,7 @@ fn test_zero_grad_clears_leaf_grad() {
 
 #[test]
 fn test_rewrap_registry_stays_bounded() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // Simulate the SGD re-wrap idiom across 50 iterations and assert that
     // LEAVES and LEAF_GRAD stay bounded — this is the core M15 leak check.
     // Without the tape_on_release hook, LEAVES grows by 1 per iteration.
@@ -891,6 +948,7 @@ fn alloc_nd(data: &[f32], shape: &[usize]) -> i64 {
 
 #[test]
 fn test_broadcast_add_equal_shapes_fast_path() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // Equal shapes: goes through GPU fast path (kernel_dispatch with the registered add kernel).
     init_add_kernel();
     let a = alloc_f32(&[1.0, 2.0, 3.0, 4.0]);
@@ -906,6 +964,7 @@ fn test_broadcast_add_equal_shapes_fast_path() {
 
 #[test]
 fn test_broadcast_add_rank_expansion() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // (8,) + (4,8) → (4,8) via CPU broadcast loop.
     let b_data: Vec<f32> = (1..=8).map(|x| x as f32).collect();
     let a_data: Vec<f32> = vec![1.0f32; 32];
@@ -930,6 +989,7 @@ fn test_broadcast_add_rank_expansion() {
 
 #[test]
 fn test_broadcast_sub_scalar_row() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // (1,4) - (3,4) → (3,4)
     let a = alloc_nd(&[1.0, 2.0, 3.0, 4.0], &[1, 4]);
     let b = alloc_nd(&[1.0; 12], &[3, 4]);
@@ -947,6 +1007,7 @@ fn test_broadcast_sub_scalar_row() {
 
 #[test]
 fn test_reduce_sum_axis0_no_keepdim() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // sum([[1,2,3],[4,5,6]], axis=0) → [5,7,9]
     let h = alloc_nd(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
     let out = tensor_reduce_sum_axis(h, 0, 0);
@@ -960,6 +1021,7 @@ fn test_reduce_sum_axis0_no_keepdim() {
 
 #[test]
 fn test_reduce_sum_axis1_keepdim() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // sum([[1,2,3],[4,5,6]], axis=1, keepdim=1) → [[6],[15]]
     let h = alloc_nd(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
     let out = tensor_reduce_sum_axis(h, 1, 1);
@@ -973,6 +1035,7 @@ fn test_reduce_sum_axis1_keepdim() {
 
 #[test]
 fn test_reduce_mean_axis0() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let h = alloc_nd(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
     let out = tensor_reduce_mean_axis(h, 0, 0);
     let result = read_f32(out);
@@ -988,6 +1051,7 @@ fn test_reduce_mean_axis0() {
 
 #[test]
 fn test_reduce_max_axis1() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let h = alloc_nd(&[1.0, 5.0, 3.0, 4.0, 2.0, 6.0], &[2, 3]);
     let out = tensor_reduce_max_axis(h, 1, 0);
     let result = read_f32(out);
@@ -1000,6 +1064,7 @@ fn test_reduce_max_axis1() {
 
 #[test]
 fn test_reduce_var_axis0() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // var of [1,4] along axis 0 = var([1,4]) = ((1-2.5)^2 + (4-2.5)^2)/2 = 2.25
     let h = alloc_nd(&[1.0, 2.0, 4.0, 8.0], &[2, 2]);
     let out = tensor_reduce_var_axis(h, 0, 0);
@@ -1016,6 +1081,7 @@ fn test_reduce_var_axis0() {
 
 #[test]
 fn test_reduce_negative_axis() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // axis=-1 on (3,4) should equal axis=1.
     let data: Vec<f32> = (0..12).map(|x| x as f32).collect();
     let h = alloc_nd(&data, &[3, 4]);
@@ -1030,6 +1096,7 @@ fn test_reduce_negative_axis() {
 
 #[test]
 fn test_tape_record_reduce_backward_sum() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // sum(x, axis=0) backward: dx = broadcast_to(dout, x.shape).
     tape_reset();
     let x_data = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
@@ -1057,6 +1124,7 @@ fn test_tape_record_reduce_backward_sum() {
 
 #[test]
 fn test_broadcast_add_backward() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // (1,3) + (2,3) — sum VJP reduces dout to each operand's shape.
     tape_reset();
     let a_data = vec![1.0f32, 1.0, 1.0];
@@ -1105,6 +1173,7 @@ fn test_broadcast_add_backward() {
 
 #[test]
 fn test_tensor_reshape_zero_copy() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let data: Vec<f32> = (0..24).map(|i| i as f32).collect();
     let h = alloc_3d(&data, 2, 3, 4);
     // Reshape (2,3,4) → (6,4)
@@ -1131,6 +1200,7 @@ fn test_tensor_reshape_zero_copy() {
 
 #[test]
 fn test_tensor_permute_2d_no_args() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // transpose(t) with 0 args: reverses a 2-D tensor [2,3] → [3,2]
     let data = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
     let h = alloc_2d(&data, 2, 3);
@@ -1145,6 +1215,7 @@ fn test_tensor_permute_2d_no_args() {
 
 #[test]
 fn test_tensor_permute_swap_two_axes() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // transpose(t, 0, 2): (2,3,4) → (4,3,2)
     let data: Vec<f32> = (0..24).map(|i| i as f32).collect();
     let h = alloc_3d(&data, 2, 3, 4);
@@ -1158,6 +1229,7 @@ fn test_tensor_permute_swap_two_axes() {
 
 #[test]
 fn test_tensor_permute_full_3d() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // permute(t, 2, 0, 1): (2,3,4) → (4,2,3)
     let data: Vec<f32> = (0..24).map(|i| i as f32).collect();
     let h = alloc_3d(&data, 2, 3, 4);
@@ -1172,6 +1244,7 @@ fn test_tensor_permute_full_3d() {
 
 #[test]
 fn test_tensor_matmul_batched_3d() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // (2,2,3) @ (2,3,2) → (2,2,2)
     // Batch 0: [[1,2,3],[4,5,6]] @ [[1,0],[0,1],[1,0]] = [[4,2],[10,5]]
     // (just checking shape and non-panic)
@@ -1194,6 +1267,7 @@ fn test_tensor_matmul_batched_3d() {
 
 #[test]
 fn test_reshape_vjp() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // Variable reshape: (4,) → (2,2), sum all, backward.
     // dout = 1, dx should be all-ones with shape (4,).
     tape_reset();
@@ -1225,6 +1299,7 @@ fn test_reshape_vjp() {
 
 #[test]
 fn test_permute_vjp_2d_transpose() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // B = permute(A, []) where A is (2,3) → B is (3,2), sum, backward.
     // dB = ones(3,2). dA = permute(dB, [1,0]) = ones(2,3).
     tape_reset();
@@ -1255,6 +1330,7 @@ fn test_permute_vjp_2d_transpose() {
 
 #[test]
 fn test_batched_matmul_vjp() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // Q=(2,2,3), K=(2,3,2), scores=Q@K=(2,2,2), loss=sum(scores).
     // All ones: each element of scores is 3.0 (dot of 3-vector of ones).
     // dQ[b] = dC[b] @ K[b]^T = ones(2,2) @ ones(2,3) = 2*ones(2,3).
@@ -1307,6 +1383,7 @@ fn alloc_i64(data: &[i64]) -> i64 {
 
 #[test]
 fn test_embedding_forward_i32() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // weight [4, 3] = rows 0..3; indices [1, 0, 2]
     // out[0] = weight[1] = [3,4,5]; out[1] = weight[0] = [0,1,2]; out[2] = weight[2] = [6,7,8]
     let wdata: Vec<f32> = (0..12).map(|i| i as f32).collect();
@@ -1323,6 +1400,7 @@ fn test_embedding_forward_i32() {
 
 #[test]
 fn test_embedding_forward_i64_indices() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // Same test as above but with i64 index tensor.
     let wdata: Vec<f32> = (0..12).map(|i| i as f32).collect();
     let w = alloc_2d(&wdata, 4, 3);
@@ -1337,6 +1415,7 @@ fn test_embedding_forward_i64_indices() {
 
 #[test]
 fn test_embedding_vjp_scatter_add() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // weight [4, 2]; indices [0, 2, 1, 0] (index 0 appears twice).
     // loss = sum(embedding(w, idx)).
     // dw[0] = 2*ones_2; dw[1] = 1*ones_2; dw[2] = 1*ones_2; dw[3] = zeros_2.
@@ -1378,6 +1457,7 @@ fn test_embedding_vjp_scatter_add() {
 
 #[test]
 fn test_embedding_gradient_matches_finite_differences() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // Finite-difference check: ∂(sum(embedding(w, [2,0,1,2])))/∂w[i,j] == count(indices==i).
     // Analytic: dw[0]=1, dw[1]=2, dw[2]=1, others 0 (with D=2 per row).
     // FD: perturb w[i,j] by eps; (f(w+eps) - f(w-eps)) / (2*eps).
@@ -1430,6 +1510,7 @@ fn test_embedding_gradient_matches_finite_differences() {
 
 #[test]
 fn test_randn_shape_and_nonzero() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let shape = [3usize, 4];
     let h = tensor_randn(shape.as_ptr(), 2);
     assert_eq!(shape_of(h), vec![3, 4]);
@@ -1443,6 +1524,7 @@ fn test_randn_shape_and_nonzero() {
 
 #[test]
 fn test_randn_deterministic_per_call_counter() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // Two consecutive calls with the same shape in a fresh counter state produce
     // different outputs (different call indices drive the Philox key).
     let shape = [4usize];
@@ -1467,6 +1549,7 @@ fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
 
 #[test]
 fn test_mps_matmul_2d_correctness() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (m, k, n) = (32, 64, 48);
     let a_data = make_random_f32(m * k, 0.0);
     let b_data = make_random_f32(k * n, 1.0);
@@ -1485,6 +1568,7 @@ fn test_mps_matmul_2d_correctness() {
 
 #[test]
 fn test_mps_matmul_3d_batched_correctness() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (batch, m, k, n) = (4, 16, 32, 24);
     let a_data = make_random_f32(batch * m * k, 2.0);
     let b_data = make_random_f32(batch * k * n, 3.0);
@@ -1503,6 +1587,7 @@ fn test_mps_matmul_3d_batched_correctness() {
 
 #[test]
 fn test_mps_matmul_3x2_broadcast_correctness() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (batch, m, k, n) = (4, 16, 32, 24);
     let a_data = make_random_f32(batch * m * k, 4.0);
     let b_data = make_random_f32(k * n, 5.0);
@@ -1522,6 +1607,7 @@ fn test_mps_matmul_3x2_broadcast_correctness() {
 #[test]
 #[ignore]
 fn test_mps_matmul_speedup() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (m, k, n) = (512, 512, 512);
     let a_data = make_random_f32(m * k, 0.0);
     let b_data = make_random_f32(k * n, 1.0);
