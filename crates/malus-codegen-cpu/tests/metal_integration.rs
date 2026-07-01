@@ -1060,6 +1060,58 @@ fn test_v4_m3_full_step_zero_cpu_compute() {
     );
 }
 
+/// M29 (ADR-0026, D5): non-gating RC leak assertion.
+///
+/// This does NOT assert `retains == releases` at whole-program end: `main`
+/// legitimately keeps weights/optimizer-momentum state alive for its entire
+/// run (a real training script runs until convergence; there's no
+/// requirement to free everything before the process exits, any more than a
+/// long-lived server is expected to free its caches before `main` returns).
+/// That one-time "still alive at exit" baseline is not a leak.
+///
+/// What *would* indicate a real bug is memory growing unboundedly across
+/// repeated steady-state iterations of the training loop. So: run 2, 3, and
+/// 4 steps, and compare the per-iteration RC delta (step N minus step N-1)
+/// across two consecutive one-more-step increments — both increments are
+/// steady-state (`zero_grad` already clears the previous step's leaf grads
+/// at the top of each iteration, and the one-time setup cost cancels out of
+/// every delta), so the two deltas must match exactly. A per-iteration leak
+/// would show up as a growing delta.
+#[test]
+fn test_v4_m29_rc_leak_assertion() {
+    let _guard = METAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let run = |max_steps: i64| -> (i64, i64, i64) {
+        let src = nanogpt_train_src(max_steps, false);
+        let user_program = parse(malus_syntax::FileId(0), &src).expect("parse failed");
+        let mut stdlib = malus_stdlib::stdlib_items();
+        stdlib.extend(user_program.items.into_iter());
+        let program = malus_syntax::ast::Program { items: stdlib };
+        let aliases = HashMap::new();
+        let typed = check(&program, &aliases).expect("type check failed");
+        let (registry, kernel_ids) =
+            malus_codegen_gpu::compile_kernels(&typed).expect("kernel compilation failed");
+        malus_runtime::runtime_init(&registry.into_hashmap());
+        let symbols = real_symbols();
+        malus_runtime::malus_rc_reset();
+        compile_and_run(&typed, &symbols, &kernel_ids).expect("JIT compile and run failed");
+        malus_runtime::malus_rc_counts()
+    };
+
+    let (r2, rel2, a2) = run(2);
+    let (r3, rel3, a3) = run(3);
+    let (r4, rel4, a4) = run(4);
+    let delta_a = (r3 - r2, rel3 - rel2, a3 - a2);
+    let delta_b = (r4 - r3, rel4 - rel3, a4 - a3);
+
+    assert_eq!(
+        delta_a, delta_b,
+        "M29 leak assertion: per-iteration RC delta must be constant across \
+         steady-state steps — step2->3 delta {delta_a:?} vs step3->4 delta \
+         {delta_b:?}; a growing delta means memory leaks per iteration"
+    );
+}
+
 /// M26 done-when: every op's analytic backward() gradient matches a
 /// finite-difference numeric gradient within 1e-3, across every op the
 /// nanoGPT forward pass exercises (matmul, softmax, layernorm, gelu,

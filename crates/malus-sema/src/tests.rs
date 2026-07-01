@@ -1090,6 +1090,14 @@ fn main():
 
 #[test]
 fn test_variable_release_emitted() {
+    // M29 (ADR-0026, D6): a grad-tracked scalar `Tensor` local now always gets
+    // a static `Drop`, never an RC `Release` — the tape's own self-retain
+    // (`tape_record_*`, `malus-runtime/src/tape.rs`) is what keeps a
+    // tape-saved tensor alive, not this binding's own drop kind. `Drop` and
+    // the old `Release` already lowered to the identical runtime decrement
+    // (`tensor_free` delegates to `tensor_release`), so this is a rename in
+    // the IR's RC-op accounting (the M29 compile-time reduction-ratio gate),
+    // not a behavior change.
     let src = r#"
 fn main():
     let t = Tensor.gpu<f32>([1.0])
@@ -1099,7 +1107,8 @@ fn main():
     let prog = check_src(src).expect("check failed");
     let body = &prog.fns[0].body;
     let kinds = flat_stmt_kinds(body);
-    assert!(kinds.contains(&"Release"), "expected Release for Variable; got {:?}", kinds);
+    assert!(!kinds.contains(&"Release"), "expected no Release (D6: always Drop); got {:?}", kinds);
+    assert!(kinds.contains(&"Drop"), "expected Drop for grad-tracked local; got {:?}", kinds);
 }
 
 #[test]
@@ -1376,11 +1385,33 @@ fn main():
 "#;
     let prog = check_src(src).expect("check failed");
     let main_fn = prog.fns.iter().find(|f| f.name == "main").expect("main not found");
-    let release_names = releases_in(&main_fn.body);
+    let identity_fn = prog.fns.iter().find(|f| f.name == "identity").expect("identity not found");
+    // M29 (D6): `out` is a plain scalar-`Tensor` local in `main` — always a
+    // static `Drop` now, regardless of grad-tracking (see
+    // `test_variable_release_emitted`).
+    let drop_names = drops_in(&main_fn.body);
     assert!(
-        release_names.contains(&"out"),
-        "call result through a grad-tracked param/return should be RC-released; got releases: {:?}",
+        drop_names.contains(&"out"),
+        "call result through a grad-tracked param/return should still get a Drop; got drops: {:?}",
+        drop_names
+    );
+    // M29 (D2): `identity` returns its own param `x` straight through — a
+    // param carries no owned reference (uniform borrow ABI), so the callee
+    // must Retain on this escape path to hand `main` a genuine new reference
+    // (see `insert_param_return_retains`). Without this, `t`'s own Drop and
+    // `out`'s Drop would both decrement a refcount that was only ever
+    // incremented once — an over-release.
+    let release_names = releases_in(&identity_fn.body);
+    assert!(
+        release_names.is_empty(),
+        "identity's own body should have no Release (params are borrows); got: {:?}",
         release_names
+    );
+    let kinds = flat_stmt_kinds(&identity_fn.body);
+    assert!(
+        kinds.contains(&"Retain"),
+        "returning a borrowed param straight through must Retain on the return path; got: {:?}",
+        kinds
     );
 }
 
@@ -1400,11 +1431,15 @@ fn main():
     print(w2)
 "#;
     let prog = check_src(src).expect("check failed");
-    let release_names = releases_in(&prog.fns[0].body);
+    // M29 (D6): `w2` is a plain scalar-`Tensor` local (an alias of `m`'s field,
+    // read via `FieldAccess` — not one of `insert_variable_arc_retains`'s two
+    // alias shapes, `Ident`/`.data`, so untouched by D2/D3 either) — always a
+    // static `Drop` now, regardless of grad-tracking.
+    let drop_names = drops_in(&prog.fns[0].body);
     assert!(
-        release_names.contains(&"w2"),
-        "reading a grad-carrying struct field should be RC-released; got releases: {:?}",
-        release_names
+        drop_names.contains(&"w2"),
+        "reading a grad-carrying struct field should still get a Drop; got drops: {:?}",
+        drop_names
     );
 }
 
@@ -1655,18 +1690,29 @@ fn main():
 /// CAPSTONE DESIGN CONSTRAINT (not an M28 bug, a pre-existing CTMM property
 /// this milestone's nanoGPT rewrite must respect): binding `let x =
 /// model.params[i]` — a plain alias of a grad-tracked tensor read out of a
-/// `List` — gets its OWN `Release` at `x`'s last use, exactly as if `x` had
-/// been freshly allocated. Since `x` is really an ALIAS of the tensor still
-/// owned by `model.params`, that `Release` would incorrectly decrement (and,
-/// on a repeated call with the same model, eventually free) the shared
-/// tensor out from under the caller. `forward()` must therefore reference
+/// `List` — gets its OWN drop at `x`'s last use, exactly as if `x` had been
+/// freshly allocated. Since `x` is really an ALIAS of the tensor still owned
+/// by `model.params`, that drop would incorrectly decrement (and, on a
+/// repeated call with the same model, eventually free) the shared tensor out
+/// from under the caller. `forward()` must therefore reference
 /// `model.params[i]` INLINE at each use site (matching the existing,
 /// already-correct V3 pattern of writing `blk.wq` inline rather than binding
 /// `let wq = blk.wq`) — never bind a struct/list tensor read to a persistent
 /// local name. Index-typed scalar constants (`let WQ = 1`) are fine, since
 /// they're plain i64 values with no ownership.
+///
+/// M29 (ADR-0026): this binding's drop is now emitted as a static `Drop`
+/// rather than the pre-M29 `Release` (D6 — the two already lowered to the
+/// identical runtime decrement, so the rename doesn't change the underlying
+/// hazard). The hazard itself is UNCHANGED by M29 and remains open post-M29:
+/// `insert_variable_arc_retains`'s alias-retain protocol (D2/D3) only
+/// recognizes bare-`Ident` and `.data`-`FieldAccess` RHS shapes;
+/// `model.params[0]` is an `Index` expression, a third shape M29's
+/// intraprocedural borrow-inference doesn't classify (see ADR-0026 "Out of
+/// Scope" — proving `ln1_w`'s lifetime nests inside `model`'s needs
+/// interprocedural analysis this milestone doesn't have).
 #[test]
-fn test_list_indexed_tensor_alias_gets_release_capstone_design_constraint() {
+fn test_list_indexed_tensor_alias_gets_drop_capstone_design_constraint() {
     let src = r#"
 struct GPT:
     params: List<Tensor<f32>>
@@ -1683,17 +1729,10 @@ fn main():
 "#;
     let typed = check_src(src).expect("check failed");
     let forward = typed.fns.iter().find(|f| f.name == "forward").unwrap();
-    // `ln1_w` escapes via `return`, so per ADR-0030 it's Release'd (RC), not
-    // statically Dropped — but the point stands regardless of which: `forward`
-    // believes it owns (or must RC-manage) a reference that `model.params`
-    // still needs. This test documents the property the capstone must design
-    // around, not asserts it's "fixed" (fixing it generally is M29 borrow-
-    // inference territory — proving `ln1_w`'s lifetime nests inside `model`'s
-    // requires interprocedural analysis this milestone doesn't have).
-    let releases = releases_in(&forward.body);
+    let drops = drops_in(&forward.body);
     assert!(
-        releases.contains(&"ln1_w"),
-        "expected ln1_w to be RC-managed (documenting the aliasing risk), got: {:?}", releases
+        drops.contains(&"ln1_w"),
+        "expected ln1_w to get its own Drop (documenting the aliasing risk), got: {:?}", drops
     );
 }
 
@@ -1721,4 +1760,125 @@ fn main():
     let tags = flat_stmt_kinds(&main.body);
     assert_eq!(tags.iter().filter(|t| **t == "RetainAgg").count(), 0, "no aliasing occurred; got tags: {:?}", tags);
     assert_eq!(tags.iter().filter(|t| **t == "DropList").count(), 1, "expected exactly one DropList; got tags: {:?}", tags);
+}
+
+// ── M29: RC-ratio compile-time reduction gate (ADR-0026, D1) ─────────────────
+//
+// Lobster's "~5%" is a reduction ratio: residual RC ops (compiler-emitted
+// Retain/Release/RetainAgg/ReleaseAgg) as a fraction of the naive baseline a
+// scheme without borrow-inference would need (one RC op per tensor-producing
+// binding that crosses a function-call boundary or is aliased). Recurses into
+// every nested scope (flat_stmt_kinds does not) since RC nodes can be emitted
+// inside if/for/while/match bodies too.
+
+fn count_recursive(stmts: &[TypedStmt], pred: &dyn Fn(&TypedStmt) -> bool) -> usize {
+    let mut n = 0;
+    for s in stmts {
+        if pred(s) {
+            n += 1;
+        }
+        match s {
+            TypedStmt::If { then_body, else_body, .. } => {
+                n += count_recursive(then_body, pred);
+                if let Some(eb) = else_body {
+                    n += count_recursive(eb, pred);
+                }
+            }
+            TypedStmt::For { body, .. }
+            | TypedStmt::While { body, .. }
+            | TypedStmt::ForIn { body, .. }
+            | TypedStmt::NoGrad { body } => {
+                n += count_recursive(body, pred);
+            }
+            TypedStmt::Match { arms, .. } => {
+                for arm in arms {
+                    n += count_recursive(&arm.body, pred);
+                }
+            }
+            _ => {}
+        }
+    }
+    n
+}
+
+fn is_rc_op(s: &TypedStmt) -> bool {
+    matches!(
+        s,
+        TypedStmt::Retain { .. }
+            | TypedStmt::Release { .. }
+            | TypedStmt::RetainAgg { .. }
+            | TypedStmt::ReleaseAgg { .. }
+    )
+}
+
+fn is_tensor_producing_binding(s: &TypedStmt) -> bool {
+    matches!(s, TypedStmt::Let { expr, .. } if expr.ty.is_tensor())
+}
+
+/// Done-when #1 (ADR-0026 D1): compiler-emitted RC ops <= ~5% of the naive
+/// baseline (one RC op per tensor-producing `let`) over a nanoGPT-shaped
+/// forward+backward pass — struct-held weights, chained calls, a param
+/// returned straight through, all differentiated via `variable()`+`backward`.
+/// Self-contained (no malus-stdlib dependency): uses plain BinOp/`@` in place
+/// of the real stdlib's layernorm/softmax/etc., which exercise the exact same
+/// RC-relevant shapes (struct-field reads, call-boundary passing, aliasing)
+/// this gate measures.
+#[test]
+fn test_v4_m29_rc_ratio_gate() {
+    let src = r#"
+struct Block:
+    ln1_w: Tensor<f32>
+    wq: Tensor<f32>
+    wk: Tensor<f32>
+    wv: Tensor<f32>
+    wo: Tensor<f32>
+
+fn attn(blk: Block, x: Tensor<f32>) -> Tensor<f32>:
+    let xn1 = x * blk.ln1_w
+    let q = xn1 @ blk.wq
+    let k = xn1 @ blk.wk
+    let v = xn1 @ blk.wv
+    let scores = q @ k
+    let attn_out = scores @ v
+    let proj = attn_out @ blk.wo
+    return proj
+
+fn identity(x: Tensor<f32>) -> Tensor<f32>:
+    return x
+
+fn main():
+    let ln1_w = variable(ones(4, 4))
+    let wq = variable(ones(4, 4))
+    let wk = variable(ones(4, 4))
+    let wv = variable(ones(4, 4))
+    let wo = variable(ones(4, 4))
+    let blk = Block(ln1_w=ln1_w, wq=wq, wk=wk, wv=wv, wo=wo)
+    let x = variable(ones(4, 4))
+    let out = attn(blk, x)
+    let same = identity(out)
+    let loss = sum(same)
+    backward(loss)
+    print(loss)
+"#;
+    let typed = check_src(src).expect("check failed");
+    let main_fn = typed.fns.iter().find(|f| f.name == "main").expect("main not found");
+    let attn_fn = typed.fns.iter().find(|f| f.name == "attn").expect("attn not found");
+    let identity_fn = typed.fns.iter().find(|f| f.name == "identity").expect("identity not found");
+
+    let rc_ops: usize = [main_fn, attn_fn, identity_fn]
+        .iter()
+        .map(|f| count_recursive(&f.body, &is_rc_op))
+        .sum();
+    let alloc_baseline: usize = [main_fn, attn_fn, identity_fn]
+        .iter()
+        .map(|f| count_recursive(&f.body, &is_tensor_producing_binding))
+        .sum();
+
+    assert!(alloc_baseline > 0, "test fixture produced no tensor bindings to measure against");
+    let ratio = rc_ops as f64 / alloc_baseline as f64;
+    assert!(
+        ratio <= 0.05,
+        "M29 RC-ratio gate: {rc_ops} RC ops / {alloc_baseline} tensor bindings = {:.1}%, expected <= 5%",
+        ratio * 100.0
+    );
 }

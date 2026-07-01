@@ -21,26 +21,26 @@ _Avoid_: Split compilation, two-stage compilation
 ### Memory
 
 **CTMM** (Compile-Time Memory Management):
-malus's automatic compile-time memory management system. Uses escape analysis and borrow-inference to insert static `free` calls for tensors. Falls back to reference counting only for tensors that genuinely escape their creation scope (primarily tensors saved onto the autograd tape). The compiler picks a single owner per allocation; all other uses are zero-cost borrows. Inspired by the Lobster language's ownership model (https://aardappel.github.io/lobster/memory_management.html). See ADR-0026.
+malus's automatic compile-time memory management system. Uses escape analysis and borrow-inference to insert static `free` calls for tensors. Falls back to reference counting only where ownership is genuinely structurally ambiguous — a `List<T>` (which may alias across a call boundary) or a struct field where a single owner can't be proven, never a scalar `Tensor` binding (M29: the autograd tape retains its own copy of anything it saves, so scalar-tensor RC is never needed for tape-survival — see ADR-0026 "why this supersedes ADR-0002/0016"). The compiler picks a single owner per allocation; all other uses are zero-cost borrows. Inspired by the Lobster language's ownership model (https://aardappel.github.io/lobster/memory_management.html). See ADR-0026.
 _Avoid_: GC, garbage collector, allocator
 
 **Escape analysis**:
 The compiler pass that determines whether a tensor's lifetime can be fully resolved at compile time by tracking where it is created, used, and last referenced.
 
 **Owner**:
-The single binding, struct field, or array element assigned a tensor allocation. Exactly one owner per allocation. The compiler emits `tensor_free` (or `tensor_release` if escaping) at the owner's last-use point.
+The single binding, struct field, or array element assigned a tensor allocation. Exactly one owner per allocation. A scalar `Tensor` owner always gets a static `tensor_free`, at its last-use point, regardless of whether it's grad-tracked (M29) — `tensor_free` itself decrements a refcount (see Static drop); RC survives only for the aggregate cases described under RC fallback.
 _Avoid_: primary reference, strong reference
 
 **Borrow**:
-Any use of a tensor allocation that is not the owner. Borrows carry zero refcount cost — `tensor_retain`/`tensor_release` are not emitted. The programmer does not annotate borrows; the compiler infers them.
+Any use of a tensor allocation that is not the owner — a function parameter (uniform borrow ABI, M29/ADR-0026 D2), or a same-scope alias the compiler proves is outlived by its source. Borrows carry zero refcount cost — `tensor_retain`/`tensor_release` are not emitted, and the owner's own drop covers every borrow's uses. The programmer does not annotate borrows; the compiler infers them.
 _Avoid_: reference, immutable reference, view
 
 **RC fallback**:
-When CTMM determines a tensor **escapes** its creation scope — primarily because it is saved onto the autograd tape — it falls back to reference counting. `tensor_retain` increments the refcount when the tensor is saved (e.g., for a backward VJP); `tensor_release` decrements and frees when the refcount hits zero. In the hot-path training loop, ≤ ~5% of allocations should require RC; the rest receive static-free via borrow-inference. See ADR-0026.
+When CTMM determines ownership is genuinely structurally ambiguous, it falls back to reference counting: a `List<T>` (always RC, ADR-0034 — may alias across a call boundary) and struct fields where a single owner can't be proven. `tensor_retain` increments the refcount when a second, independent owner needs its own reference; `tensor_release` decrements and frees when the refcount hits zero. A tensor saved onto the autograd tape is *not* an RC-fallback case — the tape retains its own copy synchronously when it records the op, independent of the binding's own (always-static) drop. In the hot-path training loop, ≤ ~5% of the compiler's own emitted `Retain`/`Release`/`RetainAgg`/`ReleaseAgg` nodes (relative to a naive non-borrow-inferred baseline) should remain — see the M29 RC-ratio gate. See ADR-0026.
 _Avoid_: garbage collection, ARC
 
 **Static drop**:
-A CTMM drop point that is fully determined at compile time. Emitted as a `TypedStmt::Drop` node, lowered to a `tensor_free` call. No refcount overhead.
+A CTMM drop point that is fully determined at compile time. Emitted as a `TypedStmt::Drop` node, lowered to a `tensor_free` call — which is itself a refcount decrement (`tensor_free` delegates to `tensor_release`, freeing at zero); "static" describes that the *decision* to drop here is compile-time-determined, not that the underlying op is somehow not a refcount operation. No RC bookkeeping overhead (no extra `Retain` to balance it).
 _Avoid_: deterministic free (too vague)
 
 ### Tensors

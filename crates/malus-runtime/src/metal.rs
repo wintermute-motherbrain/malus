@@ -191,6 +191,7 @@ pub extern "C" fn tensor_alloc_gpu(
         shape,
         ref_count: std::sync::atomic::AtomicUsize::new(1),
     });
+    crate::alloc_inc();
     Box::into_raw(tb) as i64
 }
 
@@ -217,6 +218,7 @@ pub extern "C" fn tensor_retain(handle: i64) {
     if handle == 0 {
         return;
     }
+    crate::retain_inc();
     let tb = unsafe { &*(handle as *const TensorBuffer) };
     tb.ref_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
@@ -225,15 +227,26 @@ pub extern "C" fn tensor_retain(handle: i64) {
 ///
 /// All free paths (including `tensor_free`) go through here so the ownership
 /// invariant is single-sourced.
+///
+/// M29: `fetch_sub` returns the *previous* count. `prev == 0` means this
+/// handle was already at zero — a double-release / over-release, exactly the
+/// failure mode a wrong borrow-inference owner/borrow split would produce.
+/// Aborting here is a deterministic, always-on detector for that bug class
+/// (ADR-0026 D5), cheaper than requiring ASAN to catch the same fault.
 #[no_mangle]
 pub extern "C" fn tensor_release(handle: i64) {
     if handle == 0 {
         return;
     }
+    crate::release_inc();
     let tb = unsafe { &*(handle as *const TensorBuffer) };
     // AcqRel: Acquire on the last decrement so all prior writes to the buffer
     // are visible before the drop; Release on all earlier decrements.
-    if tb.ref_count.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 {
+    let prev = tb.ref_count.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    if prev == 0 {
+        panic!("malus: over-release of tensor handle {handle:#x} (refcount already zero) — likely a borrow-inference or tape-retain bug");
+    }
+    if prev == 1 {
         crate::tape::tape_on_release(handle);
         unsafe { drop(Box::from_raw(handle as *mut TensorBuffer)); }
     }

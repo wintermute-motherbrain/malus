@@ -54,6 +54,45 @@ pub extern "C" fn malus_gradcheck_reset() {
     GRADCHECK_MAX_DIFF_BITS.store(0, Ordering::SeqCst);
 }
 
+// M29 — RC-op counters. Platform-independent; always compiled. Not the RC-ratio
+// CI gate (that's a compile-time count of CTMM-emitted Retain/Release nodes,
+// measured in malus-sema — see ADR-0026 "why this supersedes ADR-0002/0016").
+// These runtime counters back a non-gating net-zero leak assertion
+// (retain_count == release_count after a step) and are called from every
+// tensor_retain/tensor_release/tensor_alloc_gpu entry point in metal.rs.
+static RETAIN_COUNT: AtomicI64 = AtomicI64::new(0);
+static RELEASE_COUNT: AtomicI64 = AtomicI64::new(0);
+static ALLOC_COUNT: AtomicI64 = AtomicI64::new(0);
+
+pub fn retain_inc() {
+    RETAIN_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn release_inc() {
+    RELEASE_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn alloc_inc() {
+    ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
+// Not `extern "C"`: a Rust tuple has no stable FFI ABI. This is a Rust-to-Rust
+// test helper (never a JIT symbol), same pattern as `tape::registry_lens`.
+pub fn malus_rc_counts() -> (i64, i64, i64) {
+    (
+        RETAIN_COUNT.load(Ordering::SeqCst),
+        RELEASE_COUNT.load(Ordering::SeqCst),
+        ALLOC_COUNT.load(Ordering::SeqCst),
+    )
+}
+
+#[no_mangle]
+pub extern "C" fn malus_rc_reset() {
+    RETAIN_COUNT.store(0, Ordering::SeqCst);
+    RELEASE_COUNT.store(0, Ordering::SeqCst);
+    ALLOC_COUNT.store(0, Ordering::SeqCst);
+}
+
 // M22 string I/O — platform-independent.
 mod strio;
 pub use strio::{

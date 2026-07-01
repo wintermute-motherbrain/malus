@@ -6,6 +6,7 @@ mod check;
 mod env;
 mod error;
 mod ctmm;
+mod borrow_inference;
 mod grad_inference;
 mod ty;
 mod typed_ir;
