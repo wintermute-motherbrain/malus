@@ -158,6 +158,10 @@ fn main():
 
     let mut print_at = 1
     for step in range(1, max_steps + 1):
+        # M30: no-ops unless run with `malus --bench`; step_end flushes GPU
+        # work inside the timed region (matches PyTorch's per-step
+        # torch.mps.synchronize() — see ADR-0038).
+        bench_step_begin()
         let mut x_buf = buffer_i32(B * T)
         let mut y_buf = buffer_i32(B * T)
         for b in range(B):
@@ -174,6 +178,7 @@ fn main():
         let loss = cross_entropy(logits, y_toks)
         backward(loss)
         adamw(gpt, ms, vs, opt, step)
+        bench_step_end()
         if step == print_at:
             println("step {}: loss = {}", step, loss.data)
             print_at = print_at + 20

@@ -178,6 +178,9 @@ pub struct RuntimeSymbols {
     pub tape_register_backward_fn: extern "C" fn(i32, usize),
     // M26 — gradient-check test infra (record_diff builtin).
     pub malus_record_diff: extern "C" fn(f32),
+    // M30 — bench timer pair (ADR-0038); dormant unless the CLI enables --bench.
+    pub bench_step_begin: extern "C" fn(),
+    pub bench_step_end:   extern "C" fn(),
 }
 
 // M26 — (BwdSlot discriminant, malus-stdlib fn name) pairs. The discriminant
@@ -471,6 +474,9 @@ struct Codegen<'m> {
     rt_malus_rand_uniform:         FuncId,
     // M26: record_diff (gradient-check test infra).
     rt_malus_record_diff:          FuncId,
+    // M30: bench timer pair.
+    rt_bench_step_begin:           FuncId,
+    rt_bench_step_end:             FuncId,
     // M22: Buffer<i32>.
     rt_malus_buffer_i32:           FuncId,
     rt_malus_buffer_get_i32:       FuncId,
@@ -1821,6 +1827,15 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                     let func_ref = self.import_func(self.codegen.rt_malus_rand_uniform);
                     let call = self.builder.ins().call(func_ref, &[]);
                     Ok(self.builder.inst_results(call).to_vec()[0])
+                } else if callee == "bench_step_begin" || callee == "bench_step_end" {
+                    let func_id = if callee == "bench_step_begin" {
+                        self.codegen.rt_bench_step_begin
+                    } else {
+                        self.codegen.rt_bench_step_end
+                    };
+                    let func_ref = self.import_func(func_id);
+                    self.builder.ins().call(func_ref, &[]);
+                    Ok(self.builder.ins().iconst(I64, 0))
                 } else if callee == "record_diff" {
                     let v = self.lower_expr(&args[0])?;
                     let func_ref = self.import_func(self.codegen.rt_malus_record_diff);
@@ -3171,6 +3186,9 @@ pub fn compile_and_run(
     // M22 rand_uniform.
     jit_builder.symbol("malus_rand_uniform",        symbols.malus_rand_uniform        as *const u8);
     jit_builder.symbol("malus_record_diff",         symbols.malus_record_diff         as *const u8);
+    // M30 bench timer pair.
+    jit_builder.symbol("bench_step_begin",          symbols.bench_step_begin          as *const u8);
+    jit_builder.symbol("bench_step_end",            symbols.bench_step_end            as *const u8);
     // M22 Buffer<i32>.
     jit_builder.symbol("malus_buffer_i32",         symbols.malus_buffer_i32          as *const u8);
     jit_builder.symbol("malus_buffer_get_i32",     symbols.malus_buffer_get_i32      as *const u8);
@@ -3539,6 +3557,12 @@ pub fn compile_and_run(
     let rt_malus_record_diff = module.declare_function("malus_record_diff", Linkage::Import, &sig_record_diff)
         .map_err(|e| CodegenError::JitError(e.to_string()))?;
 
+    // M30 bench timer pair — () -> (), same signature as gpu_barrier.
+    let rt_bench_step_begin = module.declare_function("bench_step_begin", Linkage::Import, &sig_barrier)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
+    let rt_bench_step_end = module.declare_function("bench_step_end", Linkage::Import, &sig_barrier)
+        .map_err(|e| CodegenError::JitError(e.to_string()))?;
+
     // M22 Buffer<i32> signatures.
     // malus_buffer_i32(len: i64) -> i64
     let sig_buffer_i32 = {
@@ -3703,6 +3727,8 @@ pub fn compile_and_run(
         rt_tensor_dim,
         rt_kernel_dispatch_v2,
         rt_malus_record_diff,
+        rt_bench_step_begin,
+        rt_bench_step_end,
     };
 
     // Second pass: compile each fn body.

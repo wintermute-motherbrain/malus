@@ -1643,3 +1643,49 @@ fn test_mps_matmul_speedup() {
         speedup);
     assert!(speedup >= 10.0, "expected ≥10× speedup, got {speedup:.1}×");
 }
+
+#[test]
+fn test_bench_warm_median_skips_warmup() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    use std::time::Duration;
+    crate::bench::bench_reset();
+
+    assert!(crate::bench::bench_report().is_none());
+
+    // 3 warmup steps (large, must be excluded) + 5 warm steps.
+    for ms in [500, 400, 300] {
+        crate::bench::bench_record(Duration::from_millis(ms));
+    }
+    for ms in [10, 30, 20, 50, 40] {
+        crate::bench::bench_record(Duration::from_millis(ms));
+    }
+
+    let r = crate::bench::bench_report().expect("report after warm steps");
+    assert_eq!(r.warm_steps, 5);
+    assert_eq!(r.median, Duration::from_millis(30));
+    assert_eq!(r.min, Duration::from_millis(10));
+    assert_eq!(r.max, Duration::from_millis(50));
+
+    crate::bench::bench_reset();
+    assert!(crate::bench::bench_report().is_none());
+}
+
+#[test]
+fn test_bench_report_even_count_averages_middle() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    use std::time::Duration;
+    crate::bench::bench_reset();
+
+    for ms in [1, 1, 1] {
+        crate::bench::bench_record(Duration::from_millis(ms));
+    }
+    for ms in [10, 20, 30, 40] {
+        crate::bench::bench_record(Duration::from_millis(ms));
+    }
+
+    let r = crate::bench::bench_report().expect("report");
+    assert_eq!(r.warm_steps, 4);
+    assert_eq!(r.median, Duration::from_millis(25));
+
+    crate::bench::bench_reset();
+}

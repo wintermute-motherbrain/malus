@@ -69,7 +69,7 @@ predictions: [0.0056860363, 0.99518234, 0.9939387, 0.005444207]
 
 ## Status
 
-**V1 complete. V2 in progress (M13 done).**
+**V1–V4 complete. V5 (performance — earning the "without the Python slowness" claim) in progress, M30 done.**
 
 ### V1 — complete
 
@@ -88,10 +88,21 @@ predictions: [0.0056860363, 0.99518234, 0.9939387, 0.005444207]
 - Multi-file imports — `import ops` / `from ops import add`
 - Format-string printing — `println("loss: {}", tensor)`
 
-### V2 — autograd (in progress)
+### V2 — autograd (complete)
 
-- **M12** — Hardening: `break`/`continue`, zero-length tensor guard, enum-payload retain-on-bind
-- **M13** — `Variable<f32>` type: type-directed ARC distinguishes differentiable tensors from plain tensors at compile time; CTMM emits `tensor_retain`/`tensor_release` only for `Variable` bindings; static `Drop` on `Tensor` is untouched. Aggregate boxes (structs, enums) gain an 8-byte ARC header; match-arm struct/enum payload escape is now safe via targeted `RetainAgg`/`ReleaseAgg` emission
+Define-by-run tape with `backward()`, `.grad`, `no_grad`, and per-op VJPs. (The V2-era `Variable<f32>` type was eliminated in V4/M27 — there is one `Tensor` type; grad-tracking is inferred statically by the compiler.)
+
+### V3 — nanoGPT (complete)
+
+Broadcasting, axis reductions, `reshape`/`transpose`/`permute`, batched matmul, transformer stdlib (`softmax`, `layernorm`, `gelu`, `cross_entropy`), embeddings + index tensors, MPS-backed matmul, file I/O, and a char-GPT trained on tiny Shakespeare (`examples/nanogpt.ml`).
+
+### V4 — reclaiming the vision (complete)
+
+Kernel language v2 (thread hierarchy, shared memory, `barrier()`), all stdlib forward and backward ops as malus `.ml` GPU kernels (only `matmul` remains a vendor primitive), one `Tensor` type with static grad-inference, `Module` trait + generics + `List<T>`, and Lobster-style borrow-inference RC elimination.
+
+### V5 — performance (in progress)
+
+The V5 baseline (M30, matched methodology): the toy nanoGPT config trains at a **26.2 ms/step warm median vs 2.7 ms for f32 PyTorch-MPS — ~9.6x slower** (see `docs/milestones/m29-benchmark-results.md`). The gap is dispatch-architectural, not kernel quality: every matmul blocks on a full GPU round-trip and every op allocates a fresh buffer. V5 rebuilds the dispatch substrate (async command-buffer batching, buffer pooling) toward a hard ≤2x gate at the Karpathy nanoGPT config. Benchmark it yourself: `bench/nanogpt_step.sh`.
 
 ## Project structure
 
@@ -105,8 +116,8 @@ crates/
   malus-runtime/      # Metal API bindings, tensor ops, memory management
   malus-cli/          # script runner, entry point
 docs/
-  adr/                # architecture decision records (ADR-0001 through ADR-0014)
-  milestones/         # milestone specs (M1–M11) and V1 plan
+  adr/                # architecture decision records
+  milestones/         # milestone specs and the V1–V5 plans
   spec/               # language spec
 examples/
   add_tensors.ml      # basic kernel dispatch
@@ -118,8 +129,10 @@ examples/
   xor.ml              # V1 capstone: 2→8→1 sigmoid MLP that learns XOR
   import_demo/        # multi-file import
   hardening.ml        # M12: break/continue, zeros(0), enum-payload escape
-  variable_rc.ml      # M13: Variable<f32> wrap/identity/data, zero-leak ARC
   payload_escape.ml   # M13: struct payload escaping a match arm via aggregate ARC
+  gradient_check.ml   # M14: autograd gradient check
+  adamw.ml            # M20: self-contained AdamW optimizer
+  nanogpt.ml          # V3 capstone: char-GPT trained on tiny Shakespeare
 CONTEXT.md            # domain glossary
 ```
 
@@ -134,4 +147,4 @@ Requires: Rust 1.78+, macOS 14+ with Xcode command line tools (Metal runtime is 
 
 ## Architecture decisions
 
-See [`docs/adr/`](./docs/adr/) for the key decisions behind malus's design, including dual-pipeline compilation (ADR-0001), CTMM memory model (ADR-0002), panic-only error model (ADR-0006), built-in kernel id allocation (ADR-0010), define-by-run autograd tape (ADR-0015), and type-directed RC for `Variable` vs `Tensor` (ADR-0016).
+See [`docs/adr/`](./docs/adr/) for the key decisions behind malus's design, including dual-pipeline compilation (ADR-0001), CTMM memory model (ADR-0002), panic-only error model (ADR-0006), define-by-run autograd tape (ADR-0015), borrow-inference RC elimination (ADR-0026), static grad-inference replacing the `Variable` type (ADR-0030), and the V5 async execution model (ADR-0035).

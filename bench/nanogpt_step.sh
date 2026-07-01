@@ -1,18 +1,24 @@
 #!/usr/bin/env bash
-# M29 (ADR-0026, D7): malus-side half of the V4 performance baseline.
+# M30 (ADR-0038): the dispatch-overhead regression benchmark.
 #
-# Builds malus-cli in release mode and runs examples/nanogpt.ml end to end
-# (its `max_steps` is hardcoded to 300 in the source), measuring total
-# wall-clock time and reporting the per-step average. This is informational
-# (V4 plan: "no hard pass/fail threshold at this milestone") — pair with
-# bench/nanogpt_pytorch.py's output and record both, plus machine/version
-# info, in docs/milestones/m29-benchmark-results.md.
+# Runs examples/nanogpt.ml (toy config: C=32, T=16, B=4; max_steps hardcoded
+# to 300) with `malus --bench`, which reports the warm per-step median: the
+# runtime skips 3 warmup steps and times each remaining step with a GPU flush
+# inside the timed region — the same methodology as bench/nanogpt_pytorch.py
+# (3 warmup steps, torch.mps.synchronize() inside the timed step, median).
+# Pair the two median lines to compute the Nx ratio; record results in
+# docs/milestones/m29-benchmark-results.md.
 #
-# malus has no built-in per-step timer yet — this is the coarse,
-# always-available measurement (whole-process wall-clock / 300). A
-# --bench flag reporting a true per-step median is a natural follow-up if
-# per-step variance (data loading, first-call JIT/kernel-compile warmup)
-# turns out to matter more precisely than this average captures.
+# At this toy scale both runtimes are dispatch-bound, not compute-bound, so
+# the warm median isolates dispatch-architecture cost. Run this manually
+# before/after each V5 substrate milestone (M31/M32) to confirm the number
+# moves and nothing regresses it. Deliberately NOT a CI assert — wall-clock
+# gates flake. The M35 capstone benchmark (Karpathy config) is the hard gate;
+# this is the fast tracking check.
+#
+# Whole-process wall-clock is also printed as a sanity number; it includes
+# one-time cost (startup, MSL compile, data load/tokenize) plus post-training
+# generation, so it is NOT the headline figure.
 #
 # Usage: bench/nanogpt_step.sh
 
@@ -35,17 +41,24 @@ if [ ! -f data/tiny_shakespeare.txt ]; then
     exit 1
 fi
 
-echo "Running examples/nanogpt.ml ($MAX_STEPS steps)..."
+echo "Running examples/nanogpt.ml ($MAX_STEPS steps, --bench)..."
 START=$(date +%s.%N)
-"$BIN" examples/nanogpt.ml > /tmp/malus_nanogpt_bench.log 2>&1 || {
+"$BIN" --bench examples/nanogpt.ml > /tmp/malus_nanogpt_bench.log 2>&1 || {
     echo "malus run failed — see /tmp/malus_nanogpt_bench.log" >&2
     tail -40 /tmp/malus_nanogpt_bench.log >&2
     exit 1
 }
 END=$(date +%s.%N)
 
-TOTAL=$(echo "$END - $START" | bc)
-PER_STEP=$(echo "$TOTAL / $MAX_STEPS" | bc -l)
+# -a: the log's generated-sample section can contain bytes grep mistakes for binary.
+MEDIAN_LINE=$(grep -a '^malus bench:' /tmp/malus_nanogpt_bench.log || true)
+if [ -z "$MEDIAN_LINE" ]; then
+    echo "error: no 'malus bench:' line in output — bench_step_begin/end missing from the training loop?" >&2
+    exit 1
+fi
 
-echo "malus nanoGPT: full run ($MAX_STEPS steps) = ${TOTAL}s, avg/step = ${PER_STEP}s"
+TOTAL=$(echo "$END - $START" | bc)
+
+echo "$MEDIAN_LINE"
+echo "(whole-process wall-clock incl. startup/MSL-compile/data-load/generation: ${TOTAL}s)"
 echo "(full log: /tmp/malus_nanogpt_bench.log)"

@@ -185,6 +185,16 @@ _Avoid_: parameter concat (rejected), flat parameter list (the V4 form this repl
 Mixed-precision training semantics: parameters/gradients/optimizer state stay f32; matmuls and forward elementwise kernels compute in bf16; reductions accumulate in f32. bf16-first because it needs no loss scaling. Surface finalized at M36 (recommendation: a `with autocast:` scope mirroring `no_grad`). See ADR-0037.
 _Avoid_: half precision (imprecise — bf16, not f16), quantization (different technique)
 
+### Benchmarking (V5)
+
+**Warm per-step median**:
+The canonical malus performance number (M30): the median wall-clock time of a full training step (batch construction through optimizer update, with a GPU flush inside the timed region), measured after skipping ≥3 warmup steps. Excludes process startup, MSL kernel compilation, data load/tokenize, and post-training generation. Matches `bench/nanogpt_pytorch.py`'s methodology (`torch.mps.synchronize()` inside the timed step, median over warm steps) so the Nx ratio compares like with like.
+_Avoid_: avg/step (the M29 coarse whole-run average this replaces), steady-state throughput (a pipelined measure — the warm median deliberately serializes each step)
+
+**Dispatch-overhead regression benchmark**:
+The V5 role of the toy-config nanoGPT benchmark (`C=32, T=16, B=4`, `bench/nanogpt_step.sh`): at this scale both runtimes are dispatch-bound, not compute-bound, so the warm per-step median isolates dispatch-architecture cost. Run manually before/after each V5 substrate milestone (M31/M32) to confirm the number moves and nothing regresses it. Explicitly not a CI assert — wall-clock gates flake. Distinct from the M35 capstone benchmark (Karpathy config), which measures the claim itself.
+_Avoid_: perf gate (the M35 ≤2x gate is the gate; this is a tracking benchmark), CI benchmark
+
 ### Autograd
 
 **Grad-tracked tensor**:

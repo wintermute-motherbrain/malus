@@ -2,7 +2,7 @@
 
 ## What V5 Is For
 
-V4 reclaimed the vision's *differentiators*: real borrow-inference CTMM, a real GPU kernel language with a dogfooded stdlib, one `Tensor` type, a generic `Module` optimizer. What V4 did not do is earn the vision's *claim* — "train models like PyTorch, without the Python slowness." When both sides of the M29 benchmark were finally run (2026-07-01), the toy nanoGPT config measured **~60x slower than f32 PyTorch-MPS** (~163.9 ms/step coarse average vs 2.729 ms/step median). The V4 plan's soft "investigate" trigger was >3x.
+V4 reclaimed the vision's *differentiators*: real borrow-inference CTMM, a real GPU kernel language with a dogfooded stdlib, one `Tensor` type, a generic `Module` optimizer. What V4 did not do is earn the vision's *claim* — "train models like PyTorch, without the Python slowness." When both sides of the M29 benchmark were finally run (2026-07-01), the toy nanoGPT config measured **~60x slower than f32 PyTorch-MPS** (~163.9 ms/step coarse average vs 2.729 ms/step median). The V4 plan's soft "investigate" trigger was >3x. *(M30 correction: the coarse number was ~5/6ths one-time startup cost; the matched-methodology warm per-step median is **26.187 ms/step ≈ 9.6x** — see the M30 addendum in `m29-benchmark-results.md`. Still ~5x short of the M35 gate; the diagnosis and roadmap are unchanged, but all V5 deltas are measured against 26.187 ms.)*
 
 The gap is architectural, not compute: every `tensor_matmul` performs a full blocking `gpu_barrier()` + `commit()` + `waitUntilCompleted()` round-trip (`metal.rs:495-531`), every op allocates a fresh `MTLBuffer`, and the only barrier primitive is a global flush. At toy scale the step is nearly all synchronization stalls. Cranelift-compiled host code buys nothing while it blocks on the GPU dozens of times per step.
 
@@ -29,7 +29,7 @@ Sequential: M30 → M31 → M32 → M33 → M34 → M35 → M36. M33 and M34 are
 
 | Milestone | Theme | Key Deliverable | Gate |
 |---|---|---|---|
-| [M30](./m30-honest-timing.md) | Honest timing baseline | Per-step steady-state timer; publish the 60x baseline; docs hygiene | Timer reports warm median; baseline documented |
+| [M30](./m30-honest-timing.md) | Honest timing baseline | Per-step steady-state timer; publish the matched baseline (measured: **26.187 ms/step, ~9.6x**); docs hygiene | Timer reports warm median; baseline documented |
 | [M31](./m31-async-dispatch.md) | Async dispatch substrate | MPS matmul joins the shared command buffer; per-buffer pending flags; auto-flush on host read; `__flush()` deleted | Full test suite + gradient checks green under async dispatch; toy step time published |
 | [M32](./m32-buffer-pooling.md) | Buffer pooling + memory budget | Size-class MTLBuffer free-list; peak-memory measurement | Pool hit-rate + peak-memory reported; capstone-config budget fits |
 | [M33](./m33-nd-permute-multihead.md) | N-D permute backward + multi-head | Rank-generic permute VJP; head-folded 6-head attention | 4-D permute + folded-attention gradient checks pass |

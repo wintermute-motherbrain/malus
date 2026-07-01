@@ -203,6 +203,19 @@ pub fn register_builtins() -> HashMap<String, BuiltinSig> {
         return_placement: None,
     });
 
+    // M30 bench timer pair (ADR-0038) — no-ops unless the CLI runs with
+    // --bench; step_end flushes GPU work inside the timed region.
+    m.insert("bench_step_begin".to_string(), BuiltinSig {
+        kind: BuiltinKind::Fixed(vec![]),
+        return_ty: ResolvedTy::Unit,
+        return_placement: None,
+    });
+    m.insert("bench_step_end".to_string(), BuiltinSig {
+        kind: BuiltinKind::Fixed(vec![]),
+        return_ty: ResolvedTy::Unit,
+        return_placement: None,
+    });
+
     // M22 string I/O.
     // read_file(path: str) -> str
     m.insert("read_file".to_string(), BuiltinSig {

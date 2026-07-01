@@ -145,6 +145,16 @@ pub use metal::{
     tensor_cross_entropy, tensor_embedding,
 };
 
+// M30 — warm per-step median timer (ADR-0038); macOS-only because
+// bench_step_end flushes via gpu_barrier.
+#[cfg(target_os = "macos")]
+mod bench;
+
+#[cfg(target_os = "macos")]
+pub use bench::{
+    bench_enable, bench_report, bench_reset, bench_step_begin, bench_step_end, BenchReport,
+};
+
 #[cfg(target_os = "macos")]
 mod tape;
 

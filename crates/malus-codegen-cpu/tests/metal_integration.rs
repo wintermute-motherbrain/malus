@@ -64,6 +64,9 @@ fn real_symbols() -> RuntimeSymbols {
         kernel_dispatch_v2:        malus_runtime::kernel_dispatch_v2,
         tape_register_backward_fn: malus_runtime::tape_register_backward_fn,
         malus_record_diff:         malus_runtime::malus_record_diff,
+        // M30 bench timer pair.
+        bench_step_begin:          malus_runtime::bench_step_begin,
+        bench_step_end:            malus_runtime::bench_step_end,
     }
 }
 

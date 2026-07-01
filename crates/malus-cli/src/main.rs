@@ -11,8 +11,10 @@ mod tests;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    match args.get(1).map(String::as_str) {
-        Some(path) => run_script(path),
+    let bench = args.iter().skip(1).any(|a| a == "--bench");
+    let path = args.iter().skip(1).find(|a| !a.starts_with("--"));
+    match path {
+        Some(path) => run_script(path, bench),
         None => run_repl(),
     }
 }
@@ -80,7 +82,7 @@ fn emit_load_error(e: &LoadError) {
     }
 }
 
-fn run_script(path: &str) {
+fn run_script(path: &str, bench: bool) {
     let abs = std::path::Path::new(path);
     let loaded = match malus_loader::ModuleLoader::new().load(abs) {
         Ok(l) => l,
@@ -114,6 +116,10 @@ fn run_script(path: &str) {
                 std::process::exit(1);
             }
         };
+
+        if bench {
+            malus_runtime::bench_enable();
+        }
 
         malus_runtime::runtime_init(&registry.into_hashmap());
 
@@ -172,16 +178,35 @@ fn run_script(path: &str) {
             kernel_dispatch_v2:        malus_runtime::kernel_dispatch_v2,
             tape_register_backward_fn: malus_runtime::tape_register_backward_fn,
             malus_record_diff:         malus_runtime::malus_record_diff,
+            // M30 bench timer pair.
+            bench_step_begin:          malus_runtime::bench_step_begin,
+            bench_step_end:            malus_runtime::bench_step_end,
         };
         if let Err(e) = malus_codegen_cpu::compile_and_run(&typed, &symbols, &kernel_ids) {
             eprintln!("error: {e}");
             std::process::exit(1);
         }
+
+        if bench {
+            match malus_runtime::bench_report() {
+                Some(r) => println!(
+                    "malus bench: {} warm steps, median step = {:.3}ms (min={:.3}ms, max={:.3}ms)",
+                    r.warm_steps,
+                    r.median.as_secs_f64() * 1e3,
+                    r.min.as_secs_f64() * 1e3,
+                    r.max.as_secs_f64() * 1e3,
+                ),
+                None => eprintln!(
+                    "--bench: no warm steps recorded — the program must call \
+                     bench_step_begin()/bench_step_end() around >3 steps"
+                ),
+            }
+        }
     }
 
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = &typed;
+        let _ = (&typed, bench);
         eprintln!("error: Metal runtime requires macOS");
         std::process::exit(1);
     }

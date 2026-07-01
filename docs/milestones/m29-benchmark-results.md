@@ -65,6 +65,38 @@ barrier is a global flush; PyTorch-MPS pipelines the whole step. The gap
 is architectural, not a borrow-inference/CTMM artifact and not kernel
 quality. V5/M31 (async dispatch substrate) is the response.
 
+## M30 addendum — warm per-step median (measured 2026-07-01)
+
+M30 added the matched-methodology timer (ADR-0038): `malus --bench` skips 3
+warmup steps and reports the per-step median with a `gpu_barrier()` flush
+inside the timed region, mirroring `bench/nanogpt_pytorch.py`'s
+`torch.mps.synchronize()`-inside-the-step median. Same machine, same config,
+same day as the coarse measurement above:
+
+```
+$ bash bench/nanogpt_step.sh
+malus bench: 297 warm steps, median step = 26.187ms (min=24.242ms, max=30.983ms)
+(whole-process wall-clock incl. startup/MSL-compile/data-load/generation: 49.208530000s)
+```
+
+**Matched Nx ≈ 9.6x** (26.187 ms / 2.729 ms). The coarse 164ms/step figure —
+and this doc's earlier prediction that the matched number would land at
+45–55x — overstated the steady-state gap by ~6x: a timestamped run shows the
+300-step training loop spans only ~7.9s and post-training generation <1s of
+the ~49.2s process; the remaining ~40.6s is one-time startup before step 1
+(MSL compilation of the full M25/M26 stdlib kernel set, tiny_shakespeare
+load/char-tokenize, Cranelift JIT). That startup cost is real UX but is not
+per-step dispatch overhead, and PyTorch's median never counted its own
+equivalents.
+
+**What this changes:** every V5 milestone reports its delta against
+**26.187 ms/step (9.6x)**, not 164 ms (60x). **What it doesn't change:** the
+V5 motivation and diagnosis. 9.6x is still ~5x short of the M35 ≤2x gate, and
+the causes are the same architecture measured here — sync-per-matmul
+`commit()+waitUntilCompleted()` round-trips, a fresh `MTLBuffer` per op,
+global-flush barriers (M31/M32). The 60x figure should no longer be quoted as
+the steady-state gap; it was the coarse whole-process ratio.
+
 ## Known caveats affecting comparability
 
 - The malus number is a coarse whole-run average (300-step total / 300),
@@ -79,7 +111,9 @@ quality. V5/M31 (async dispatch substrate) is the response.
   matched. Because the malus average includes one-time startup cost, the
   ~60x figure slightly overstates the steady-state gap — the matched
   number will likely land in the ~45–55x range, which changes nothing
-  about the conclusion.
+  about the conclusion. *(M30 correction: this prediction was wrong — the
+  matched number is ~9.6x; the overstatement was ~6x, not "slight". See
+  the M30 addendum above.)*
 - malus dispatches per-op Metal kernels with CTMM-inserted barriers
   (composed attention, ADR-0029); PyTorch's MPS backend uses fused
   scaled-dot-product-attention and heavily kernel-fused ops. Some gap is

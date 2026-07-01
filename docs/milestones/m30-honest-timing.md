@@ -3,7 +3,9 @@
 **Crates:** `malus-runtime`, `malus-cli` (bench harness), docs
 **Track:** perf
 **Depends on:** M29 (V4 complete)
-**Status:** planned
+**Status:** done (2026-07-01)
+
+**Outcome:** `bench_step_begin()`/`bench_step_end()` dormant builtins + `malus --bench` (ADR-0038). Measured warm per-step median: **26.187 ms (min 24.242, max 30.983, 297 warm steps)** → matched Nx ≈ **9.6x** vs PyTorch-MPS's 2.729 ms — not the predicted 45–55x. The coarse 164 ms/step figure was ~5/6ths one-time startup (~40.6s before step 1: MSL compile of the full stdlib kernel set, data load/tokenize, JIT) plus <1s generation. See the M30 addendum in `m29-benchmark-results.md`.
 
 Give malus a steady-state per-step timer (the M29 spec §4.1 item that was skipped), record the V5 starting line honestly, and clean up the stale docs. No performance fixes in this milestone — just the truth.
 

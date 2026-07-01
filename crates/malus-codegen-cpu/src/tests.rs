@@ -111,6 +111,11 @@ extern "C" fn mock_kernel_dispatch(_kernel_id: u64, handles: *const i64, count: 
 
 extern "C" fn mock_gpu_barrier() {}
 
+// M30 — bench pair mocked so tests stay off the Metal path (real
+// bench_step_end calls gpu_barrier).
+extern "C" fn mock_bench_step_begin() {}
+extern "C" fn mock_bench_step_end() {}
+
 fn mock_binary_tensor_op(a: i64, b: i64, op: impl Fn(f32, f32) -> f32) -> i64 {
     let (ad, as_) = with_store(|s| (s.get_data(a), s.get_shape(a)));
     let (bd, bs) = with_store(|s| (s.get_data(b), s.get_shape(b)));
@@ -353,6 +358,8 @@ fn mock_symbols() -> RuntimeSymbols {
         // (same as malus_rand_uniform/malus_rand_int above).
         tape_register_backward_fn: malus_runtime::tape_register_backward_fn,
         malus_record_diff:         malus_runtime::malus_record_diff,
+        bench_step_begin:          mock_bench_step_begin,
+        bench_step_end:            mock_bench_step_end,
     }
 }
 
