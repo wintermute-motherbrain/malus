@@ -163,6 +163,28 @@ _Avoid_: Builtin kernel, intrinsic kernel, stdlib kernel
 The type regime inside a kernel body. Tensor parameters are bound as their *element* scalar type (`f32`, not `Tensor<f32>`). The body is checked as per-thread scalar math; the final `return` expression must have the return tensor's element type. Codegen emits `x[tid]` for params and bare `name` for `let`-bound locals. This means kernel-body comparison operators yield the operand's scalar dtype (a float mask), not `Bool`. `fn`-body BinOp rules and scalar-broadcast rules do not apply inside kernels.
 _Avoid_: Scalar-space, thread-space, per-element computation
 
+### Execution (V5, planned)
+
+**Async dispatch substrate**:
+The V5 (M31) execution model: every GPU op — custom kernels and MPS matmul alike — encodes into the shared command buffer without committing; commits happen only when the host actually reads data. Phase 1 of the execution-model ladder (compile-time graph is the endgame; runtime lazy graph capture rejected). See ADR-0035.
+_Avoid_: lazy evaluation, graph capture, deferred execution
+
+**Pending tracking / auto-flush**:
+The V5 runtime read-safety guarantee: each `TensorBuffer` records whether uncommitted GPU work has written it (a commit-generation stamp); any host-side read of a pending buffer flushes first. Replaces per-call-site `__flush()` workarounds and demotes CTMM static barrier insertion from correctness mechanism to optimization. See ADR-0035.
+_Avoid_: barrier-before-read (the gap it fixes, not the mechanism), read fence
+
+**Head-folding**:
+Expressing multi-head attention with the existing 3-D batched matmul by folding batch and head dims: `[B,T,C] → reshape [B,T,H,hs] → permute (0,2,1,3) → reshape [B*H,T,hs]`, and unfolding after. Requires the rank-generic permute VJP (V5/M33); avoids adding 4-D matmul.
+_Avoid_: 4-D matmul (not shipped), multi-head reshape (vague)
+
+**Optimizer recursion**:
+The V5 (M34) Module-composition pattern: the generic optimizer is applied per submodule, so each submodule's `parameters()` identity list receives the slot writes. `parameters()` results are never concatenated — a merged list would be a fresh snapshot and the optimizer would silently update the snapshot instead of the model (the ADR-0034 write-back hazard). See ADR-0036.
+_Avoid_: parameter concat (rejected), flat parameter list (the V4 form this replaces)
+
+**Autocast** (V5/M36, planned):
+Mixed-precision training semantics: parameters/gradients/optimizer state stay f32; matmuls and forward elementwise kernels compute in bf16; reductions accumulate in f32. bf16-first because it needs no loss scaling. Surface finalized at M36 (recommendation: a `with autocast:` scope mirroring `no_grad`). See ADR-0037.
+_Avoid_: half precision (imprecise — bf16, not f16), quantization (different technique)
+
 ### Autograd
 
 **Grad-tracked tensor**:

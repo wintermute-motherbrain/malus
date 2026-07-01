@@ -17,9 +17,10 @@ PyTorch-MPS) is the number V4 hands off, with `>3x` a soft
 Both sides run the exact architecture and dims `examples/nanogpt.ml`'s
 `fn main()` uses: single-block causal self-attention + GELU-MLP char-GPT,
 `C=32` (embedding), `T=16` (context), `B=4` (batch), `V=128` (vocab),
-`C4=128` (MLP hidden), f32, AdamW (`lr=0.01, beta1=0.9, beta2=0.999,
-eps=1e-8, wd=0.01`), trained on `data/tiny_shakespeare.txt` with char-level
-tokenization.
+`C4=128` (MLP hidden), f32, AdamW (`lr=0.001, beta1=0.9, beta2=0.999,
+eps=1e-8, wd=0.01` — an earlier revision of this doc said `lr=0.01`,
+contradicting `examples/nanogpt.ml:157`; `0.001` is what the code runs),
+trained on `data/tiny_shakespeare.txt` with char-level tokenization.
 
 ## Results
 
@@ -35,23 +36,34 @@ malus nanoGPT: full run (300 steps) = 49.407861000s, avg/step = 0.1647s
 kernel compilation, `data/tiny_shakespeare.txt` load/tokenize amortized
 over 300 steps; not a true per-step median).
 
-### PyTorch-MPS (not measured in this environment)
+### PyTorch-MPS (measured 2026-07-01)
 
-`bench/nanogpt_pytorch.py` is written and ready (matches the malus
-architecture/dims exactly — see the script's own `Block`/`GPT` classes) but
-**could not be run**: this session's environment has no `torch` installed
-(`ModuleNotFoundError: No module named 'torch'`). To complete the
-comparison on a machine with PyTorch + MPS:
+Both sides run by the user on the same M4 Max machine:
 
 ```
-pip install torch
-python3 bench/nanogpt_pytorch.py --steps 20
+malus nanoGPT:       full run (300 steps) = 49.177331s, avg/step = 163.92ms
+PyTorch-MPS nanoGPT: 20 steps, median step = 2.729ms (min=2.550ms, max=3.389ms)
 ```
+
+(The malus re-run reproduced the original measurement within noise:
+49.18s vs 49.41s total.)
 
 ### Nx ratio
 
-**Not yet computed** — pending the PyTorch-MPS run above. Once both
-numbers exist, ratio = malus per-step time / PyTorch per-step median time.
+**Nx ≈ 60x** (163.9 ms / 2.729 ms ≈ 60.1). Even discounting a generous
+share of the malus number as one-time startup/MSL-compile/data-load cost,
+steady state would remain ~45–50x. The V4 soft "investigate" trigger was
+>3x; this result is the founding motivation for V5 (see
+`docs/milestones/v5-plan.md` and ADR-0035).
+
+**Diagnosis:** at this toy scale both runtimes are dispatch-bound, not
+compute-bound, so the ratio measures dispatch architecture. malus performs
+a full blocking `gpu_barrier()` + `commit()` + `waitUntilCompleted()`
+round-trip inside every `tensor_matmul` (~20+ per step across
+forward+backward), allocates a fresh `MTLBuffer` per op, and its only
+barrier is a global flush; PyTorch-MPS pipelines the whole step. The gap
+is architectural, not a borrow-inference/CTMM artifact and not kernel
+quality. V5/M31 (async dispatch substrate) is the response.
 
 ## Known caveats affecting comparability
 
@@ -61,6 +73,13 @@ numbers exist, ratio = malus per-step time / PyTorch per-step median time.
   per-step timer (noted as a follow-up in `bench/nanogpt_step.sh`) would
   exclude. The true steady-state per-step cost is likely somewhat lower
   than 164.7ms.
+- The two methodologies are therefore not strictly comparable (coarse
+  whole-run average vs warm steady-state median). V5's M30 adds the
+  per-step warm-median timer to malus so subsequent comparisons are
+  matched. Because the malus average includes one-time startup cost, the
+  ~60x figure slightly overstates the steady-state gap — the matched
+  number will likely land in the ~45–55x range, which changes nothing
+  about the conclusion.
 - malus dispatches per-op Metal kernels with CTMM-inserted barriers
   (composed attention, ADR-0029); PyTorch's MPS backend uses fused
   scaled-dot-product-attention and heavily kernel-fused ops. Some gap is

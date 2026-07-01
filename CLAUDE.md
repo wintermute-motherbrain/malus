@@ -2,9 +2,9 @@
 
 ## What this is
 
-malus is a compiled ML DSL for Apple Silicon. Python-like syntax, dual compilation pipeline: `fn` bodies → Cranelift JIT (CPU), `kernel` bodies → Metal Shading Language (GPU). The CTMM memory model uses escape analysis + Lobster-style borrow-inference to insert static `free` calls at compile time, falling back to reference counting only where ownership is genuinely structurally ambiguous (a `List<T>` that may alias across a call boundary, or a struct field with no provable single owner) — never for the autograd tape, which retains its own copy of anything it saves (M29, ADR-0026). There is one tensor type: `Tensor<dtype>`.
+malus is a compiled ML DSL for Apple Silicon. Python-like syntax, dual compilation pipeline: `fn` bodies → Cranelift JIT (CPU), `kernel` bodies → Metal Shading Language (GPU). North star: train models like PyTorch without the Python slowness — the V5 gate is ≤2x f32 PyTorch-MPS at the real Karpathy nanoGPT config. The CTMM memory model uses escape analysis + Lobster-style borrow-inference to insert static `free` calls at compile time, falling back to reference counting only where ownership is genuinely structurally ambiguous (a `List<T>` that may alias across a call boundary, or a struct field with no provable single owner) — never for the autograd tape, which retains its own copy of anything it saves (M29, ADR-0026). There is one tensor type: `Tensor<dtype>`.
 
-## Current state: **V4 done — M29 done (2026-07-01)**
+## Current state: **V4 done — V5 planned (2026-07-01), M30 next**
 
 | Milestone | Status | Crate |
 |---|---|---|
@@ -41,9 +41,34 @@ malus is a compiled ML DSL for Apple Silicon. Python-like syntax, dual compilati
 | M26 — Backward kernels (GPU autograd; full-step CPU-counter==0 canonical gate) | ✅ done | `malus-runtime`, `malus-codegen-cpu`, `malus-stdlib` |
 | M27 — Kill `Variable` (static grad-inference; one `Tensor` type) | ✅ done | `malus-sema`, `malus-codegen-cpu`, `malus-codegen-gpu`, `malus-syntax` |
 | M28 — Module trait + generic optimizer (generics, `impl`, `List<T>`; no-unroll lint gate) | ✅ done | all crates |
-| M29 — Borrow-inference RC + benchmark (Lobster single-owner/borrow pass; ≤5% compile-time RC-reduction-ratio gate; malus-side benchmark measured, PyTorch-MPS side pending) | ✅ done | `malus-sema`, `malus-runtime` |
+| M29 — Borrow-inference RC + benchmark (Lobster single-owner/borrow pass; ≤5% compile-time RC-reduction-ratio gate; both sides measured 2026-07-01: **Nx ≈ 60x slower than f32 PyTorch-MPS** at the toy config — the founding motivation for V5) | ✅ done | `malus-sema`, `malus-runtime` |
+| **V5 — Earning the Claim** (roadmap approved 2026-07-01; see `docs/milestones/v5-plan.md`, ADRs 0035–0037) | | |
+| M30 — Honest timing baseline (warm per-step median timer; publish 60x baseline; docs hygiene) | planned | `malus-runtime`, `malus-cli` |
+| M31 — Async dispatch substrate (MPS matmul joins shared command buffer; per-buffer pending flags; auto-flush on host read; `__flush()` deleted) | planned | `malus-runtime`, `malus-sema` |
+| M32 — Buffer pooling + memory budget (size-class MTLBuffer free-list) | planned | `malus-runtime` |
+| M33 — N-D permute backward + multi-head attention (rank-generic permute VJP; head-folding) | planned | `malus-runtime`, `malus-stdlib` |
+| M34 — Named submodules (`List<Struct>` recursive drop; optimizer recursion; ADR-0036) | planned | `malus-sema`, `malus-codegen-cpu`, `malus-cli` |
+| M35 — Capstone + benchmark gate (Karpathy config 6L/6H/384d/T=256/B=64; **≤2x PyTorch-MPS f32 hard gate**; README rewrite) | planned | all crates |
+| M36 — Mixed precision, bf16-first (autocast-style; post-gate; ADR-0037) | planned | `malus-codegen-gpu`, `malus-runtime`, `malus-sema`, `malus-stdlib` |
 
-Full milestone specs: `docs/milestones/`. V1 plan: `docs/milestones/v1-plan.md`. V2 plan: `docs/milestones/v2-plan.md`. V3 plan: `docs/milestones/v3-plan.md`. V4 plan: `docs/milestones/v4-plan.md` + individual specs `m23` through `m29`. Architecture decisions: `docs/adr/` (V4 ADRs: 0026–0034). Domain vocabulary: `CONTEXT.md`.
+Full milestone specs: `docs/milestones/`. V1 plan: `docs/milestones/v1-plan.md`. V2 plan: `docs/milestones/v2-plan.md`. V3 plan: `docs/milestones/v3-plan.md`. V4 plan: `docs/milestones/v4-plan.md` + individual specs `m23` through `m29`. V5 plan: `docs/milestones/v5-plan.md` + individual specs `m30` through `m36`. Architecture decisions: `docs/adr/` (V4 ADRs: 0026–0034; V5 ADRs: 0035–0037). Domain vocabulary: `CONTEXT.md`.
+
+## V5 Design Decisions
+
+These decisions were made during V5 planning (2026-07-01). Do not re-litigate them without user input.
+
+| Decision | Choice | Rationale |
+|---|---|---|
+| V5 north star | Performance-first: earn "without the Python slowness" | The vision's one falsifiable claim measured false at ~60x; causes are dispatch-architectural, untouchable by language/tooling work. |
+| Capstone scale | Karpathy char-Shakespeare config (6L/6H/384d/T=256/B=64) | Toy-config Nx measures only dispatch overhead; the claim must hold at a config PyTorch users recognize. Toy kept as regression benchmark. |
+| Perf bar | ≤2x f32 PyTorch-MPS, **hard gate**; parity stretch | V4's soft bar went unmeasured until after closing. Matmul dominates at 384d and both sides use MPS matmul, so ≤2x is achievable without fusion. |
+| Execution model | Async runtime substrate (V5) → compile-time graph (V6); lazy runtime capture rejected | malus is compiled — the typed IR already IS the graph; lazy capture is the dynamic-language workaround and would be thrown away. See ADR-0035. |
+| Read safety | Runtime per-buffer pending tracking + auto-flush | Fixes ADR-0032 barrier-before-read as a guarantee, not per-call-site `__flush()`. Static barriers demote to optimization (CTMM shape: static fast path, dynamic fallback). |
+| Multi-head | Head-folding via rank-generic permute VJP + existing 3-D matmul | Whole forward path already works; only permute backward (hardcoded rank ≤3) blocks it. No 4-D matmul needed. |
+| Submodules | Named, via optimizer recursion; `parameters()` concat rejected | Concat returns a snapshot — optimizer would update it while weights freeze silently (ADR-0034 hazard). See ADR-0036. |
+| Mixed precision | bf16-first autocast, in V5 (M36) but strictly post-gate | Honors v4-plan promise; bf16 needs no loss scaling; gate stays f32-vs-f32 so it measures architecture, not precision. See ADR-0037. |
+| Persistence | Save/load/SafeTensors deferred to V6 | Nothing in V5's done-when needs it; deserves its own designed milestone. |
+| Tooling | Docs hygiene only (README rewrite at M35) | None of it moves the perf claim; the tooling arc is V6+. |
 
 ## V2 Design Decisions
 
@@ -199,7 +224,7 @@ The `i64` handle is a raw pointer to a heap-allocated `TensorBuffer { buffer: me
 | Lvalue assignment (`a[i]=e`, `s.f=e`) | ✅ M20 | Done; `mut` params for interior-only borrows; `**` power op |
 | `transpose`/`sum`/axis reductions are CPU loops | ✅ M25/M26 | All replaced by malus `.ml` kernels (ADR-0027/0028); CPU-counter CI gate enforces this |
 | File I/O / data loading | ✅ M22 | `read_file`, `str_len`, `str_char_at`, `str_from_char`, `Buffer<i32>`, `freeze`, `rand_int`, `rand_uniform`, `tensor.data[i]` — all done |
-| Non-f32 compute dtypes (f16, bf16) | Post-V4 | Only i32/i64 for index tensors; f16/bf16 mixed-precision deferred (D10) |
+| Non-f32 compute dtypes (f16, bf16) | **V5/M36 planned** | Only i32/i64 for index tensors today; bf16 autocast-style mixed precision lands post-gate in M36 (ADR-0037); f16 + loss scaling stays deferred |
 | Cross-module structs/enums unsupported (loader `exported_names` gap) | Post-V4 | See `docs/milestones/cross-module-types.md` |
 | ScalarBroadcast IR node | Post-V4 | Inline scalar-broadcast BinOps work; dedicated IR node deferred |
 | CTMM barrier coalescing is conservative | Post-V4 | ADR-0009 "Consequences" |
@@ -213,8 +238,12 @@ The `i64` handle is a raw pointer to a heap-allocated `TensorBuffer { buffer: me
 | Backward kernels on GPU | ✅ M26 | Every VJP is a malus kernel + host fn (ADR-0032); `tape.rs` keeps only the tape-walk orchestration; canonical `count()==0` full-train-step gate passes |
 | Embedding backward scatter-add uses per-row gather, not atomics | Post-V4 | Deterministic and exact at nanoGPT's char-level vocab scale; `atomic<f32>`/`atomic_fetch_add_explicit` deferred as a real kernel-language feature for large-vocab efficiency (ADR-0032) |
 | Backward reductions inherit forward's ≤1024 reduced-axis cap | Post-V4 | Single-threadgroup `Array<f32,1024>` scratch (M25); grid-stride reduction to lift it deferred — never hit at nanoGPT's gate config (ADR-0032) |
-| `gpu_barrier()` is barrier-before-*drop*, not barrier-before-*read* | Post-V4 | CTMM's `insert_barriers` only flushes before a pending Tensor's static drop; `Variable` (RC-managed) reads can see stale GPU state if nothing else triggers a flush first. Worked around per-call-site (e.g. `examples/gradient_check.ml`'s `__flush()`); not fixed at the CTMM level (ADR-0032) |
-| Flash attention | Post-V4 | Composed attention ships V4 (ADR-0029); flash requires simdgroup_matrix + mixed precision |
+| `gpu_barrier()` is barrier-before-*drop*, not barrier-before-*read* | **V5/M31 planned** | CTMM's `insert_barriers` only flushes before a pending Tensor's static drop; RC-managed reads can see stale GPU state if nothing else triggers a flush first. Worked around per-call-site (e.g. `examples/gradient_check.ml`'s `__flush()`). M31 fixes it as a runtime guarantee: per-buffer pending tracking + auto-flush on host read (ADR-0035) |
+| Flash attention | V6 | Composed attention ships V4 (ADR-0029); flash requires simdgroup_matrix + mixed precision (bf16 lands M36) |
+| Dispatch architecture is sync-per-matmul eager | **V5/M31–M32 planned** | Measured 2026-07-01: toy nanoGPT ~60x slower than f32 PyTorch-MPS; `tensor_matmul` does commit+waitUntilCompleted per call, fresh `MTLBuffer` per op, global-flush barriers. V5 async substrate + pooling is the response (ADR-0035, `docs/milestones/m29-benchmark-results.md`) |
+| `permute` backward is hardcoded to rank ≤3 — 4-D permute has no working gradient | **V5/M33 planned** | `tape.rs:591-599` passes exactly 3 inverse indices; blocks multi-head attention (head-folding needs differentiable 4-D permute). Forward permute is already rank-generic |
+| `List<Struct>` elements leak on drop | **V5/M34 planned** | `DropList` only drops tensor elements; struct/list elements are silently skipped (`malus-codegen-cpu/src/lib.rs:1035-1037`). Only `List<Tensor<f32>>` is sound today; M34 makes drop type-directed and recursive |
+| Model save/load / checkpointing (SafeTensors) | V6 | Consciously sequenced after the V5 perf claim; deserves its own designed milestone |
 
 ## Coding conventions
 
