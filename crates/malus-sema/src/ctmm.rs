@@ -1462,14 +1462,19 @@ fn collect_idents_in_stmt(stmt: &TypedStmt, out: &mut HashSet<String>) {
 /// aggregate-literal cases below are unrelated to that call-boundary protocol
 /// — they guard against two *same-function* bindings independently dropping
 /// the identical handle — and are unaffected by this change.
+///
+/// Shape recognition delegates to `retain_sites` (`retain_sites.rs`) — the
+/// single source of truth for "which alias shapes are retain-worthy," also
+/// consulted by `borrow_inference` when deciding which of these retains are
+/// safe to demote.
 fn insert_variable_arc_retains(body: &mut Vec<TypedStmt>) {
     let mut i = 0;
     while i < body.len() {
         let retain_names: Vec<String> = match &body[i] {
             TypedStmt::Let { expr, .. } | TypedStmt::LetTuple { expr, .. } => {
-                variable_arc_retains_for_expr(expr)
+                tensor_retain_names(expr)
             }
-            TypedStmt::Assign { expr, .. } => variable_arc_retains_for_expr(expr),
+            TypedStmt::Assign { expr, .. } => tensor_retain_names(expr),
             _ => vec![],
         };
         for name in retain_names.into_iter().rev() {
@@ -1480,62 +1485,12 @@ fn insert_variable_arc_retains(body: &mut Vec<TypedStmt>) {
     }
 }
 
-// M27: `grad_tracked` is a content-based flag — it can be true for an
-// `Array`/`Tuple`-typed expression too (e.g. `[variable(x), variable(y)]`, or
-// a tuple built from grad-tracked elements; see `grad_inference.rs`). The
-// scalar-handle Retain protocol below only applies to `Tensor`-typed values —
-// retaining an aggregate box pointer with `tensor_retain` is a type-confusion
-// bug (aggregates have their own ARC header layout and `aggregate_retain`
-// mechanism, unaffected by M27). Every arm below is therefore additionally
-// gated on `.ty.is_tensor()`.
-fn variable_arc_retains_for_expr(expr: &TypedExpr) -> Vec<String> {
-    match &expr.kind {
-        // let b = a — grad-tracked alias: retain a so b is a genuine co-owner.
-        TypedExprKind::Ident(name) if expr.grad_tracked && expr.ty.is_tensor() => {
-            vec![name.clone()]
-        }
-        // let t = v.data — .data let-bind: retain v's handle so t is a genuine Tensor owner.
-        TypedExprKind::FieldAccess { base, field }
-            if field == "data" && base.grad_tracked && base.ty.is_tensor() =>
-        {
-            if let TypedExprKind::Ident(n) = &base.kind {
-                vec![n.clone()]
-            } else {
-                vec![]
-            }
-        }
-        // M29 (D2): fn-call-argument retaining removed — see
-        // `insert_variable_arc_retains`'s doc comment. Tensor params are a
-        // uniform zero-cost borrow; the caller no longer retains before a call.
-        // Array literal: retain grad-tracked ident elements so the slot is a genuine
-        // co-owner alongside any binding that still references the same handle.
-        TypedExprKind::ArrayLiteral { elements } => elements
-            .iter()
-            .filter(|e| e.grad_tracked && e.ty.is_tensor())
-            .filter_map(|e| {
-                if let TypedExprKind::Ident(n) = &e.kind {
-                    Some(n.clone())
-                } else {
-                    None
-                }
-            })
-            .collect(),
-        // Struct literal: retain grad-tracked ident fields so the struct slot is a genuine
-        // co-owner alongside any binding that still references the same handle.
-        // (variable() calls self-retain, so only Ident sources need an extra retain here.)
-        TypedExprKind::StructInit { fields, .. } => fields
-            .iter()
-            .filter(|f| f.grad_tracked && f.ty.is_tensor())
-            .filter_map(|f| {
-                if let TypedExprKind::Ident(n) = &f.kind {
-                    Some(n.clone())
-                } else {
-                    None
-                }
-            })
-            .collect(),
-        _ => vec![],
-    }
+fn tensor_retain_names(expr: &TypedExpr) -> Vec<String> {
+    crate::retain_sites::retain_sites(expr)
+        .into_iter()
+        .filter(|s| s.kind == crate::retain_sites::RetainKind::Tensor)
+        .map(|s| s.source)
+        .collect()
 }
 
 /// M28: insert `RetainAgg { name }` before any `Let`/`LetMut`/`Assign`/`Return`
@@ -1560,21 +1515,25 @@ fn variable_arc_retains_for_expr(expr: &TypedExpr) -> Vec<String> {
 /// List construction site in the V4 capstone). A `List` passed as a plain
 /// (non-`mut`) call argument would need the same treatment if ever added —
 /// `mut` params are unaffected (borrows, never separately dropped; ADR-0025).
+///
+/// Shape recognition delegates to `retain_sites` (`retain_sites.rs`) — see
+/// `insert_variable_arc_retains`'s doc comment for the single-source-of-truth
+/// rationale shared with `borrow_inference`.
 fn insert_list_retains(body: &mut Vec<TypedStmt>) {
     let mut i = 0;
     while i < body.len() {
         let retain_names: Vec<String> = match &body[i] {
             TypedStmt::Let { expr, .. } | TypedStmt::LetTuple { expr, .. } => {
-                list_retains_for_expr(expr)
+                list_retain_names(expr)
             }
-            TypedStmt::Assign { expr, .. } => list_retains_for_expr(expr),
-            TypedStmt::Return { expr } => {
-                if let TypedExprKind::Ident(n) = &expr.kind {
-                    if expr.ty.is_list() { vec![n.clone()] } else { vec![] }
-                } else {
-                    vec![]
-                }
-            }
+            TypedStmt::Assign { expr, .. } => list_retain_names(expr),
+            // Return only recognizes the bare-Ident shape, not e.g. a
+            // StructInit field — a narrower scope than Let/Assign, matching
+            // the original hand-written arm this replaces.
+            TypedStmt::Return { expr } => list_retain_names(expr)
+                .into_iter()
+                .filter(|_| matches!(expr.kind, TypedExprKind::Ident(_)))
+                .collect(),
             _ => vec![],
         };
         for name in retain_names.into_iter().rev() {
@@ -1585,22 +1544,12 @@ fn insert_list_retains(body: &mut Vec<TypedStmt>) {
     }
 }
 
-fn list_retains_for_expr(expr: &TypedExpr) -> Vec<String> {
-    match &expr.kind {
-        TypedExprKind::Ident(name) if expr.ty.is_list() => vec![name.clone()],
-        TypedExprKind::StructInit { fields, .. } => fields
-            .iter()
-            .filter(|f| f.ty.is_list())
-            .filter_map(|f| {
-                if let TypedExprKind::Ident(n) = &f.kind {
-                    Some(n.clone())
-                } else {
-                    None
-                }
-            })
-            .collect(),
-        _ => vec![],
-    }
+fn list_retain_names(expr: &TypedExpr) -> Vec<String> {
+    crate::retain_sites::retain_sites(expr)
+        .into_iter()
+        .filter(|s| s.kind == crate::retain_sites::RetainKind::ListAgg)
+        .map(|s| s.source)
+        .collect()
 }
 
 fn collect_idents_in_expr(expr: &crate::typed_ir::TypedExpr, out: &mut HashSet<String>) {

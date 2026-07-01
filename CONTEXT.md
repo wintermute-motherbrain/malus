@@ -43,6 +43,10 @@ _Avoid_: garbage collection, ARC
 A CTMM drop point that is fully determined at compile time. Emitted as a `TypedStmt::Drop` node, lowered to a `tensor_free` call — which is itself a refcount decrement (`tensor_free` delegates to `tensor_release`, freeing at zero); "static" describes that the *decision* to drop here is compile-time-determined, not that the underlying op is somehow not a refcount operation. No RC bookkeeping overhead (no extra `Retain` to balance it).
 _Avoid_: deterministic free (too vague)
 
+**Retain site**:
+A use of a tensor or `List<T>` handle that CTMM's emission pass recognizes as reusing an existing allocation rather than producing a fresh one — a same-scope alias (`let b = a`, `let t = v.data`) or an aggregate-literal field/element (`StructInit`, `ArrayLiteral`) — and therefore emits a `Retain`/`RetainAgg` for, to balance a later independent drop of the same handle. `malus-sema/src/retain_sites.rs`'s `retain_sites` is the single, exhaustive recognizer for these shapes: both the emission pass (`ctmm.rs`) and the borrow-inference demotion pass (`borrow_inference.rs`, which removes retain sites it can prove redundant under RC fallback) consult it, so the two passes cannot silently disagree about which aliases are retain-worthy. See ADR-0026.
+_Avoid_: alias site, reference site
+
 ### Tensors
 
 **Tensor**:

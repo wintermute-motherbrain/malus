@@ -34,7 +34,8 @@
 // for this class of aliasing).
 
 use std::collections::{HashMap, HashSet};
-use crate::typed_ir::{TypedAssignTarget, TypedExpr, TypedExprKind, TypedStmt};
+use crate::retain_sites::{retain_sites, AliasShape, RetainKind};
+use crate::typed_ir::{TypedAssignTarget, TypedExpr, TypedStmt};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum BorrowRoot {
@@ -103,8 +104,8 @@ pub fn demote_safe_borrows(body: &mut Vec<TypedStmt>, param_names: &HashSet<Stri
 
     // StructInit/ArrayLiteral field/element aliasing: `let blk = Block(w=w, ...)`
     // retains each grad-tracked Ident field so the struct's copy survives
-    // independently of the source binding's own drop (`variable_arc_retains_for_expr`'s
-    // StructInit/ArrayLiteral cases, ctmm.rs — unconditional, unlike the
+    // independently of the source binding's own drop (`retain_sites`'s
+    // StructField/ArrayElem shapes, retain_sites.rs — unconditional, unlike the
     // plain-alias cases above, since a struct/array field is a genuinely
     // different, longer-lived owner than a same-scope `let`).
     //
@@ -150,8 +151,10 @@ pub fn demote_safe_borrows(body: &mut Vec<TypedStmt>, param_names: &HashSet<Stri
 
 /// For every top-level tensor-typed `let`/`let mut` whose RHS is a borrow-shaped
 /// alias (`let b = a` or `let t = v.data`) of an in-scope source, resolve its
-/// `BorrowRoot`. Mirrors the two shapes `variable_arc_retains_for_expr`
-/// (ctmm.rs) already special-cases.
+/// `BorrowRoot`. Consults `retain_sites` (`retain_sites.rs`) — the same
+/// recognizer CTMM's emission pass uses to decide which of these aliases get
+/// a `Retain` in the first place — restricted to the two plain-alias shapes
+/// (`Ident`, `DataField`) this demotion criterion applies to.
 fn classify_borrows(
     body: &[TypedStmt],
     param_names: &HashSet<String>,
@@ -161,7 +164,7 @@ fn classify_borrows(
 
     for stmt in body {
         if let TypedStmt::Let { name, expr } = stmt {
-            let Some(source) = alias_source(expr) else { continue };
+            let Some(source) = plain_alias_source(expr) else { continue };
             let root = if param_names.contains(&source) {
                 Some(BorrowRoot::Param)
             } else if let Some(existing) = roots.get(&source) {
@@ -185,43 +188,33 @@ fn classify_borrows(
 }
 
 /// Extract `a` from `let b = a` (bare Ident) or `let t = v.data` (`.data`
-/// detach-bind), restricted to `Tensor`-typed expressions — the two alias
-/// shapes that reuse an existing handle rather than producing a fresh
-/// allocation (see `ctmm.rs`'s `variable_arc_retains_for_expr`).
-fn alias_source(expr: &TypedExpr) -> Option<String> {
-    if !expr.ty.is_tensor() {
-        return None;
-    }
-    match &expr.kind {
-        TypedExprKind::Ident(name) => Some(name.clone()),
-        TypedExprKind::FieldAccess { base, field } if field == "data" => match &base.kind {
-            TypedExprKind::Ident(name) => Some(name.clone()),
-            _ => None,
-        },
-        _ => None,
-    }
+/// detach-bind) via `retain_sites`, restricted to `RetainKind::Tensor` and
+/// the plain-alias shapes (`Ident`/`DataField`) — the two alias shapes that
+/// reuse an existing handle rather than producing a fresh allocation.
+fn plain_alias_source(expr: &TypedExpr) -> Option<String> {
+    retain_sites(expr)
+        .into_iter()
+        .find(|s| {
+            s.kind == RetainKind::Tensor
+                && matches!(s.shape, AliasShape::Ident | AliasShape::DataField)
+        })
+        .map(|s| s.source)
 }
 
 /// For every top-level `let name = StructInit{...}` or `let name =
 /// ArrayLiteral{...}`, map each bare-`Ident`, tensor-typed, grad-tracked
-/// field/element source to the index of that construction statement.
-/// Mirrors `variable_arc_retains_for_expr`'s StructInit/ArrayLiteral arms
-/// (ctmm.rs), which is what actually emitted the Retain this function is
-/// deciding whether to remove.
+/// field/element source to the index of that construction statement, via
+/// `retain_sites`'s `StructField`/`ArrayElem` shapes — which is what
+/// actually emitted the Retain this function is deciding whether to remove.
 fn struct_init_field_sources(body: &[TypedStmt]) -> HashMap<String, usize> {
     let mut out = HashMap::new();
     for (i, stmt) in body.iter().enumerate() {
         let TypedStmt::Let { expr, .. } = stmt else { continue };
-        let sources: Vec<&TypedExpr> = match &expr.kind {
-            TypedExprKind::StructInit { fields, .. } => fields.iter().collect(),
-            TypedExprKind::ArrayLiteral { elements } => elements.iter().collect(),
-            _ => continue,
-        };
-        for f in sources {
-            if f.grad_tracked && f.ty.is_tensor() {
-                if let TypedExprKind::Ident(name) = &f.kind {
-                    out.insert(name.clone(), i);
-                }
+        for site in retain_sites(expr) {
+            if site.kind == RetainKind::Tensor
+                && matches!(site.shape, AliasShape::StructField | AliasShape::ArrayElem)
+            {
+                out.insert(site.source, i);
             }
         }
     }

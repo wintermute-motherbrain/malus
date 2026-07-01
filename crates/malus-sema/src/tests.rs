@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use malus_syntax::parse;
-use crate::{check, SemaError, TypedAssignTarget, TypedStmt};
+use crate::{check, SemaError, TypedAssignTarget, TypedExpr, TypedExprKind, TypedStmt};
 
 fn check_src(src: &str) -> Result<crate::TypedProgram, Vec<SemaError>> {
     let program = parse(malus_syntax::FileId(0), src).expect("parse failed");
@@ -1881,4 +1881,165 @@ fn main():
         "M29 RC-ratio gate: {rc_ops} RC ops / {alloc_baseline} tensor bindings = {:.1}%, expected <= 5%",
         ratio * 100.0
     );
+}
+
+// ── retain_sites: direct unit tests ──────────────────────────────────────────
+//
+// `retain_sites` (retain_sites.rs) is the single recognizer both CTMM's
+// emission pass (ctmm.rs) and borrow_inference's demotion pass consult for
+// "which alias shapes are retain-worthy." Before this module existed, the
+// equivalent logic (`variable_arc_retains_for_expr`, `list_retains_for_expr`,
+// `alias_source`, `struct_init_field_sources`) had zero direct tests — only
+// transitive coverage via `check_src`. These are the recognizer's own test
+// surface, one per `AliasShape`/`RetainKind`, plus the documented `Index`
+// no-retain arm.
+
+use crate::retain_sites::{retain_sites, AliasShape, RetainKind};
+use crate::ResolvedTy;
+use malus_syntax::ast::Placement;
+use malus_syntax::Span;
+
+fn dummy_span() -> Span {
+    Span::at(malus_syntax::FileId(0), 0)
+}
+
+fn tensor_ty() -> ResolvedTy {
+    ResolvedTy::Tensor { dtype: malus_syntax::ast::ScalarTy::F32 }
+}
+
+fn list_of_tensor_ty() -> ResolvedTy {
+    ResolvedTy::List { elem: Box::new(tensor_ty()) }
+}
+
+fn ident_expr(name: &str, ty: ResolvedTy, grad_tracked: bool) -> TypedExpr {
+    TypedExpr {
+        kind: TypedExprKind::Ident(name.to_string()),
+        ty,
+        placement: Some(Placement::Gpu),
+        span: dummy_span(),
+        grad_tracked,
+    }
+}
+
+#[test]
+fn test_retain_sites_grad_tracked_tensor_ident_is_a_tensor_site() {
+    let expr = ident_expr("a", tensor_ty(), true);
+    let sites = retain_sites(&expr);
+    assert_eq!(sites.len(), 1);
+    assert_eq!(sites[0].source, "a");
+    assert_eq!(sites[0].shape, AliasShape::Ident);
+    assert_eq!(sites[0].kind, RetainKind::Tensor);
+}
+
+#[test]
+fn test_retain_sites_non_grad_tracked_tensor_ident_is_not_a_site() {
+    let expr = ident_expr("a", tensor_ty(), false);
+    assert!(retain_sites(&expr).is_empty());
+}
+
+#[test]
+fn test_retain_sites_list_ident_is_a_listagg_site_regardless_of_grad_tracked() {
+    // List RC is structural (ADR-0034), not grad-tracked-gated.
+    let expr = ident_expr("ps", list_of_tensor_ty(), false);
+    let sites = retain_sites(&expr);
+    assert_eq!(sites.len(), 1);
+    assert_eq!(sites[0].source, "ps");
+    assert_eq!(sites[0].shape, AliasShape::Ident);
+    assert_eq!(sites[0].kind, RetainKind::ListAgg);
+}
+
+#[test]
+fn test_retain_sites_data_field_of_grad_tracked_tensor_is_datafield_site() {
+    let base = ident_expr("v", tensor_ty(), true);
+    let expr = TypedExpr {
+        kind: TypedExprKind::FieldAccess { base: Box::new(base), field: "data".to_string() },
+        ty: tensor_ty(),
+        placement: Some(Placement::Gpu),
+        span: dummy_span(),
+        grad_tracked: false,
+    };
+    let sites = retain_sites(&expr);
+    assert_eq!(sites.len(), 1);
+    assert_eq!(sites[0].source, "v");
+    assert_eq!(sites[0].shape, AliasShape::DataField);
+    assert_eq!(sites[0].kind, RetainKind::Tensor);
+}
+
+#[test]
+fn test_retain_sites_non_data_field_access_is_not_a_site() {
+    let base = ident_expr("blk", ResolvedTy::Tensor { dtype: malus_syntax::ast::ScalarTy::F32 }, true);
+    let expr = TypedExpr {
+        kind: TypedExprKind::FieldAccess { base: Box::new(base), field: "grad".to_string() },
+        ty: tensor_ty(),
+        placement: Some(Placement::Gpu),
+        span: dummy_span(),
+        grad_tracked: false,
+    };
+    assert!(retain_sites(&expr).is_empty());
+}
+
+#[test]
+fn test_retain_sites_array_literal_only_retains_grad_tracked_ident_elements() {
+    let elements = vec![
+        ident_expr("a", tensor_ty(), true),
+        ident_expr("b", tensor_ty(), false),
+    ];
+    let expr = TypedExpr {
+        kind: TypedExprKind::ArrayLiteral { elements },
+        ty: ResolvedTy::Array { elem: Box::new(tensor_ty()), len: 2 },
+        placement: None,
+        span: dummy_span(),
+        grad_tracked: true,
+    };
+    let sites = retain_sites(&expr);
+    assert_eq!(sites.len(), 1);
+    assert_eq!(sites[0].source, "a");
+    assert_eq!(sites[0].shape, AliasShape::ArrayElem);
+    assert_eq!(sites[0].kind, RetainKind::Tensor);
+}
+
+#[test]
+fn test_retain_sites_struct_init_recognizes_tensor_and_list_fields() {
+    let fields = vec![
+        ident_expr("w", tensor_ty(), true),
+        ident_expr("ps", list_of_tensor_ty(), false),
+    ];
+    let expr = TypedExpr {
+        kind: TypedExprKind::StructInit { name: "Block".to_string(), fields },
+        ty: ResolvedTy::Struct { name: "Block".to_string(), fields: vec![] },
+        placement: None,
+        span: dummy_span(),
+        grad_tracked: true,
+    };
+    let sites = retain_sites(&expr);
+    assert_eq!(sites.len(), 2);
+    assert!(sites.iter().any(|s| s.source == "w"
+        && s.shape == AliasShape::StructField
+        && s.kind == RetainKind::Tensor));
+    assert!(sites.iter().any(|s| s.source == "ps"
+        && s.shape == AliasShape::StructField
+        && s.kind == RetainKind::ListAgg));
+}
+
+#[test]
+fn test_retain_sites_index_expr_is_never_a_site() {
+    // `model.params[0]` — the documented open hazard (ADR-0026 "Out of
+    // Scope"): named explicitly in `AliasShape::Index` so the gap is visible
+    // in retain_sites.rs itself, but it never yields a site either way.
+    let base = ident_expr("params", list_of_tensor_ty(), false);
+    let index = TypedExpr {
+        kind: TypedExprKind::Lit(malus_syntax::ast::Lit::Int(0)),
+        ty: ResolvedTy::Scalar(malus_syntax::ast::ScalarTy::I64),
+        placement: None,
+        span: dummy_span(),
+        grad_tracked: false,
+    };
+    let expr = TypedExpr {
+        kind: TypedExprKind::Index { base: Box::new(base), indices: vec![index] },
+        ty: tensor_ty(),
+        placement: Some(Placement::Gpu),
+        span: dummy_span(),
+        grad_tracked: true,
+    };
+    assert!(retain_sites(&expr).is_empty());
 }
