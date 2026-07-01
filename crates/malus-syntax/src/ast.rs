@@ -22,7 +22,6 @@ pub enum Placement {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Ty {
     Tensor { dtype: ScalarTy },
-    Variable { dtype: ScalarTy },
     Scalar(ScalarTy),
     Bool,
     Tuple(Vec<Ty>),

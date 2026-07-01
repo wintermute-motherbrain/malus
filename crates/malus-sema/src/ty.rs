@@ -4,7 +4,6 @@ use std::fmt;
 #[derive(Debug, Clone, PartialEq)]
 pub enum ResolvedTy {
     Tensor { dtype: ScalarTy },
-    Variable { dtype: ScalarTy },
     Scalar(ScalarTy),
     Bool,
     Tuple(Vec<ResolvedTy>),
@@ -34,7 +33,6 @@ impl fmt::Display for ResolvedTy {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ResolvedTy::Tensor { dtype } => write!(f, "Tensor<{}>", scalar_ty_name(dtype)),
-            ResolvedTy::Variable { dtype } => write!(f, "Variable<{}>", scalar_ty_name(dtype)),
             ResolvedTy::Scalar(s) => write!(f, "{}", scalar_ty_name(s)),
             ResolvedTy::Bool => write!(f, "bool"),
             ResolvedTy::Tuple(ts) => {
@@ -60,10 +58,6 @@ impl fmt::Display for ResolvedTy {
 impl ResolvedTy {
     pub fn is_tensor(&self) -> bool {
         matches!(self, ResolvedTy::Tensor { .. })
-    }
-
-    pub fn is_variable(&self) -> bool {
-        matches!(self, ResolvedTy::Variable { .. })
     }
 
     pub fn tensor_dtype(&self) -> Option<&ScalarTy> {

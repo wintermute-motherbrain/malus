@@ -162,7 +162,7 @@ _Avoid_: Scalar-space, thread-space, per-element computation
 ### Autograd
 
 **Grad-tracked tensor**:
-A `Tensor<f32>` whose binding is statically inferred to derive from a grad leaf (created by `variable(...)`) and is not inside a `no_grad` scope. There is no distinct `Variable` type in V4. Grad-tracking is a compiler-inferred property. See ADR-0030.
+A `Tensor<f32>` whose binding is statically inferred to derive from a grad leaf (created by `variable(...)`) and is not inside a `no_grad` scope. Inference is whole-program: the property propagates across function parameters/returns (a param is grad-tracked if any call site passes a grad-tracked arg; a return is grad-tracked if the return expr is) and struct fields (a field is grad-tracked if any store into it is), not just within one function body. There is no distinct `Variable` type in V4. Grad-tracking is a compiler-inferred property, computed in `malus-sema/src/grad_inference.rs`. See ADR-0030.
 _Avoid_: Variable (eliminated in V4), Tensor.requires_grad
 
 **Tape**:
@@ -178,8 +178,12 @@ A builtin that walks the tape in reverse from a scalar-valued loss tensor, accum
 _Avoid_: backpropagation (fine informally, not a technical term here)
 
 **`.grad`**:
-A field accessor on a leaf tensor (one created with `variable(t)`) that returns the accumulated gradient as a `Tensor<f32>`. Zero (or a zeros tensor) if `backward` has not yet been called. Cleared by `zero_grad`.
+A field accessor that returns the accumulated gradient as a `Tensor<f32>`. Legal on any grad-tracked tensor (gated on the same `grad_tracked` property as tape recording, not a separate leaf set); zero (or a zeros tensor) if the receiver is not a leaf or `backward` has not yet been called. Cleared by `zero_grad`. `.grad` is itself a detach point: `x.grad` is never grad-tracked, preventing double-backward. See ADR-0030.
 _Avoid_: gradient tensor, derivative
+
+**`.data`**:
+A field accessor that returns the same tensor handle (identity at runtime) but is a detach point: the grad-inference pass marks `x.data` as never grad-tracked regardless of `x`. Used to read a grad-tracked tensor's value without pulling the read into the tape, e.g. an optimizer's `w.data - lr * grad`. Distinct from `no_grad` — `.data` severs one value's grad lineage at a point; `no_grad` suppresses tape recording for an entire scoped region. See ADR-0030.
+_Avoid_: identity accessor (undersells that it detaches), raw tensor
 
 **`no_grad`**:
 A scoped region (`with no_grad: body`) that suppresses tape recording. Grad-tracked ops inside the body execute but push no `TapeNode`. A static scope — CTMM emits static-free for all tensors inside `no_grad` regardless of whether they derive from leaves. Used for inference and the optimizer update step.

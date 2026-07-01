@@ -4,7 +4,7 @@
 
 malus is a compiled ML DSL for Apple Silicon. Python-like syntax, dual compilation pipeline: `fn` bodies → Cranelift JIT (CPU), `kernel` bodies → Metal Shading Language (GPU). The CTMM memory model uses escape analysis + Lobster-style borrow-inference to insert static `free` calls at compile time, falling back to reference counting only for tensors that genuinely escape their creation scope (primarily tape-saved tensors for autograd). There is one tensor type: `Tensor<dtype>`.
 
-## Current state: **V4 in progress — M26 done (2026-06-30)**
+## Current state: **V4 in progress — M27 done (2026-06-30)**
 
 | Milestone | Status | Crate |
 |---|---|---|
@@ -39,7 +39,7 @@ malus is a compiled ML DSL for Apple Silicon. Python-like syntax, dual compilati
 | M24 — Kernel language v2 (thread hierarchy, flat indexing, `let shared`, `barrier()`, control flow, scalar uniforms) | ✅ done | `malus-codegen-gpu`, `malus-syntax`, `malus-sema`, `malus-runtime` |
 | M25 — Stdlib forward kernels (all CPU-loop ops → malus `.ml` kernels; forward-hot-path CPU-counter==0) | ✅ done | all crates |
 | M26 — Backward kernels (GPU autograd; full-step CPU-counter==0 canonical gate) | ✅ done | `malus-runtime`, `malus-codegen-cpu`, `malus-stdlib` |
-| M27 — Kill `Variable` (static grad-inference; one `Tensor` type) | 🔲 todo | `malus-sema`, `malus-codegen-cpu` |
+| M27 — Kill `Variable` (static grad-inference; one `Tensor` type) | ✅ done | `malus-sema`, `malus-codegen-cpu`, `malus-codegen-gpu`, `malus-syntax` |
 | M28 — Module trait + generic optimizer (generics, `impl`, `List<T>`; no-unroll lint gate) | 🔲 todo | all crates |
 | M29 — Borrow-inference RC + benchmark (Lobster single-owner/borrow pass; ≤~5% RC ops; Nx PyTorch-MPS) | 🔲 todo | `malus-sema` |
 
@@ -204,7 +204,7 @@ The `i64` handle is a raw pointer to a heap-allocated `TensorBuffer { buffer: me
 | ScalarBroadcast IR node | Post-V4 | Inline scalar-broadcast BinOps work; dedicated IR node deferred |
 | CTMM barrier coalescing is conservative | Post-V4 | ADR-0009 "Consequences" |
 | `MetalContext` is single-consumer, not thread-safe under concurrent host access | By design | Metal-touching test files (`malus-runtime/src/tests.rs`, `malus-codegen-cpu/tests/metal_integration.rs`) must serialize via a per-file `Mutex<()>` test lock, held for the whole test body — not reentrant, don't nest acquisitions. See ADR-0033. |
-| `Variable` type (type-directed RC) | **M27** | To be eliminated; replaced by single `Tensor` type + static grad-inference (ADR-0030) |
+| `Variable` type (type-directed RC) | ✅ M27 | Eliminated; replaced by single `Tensor` type + whole-program static grad-inference (`malus-sema/src/grad_inference.rs`, ADR-0030) |
 | Generics / `impl` / `Module` trait / `List<T>` | **M28** | ADR-0007 fenced scope; required for generic optimizer |
 | Lobster borrow-inference RC elimination | **M29** | The founding CTMM differentiator; ADR-0026 |
 | Kernel language beyond elementwise maps | ✅ M24 | Thread hierarchy, flat indexing, `let shared`, `barrier()`, control flow, scalar uniforms (ADR-0027) |

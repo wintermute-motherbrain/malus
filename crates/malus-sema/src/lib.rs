@@ -6,6 +6,7 @@ mod check;
 mod env;
 mod error;
 mod ctmm;
+mod grad_inference;
 mod ty;
 mod typed_ir;
 
@@ -28,6 +29,7 @@ pub fn check(
     module_aliases: &HashMap<String, HashSet<String>>,
 ) -> Result<TypedProgram, Vec<SemaError>> {
     let mut typed = check_program(program, module_aliases)?;
-    ctmm::annotate_fns(&mut typed.fns);
+    grad_inference::infer(&mut typed);
+    ctmm::annotate_fns(&mut typed);
     Ok(typed)
 }

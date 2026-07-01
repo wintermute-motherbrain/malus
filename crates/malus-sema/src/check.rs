@@ -333,7 +333,7 @@ pub fn check(
     }
 
     if errors.is_empty() {
-        Ok(TypedProgram { fns: typed_fns, kernels: typed_kernels })
+        Ok(TypedProgram { fns: typed_fns, kernels: typed_kernels, ..Default::default() })
     } else {
         Err(errors)
     }
@@ -650,7 +650,7 @@ fn check_body(
                     ctx.env.push_scope();
                     let mut bindings_typed: Vec<(String, ResolvedTy)> = Vec::new();
                     for (bname, (_, fty)) in arm.bindings.iter().zip(vfields.iter()) {
-                        let fpl = if fty.is_tensor() || fty.is_variable() { Some(Placement::Gpu) } else { None };
+                        let fpl = if fty.is_tensor() { Some(Placement::Gpu) } else { None };
                         ctx.env.bind(bname.clone(), fty.clone(), fpl);
                         bindings_typed.push((bname.clone(), fty.clone()));
                     }
@@ -761,7 +761,7 @@ fn check_binop(
     ctx: &mut BodyCtx<'_>,
 ) -> Option<TypedExpr> {
     // `**` is scalar-only: f32 ** {f32|i32|i64} → f32.
-    // Check this before the general Variable/Tensor path.
+    // Check this before the general Tensor path.
     if *op == BinOp::Pow {
         let tlhs = check_expr(lhs, Some(&ResolvedTy::Scalar(ScalarTy::F32)), ctx)?;
         let trhs = check_expr(rhs, None, ctx)?;
@@ -783,34 +783,6 @@ fn check_binop(
 
     let tlhs = check_expr(lhs, None, ctx)?;
     let trhs = check_expr(rhs, None, ctx)?;
-
-    // Variable⊗Variable → Variable for arithmetic and matmul ops.
-    if tlhs.ty.is_variable() && trhs.ty.is_variable() {
-        if !matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Matmul) {
-            ctx.errors.push(SemaError::TypeMismatch {
-                expected: tlhs.ty.clone(),
-                found: trhs.ty.clone(),
-                span,
-            });
-            return None;
-        }
-        let ldtype = match &tlhs.ty { ResolvedTy::Variable { dtype } => dtype.clone(), _ => unreachable!() };
-        let rdtype = match &trhs.ty { ResolvedTy::Variable { dtype } => dtype.clone(), _ => unreachable!() };
-        if ldtype != rdtype {
-            ctx.errors.push(SemaError::DtypeMismatch {
-                lhs: scalar_ty_name(&ldtype).to_string(),
-                rhs: scalar_ty_name(&rdtype).to_string(),
-                span,
-            });
-            return None;
-        }
-        return Some(typed_expr(
-            TypedExprKind::BinOp { op: op.clone(), lhs: Box::new(tlhs), rhs: Box::new(trhs) },
-            ResolvedTy::Variable { dtype: ldtype },
-            Some(Placement::Gpu),
-            span,
-        ));
-    }
 
     // Placement check for tensor operands.
     if tlhs.ty.is_tensor() && trhs.ty.is_tensor() {
@@ -1264,22 +1236,8 @@ fn check_call(
                 }
             }
             let placement = sig.return_placement;
-            // Unary-tensor builtins accept Variable<f32> and return Variable<f32>:
-            // relu/sigmoid/tanh/exp/log/sqrt/abs/transpose/sum take Tensor<f32> in the
-            // builtin table, but when the caller passes a Variable the VJP path needs
-            // the return type to be Variable so codegen emits tape_record_unary.
-            let return_ty = if let BuiltinKind::Fixed(params) = &sig.kind {
-                if params.len() == 1
-                    && sig.return_ty.is_tensor()
-                    && typed_args.len() == 1
-                    && typed_args[0].ty.is_variable()
-                {
-                    if let ResolvedTy::Variable { dtype } = &typed_args[0].ty {
-                        ResolvedTy::Variable { dtype: dtype.clone() }
-                    } else {
-                        sig.return_ty.clone()
-                    }
-                } else if ctx.in_kernel
+            let return_ty = if let BuiltinKind::Fixed(_) = &sig.kind {
+                if ctx.in_kernel
                     && sig.return_ty.is_tensor()
                     && typed_args.iter().all(|a| matches!(&a.ty, ResolvedTy::Scalar(_)))
                     && !typed_args.is_empty()
@@ -1310,9 +1268,8 @@ fn check_call(
 // ── Shape-op call checking ────────────────────────────────────────────────────
 //
 // Handles reshape(t, d0..dn), transpose(t[, i, j]), permute(t, p0..pn).
-// First arg must be Tensor<f32> or Variable<f32>; remaining args are i64 dims.
-// Normalizes to positional [tensor, d0..dn].  Variable input propagates to
-// Variable output (same as reduction checking).  No shape/count validation in
+// First arg must be Tensor<f32>; remaining args are i64 dims.
+// Normalizes to positional [tensor, d0..dn].  No shape/count validation in
 // sema — runtime panics on mismatch (ADR-0013).
 
 fn check_shape_op_call(
@@ -1348,9 +1305,8 @@ fn check_shape_op_call(
         return None;
     }
 
-    // Check the leading tensor/variable arg.
+    // Check the leading tensor arg.
     let checked_tensor = check_expr(positional[0], Some(&tensor_f32), ctx)?;
-    let is_variable = checked_tensor.ty.is_variable();
 
     // Check each remaining dim arg with an I64 hint (shape args are i64 scalars).
     let mut typed_args: Vec<TypedExpr> = vec![checked_tensor];
@@ -1358,16 +1314,9 @@ fn check_shape_op_call(
         typed_args.push(check_expr(dim_arg, Some(&ResolvedTy::Scalar(ScalarTy::I64)), ctx)?);
     }
 
-    // Propagate Variable: if input is Variable<f32>, output is Variable<f32>.
-    let return_ty = if is_variable {
-        ResolvedTy::Variable { dtype: ScalarTy::F32 }
-    } else {
-        tensor_f32
-    };
-
     Some(typed_expr(
         TypedExprKind::Call { callee: callee.to_string(), args: typed_args },
-        return_ty,
+        tensor_f32,
         Some(Placement::Gpu),
         span,
     ))
@@ -1378,7 +1327,7 @@ fn check_shape_op_call(
 // Handles `sum`, `mean`, `max`, `var` with optional named args `axis=i32` and
 // `keepdim=i32` (0/1).  Normalizes to positional [tensor, axis, keepdim] for
 // axis reductions.  For `sum` with no `axis=`, falls through to the 1-arg
-// whole-tensor path.  Variable<f32> input propagates to Variable<f32> output.
+// whole-tensor path.
 
 fn check_reduction_call(
     callee: &str,
@@ -1433,22 +1382,12 @@ fn check_reduction_call(
     };
 
     let checked_tensor = check_expr(tensor_raw, Some(&tensor_f32), ctx)?;
-    let is_variable = checked_tensor.ty.is_variable();
 
     // sum(t) with no axis= — whole-tensor backward-compatible 1-arg form.
     if callee == "sum" && axis_raw.is_none() {
-        let return_ty = if is_variable {
-            if let ResolvedTy::Variable { dtype } = &checked_tensor.ty {
-                ResolvedTy::Variable { dtype: dtype.clone() }
-            } else {
-                tensor_f32
-            }
-        } else {
-            tensor_f32
-        };
         return Some(typed_expr(
             TypedExprKind::Call { callee: callee.to_string(), args: vec![checked_tensor] },
-            return_ty,
+            tensor_f32,
             Some(Placement::Gpu),
             span,
         ));
@@ -1481,30 +1420,20 @@ fn check_reduction_call(
         )
     };
 
-    let return_ty = if is_variable {
-        if let ResolvedTy::Variable { dtype } = &checked_tensor.ty {
-            ResolvedTy::Variable { dtype: dtype.clone() }
-        } else {
-            tensor_f32
-        }
-    } else {
-        tensor_f32
-    };
-
     Some(typed_expr(
         TypedExprKind::Call {
             callee: callee.to_string(),
             args: vec![checked_tensor, checked_axis, checked_keepdim],
         },
-        return_ty,
+        tensor_f32,
         Some(Placement::Gpu),
         span,
     ))
 }
 
 // ── M18: AxisOnly builtins (softmax, layernorm) ──────────────────────────────
-// One positional tensor/variable arg + required named `axis=N`.
-// Normalizes to positional [tensor, axis].  Variable propagates to Variable output.
+// One positional tensor arg + required named `axis=N`.
+// Normalizes to positional [tensor, axis].
 
 fn check_axis_only_call(
     callee: &str,
@@ -1569,26 +1498,15 @@ fn check_axis_only_call(
     };
 
     let checked_tensor = check_expr(tensor_raw, Some(&tensor_f32), ctx)?;
-    let is_variable = checked_tensor.ty.is_variable();
     // Runtime ABI uses i64 for axis; hint I64 so check_lit produces I64.
     let checked_axis = check_expr(axis_raw, Some(&ResolvedTy::Scalar(ScalarTy::I64)), ctx)?;
-
-    let return_ty = if is_variable {
-        if let ResolvedTy::Variable { dtype } = &checked_tensor.ty {
-            ResolvedTy::Variable { dtype: dtype.clone() }
-        } else {
-            tensor_f32
-        }
-    } else {
-        tensor_f32
-    };
 
     Some(typed_expr(
         TypedExprKind::Call {
             callee: callee.to_string(),
             args: vec![checked_tensor, checked_axis],
         },
-        return_ty,
+        tensor_f32,
         Some(Placement::Gpu),
         span,
     ))
@@ -1813,9 +1731,9 @@ fn check_field_access(
         ));
     }
 
-    // .ndim on a tensor or variable → Scalar(I64) in fn bodies, Scalar(I32) in kernel bodies.
+    // .ndim on a tensor → Scalar(I64) in fn bodies, Scalar(I32) in kernel bodies.
     // Kernel bodies use I32 to match thread intrinsics and scalar uniform params.
-    if field == "ndim" && (tbase.ty.is_tensor() || tbase.ty.is_variable()) {
+    if field == "ndim" && tbase.ty.is_tensor() {
         let idx_ty = if ctx.in_kernel { ScalarTy::I32 } else { ScalarTy::I64 };
         return Some(typed_expr(
             TypedExprKind::FieldAccess { base: Box::new(tbase), field: field.to_string() },
@@ -1827,7 +1745,7 @@ fn check_field_access(
 
     // .shape and .strides are valid only when immediately indexed (t.shape[i], t.strides[i]).
     // In fn bodies, element type is I64. In kernel bodies, I32 (matching thread intrinsics).
-    if (field == "shape" || field == "strides") && (tbase.ty.is_tensor() || tbase.ty.is_variable()) {
+    if (field == "shape" || field == "strides") && tbase.ty.is_tensor() {
         let placement = tbase.placement;
         let idx_ty = if ctx.in_kernel { ScalarTy::I32 } else { ScalarTy::I64 };
         return Some(typed_expr(
@@ -1838,9 +1756,10 @@ fn check_field_access(
         ));
     }
 
-    // .data on a Variable returns the underlying Tensor.
+    // .data — detach: returns the same-handle Tensor, severing grad-tracking
+    // (M27 grad_inference.rs forces the result non-grad-tracked; ADR-0030).
     if field == "data" {
-        if let ResolvedTy::Variable { dtype } = &tbase.ty.clone() {
+        if let ResolvedTy::Tensor { dtype } = &tbase.ty.clone() {
             return Some(typed_expr(
                 TypedExprKind::FieldAccess { base: Box::new(tbase), field: field.to_string() },
                 ResolvedTy::Tensor { dtype: dtype.clone() },
@@ -1850,9 +1769,11 @@ fn check_field_access(
         }
     }
 
-    // .grad on a Variable returns an owned Tensor (retained by tape_get_grad, see D5).
+    // .grad returns an owned Tensor (retained by tape_get_grad, see D5) — also a
+    // detach point. Legality (must be grad-tracked) is gated by grad_inference.rs,
+    // not here (M27 decision #4: reuse the grad-tracked set, no separate leaf-set).
     if field == "grad" {
-        if let ResolvedTy::Variable { dtype } = &tbase.ty.clone() {
+        if let ResolvedTy::Tensor { dtype } = &tbase.ty.clone() {
             return Some(typed_expr(
                 TypedExprKind::FieldAccess { base: Box::new(tbase), field: field.to_string() },
                 ResolvedTy::Tensor { dtype: dtype.clone() },
@@ -2026,7 +1947,7 @@ fn check_kernel_launch(
     };
 
     // Partition kernel params into tensor params and scalar params (declaration order).
-    let tensor_params: Vec<&KernelParamSig> = ksig.params.iter().filter(|p| p.ty.is_tensor() || p.ty.is_variable()).collect();
+    let tensor_params: Vec<&KernelParamSig> = ksig.params.iter().filter(|p| p.ty.is_tensor()).collect();
     let scalar_params: Vec<&KernelParamSig> = ksig.params.iter().filter(|p| matches!(p.ty, ResolvedTy::Scalar(_))).collect();
 
     // Check positional runtime args match the kernel params (tensors then scalars).
@@ -2147,7 +2068,6 @@ pub fn resolve_ty(
 ) -> Option<ResolvedTy> {
     match ty {
         Ty::Tensor { dtype } => Some(ResolvedTy::Tensor { dtype: dtype.clone() }),
-        Ty::Variable { dtype } => Some(ResolvedTy::Variable { dtype: dtype.clone() }),
         Ty::Scalar(s) => Some(ResolvedTy::Scalar(s.clone())),
         Ty::Bool => Some(ResolvedTy::Bool),
         Ty::Tuple(ts) => {
@@ -2192,8 +2112,7 @@ pub fn resolve_ty(
 /// Valid targets (single-level only):
 ///   - `Ident(name)` — bare variable rebind; requires `let mut` local (not `mut` param).
 ///   - `Index { base: Ident(name), .. }` — indexed element; base must be mutable.
-///   - `FieldAccess { base: Ident(name), field }` — struct field; base must be mutable;
-///     field must not be `Variable` (post-V3, ADR-0016).
+///   - `FieldAccess { base: Ident(name), field }` — struct field; base must be mutable.
 /// Nested targets (`a[i].f`, `a.b[j]`) are rejected with `NestedLvalue`.
 fn check_lvalue(
     target: &malus_syntax::ast::Expr,
@@ -2446,7 +2365,7 @@ fn typed_expr(
     placement: Option<Placement>,
     span: Span,
 ) -> TypedExpr {
-    TypedExpr { kind, ty, placement, span }
+    TypedExpr { kind, ty, placement, span, grad_tracked: false }
 }
 
 fn placement_name(p: Option<Placement>) -> String {

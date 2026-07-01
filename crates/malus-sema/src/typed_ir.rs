@@ -1,13 +1,22 @@
+use std::collections::{HashMap, HashSet};
 use malus_syntax::ast::{BinOp, Lit, Placement, ScalarTy, UnaryOp};
 use malus_syntax::Span;
 use crate::ty::ResolvedTy;
 
 // ── Program ───────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct TypedProgram {
     pub fns: Vec<TypedFn>,
     pub kernels: Vec<TypedKernel>,
+    /// M27 grad-inference (`grad_inference.rs`): `(struct_name, field_name)` pairs
+    /// where at least one construction/field-assign site stores a grad-tracked value.
+    pub struct_field_grad: HashSet<(String, String)>,
+    /// M27 grad-inference: per-fn, per-parameter-position grad-tracked flag.
+    /// True if any call site passes a grad-tracked argument in that position.
+    pub fn_param_grad: HashMap<String, Vec<bool>>,
+    /// M27 grad-inference: per-fn return-value grad-tracked flag.
+    pub fn_ret_grad: HashMap<String, bool>,
 }
 
 // ── Functions and Kernels ─────────────────────────────────────────────────────
@@ -68,7 +77,6 @@ pub enum TypedAssignTarget {
     },
     /// `base.field = e` — struct field assignment.
     /// Requires the base binding to be mutable (`let mut` or `mut` param).
-    /// Assigning to a `Variable` field is rejected (post-V3, ADR-0016).
     Field {
         base: String,
         slot_idx: usize,
@@ -151,7 +159,7 @@ pub enum TypedStmt {
     DropStruct {
         name: String,
         droppable_fields: Vec<(usize, ResolvedTy)>,
-        /// Slot indices of nested Variable/struct/enum fields that need ARC release.
+        /// Slot indices of nested struct/enum fields that need ARC release.
         /// Populated in M13+; empty in M12 and earlier.
         retained_agg_slots: Vec<usize>,
     },
@@ -176,12 +184,14 @@ pub enum TypedStmt {
     /// The tuple box is freed immediately after extracting fields in codegen.
     LetTuple { names: Vec<(String, ResolvedTy)>, expr: TypedExpr },
     /// CTMM: free a tuple's heap box and release owned fields.
-    /// `droppable_fields` is `(slot_index, field_ty)` for Tensor/Variable fields.
+    /// `droppable_fields` is `(slot_index, field_ty)` for Tensor fields.
     DropTuple { name: String, droppable_fields: Vec<(usize, ResolvedTy)> },
     // ── M14: tape control ─────────────────────────────────────────────────────
     /// `with no_grad: body` — emit tape_pause() before body, tape_resume() after.
-    /// Variable RC (retain/release) is unchanged; only tape recording is gated.
-    /// Early-exit (return/break/continue) across this boundary is rejected by sema.
+    /// M27: grad-inference also forces every expression lexically inside `body`
+    /// to be non-grad-tracked, so CTMM statically drops (not RC-releases) locals
+    /// bound here (ADR-0030/0032). Early-exit (return/break/continue) across this
+    /// boundary is rejected by sema.
     NoGrad { body: Vec<TypedStmt> },
     // ── M22: Buffer<i32> ─────────────────────────────────────────────────────
     /// CTMM: free a CPU-side staging buffer.
@@ -211,6 +221,11 @@ pub struct TypedExpr {
     /// Non-None only for tensor-typed expressions.
     pub placement: Option<Placement>,
     pub span: Span,
+    /// M27 grad-inference (`grad_inference.rs`): true if this expression's result
+    /// may be saved onto the autograd tape. Set by the pass; `false` as produced
+    /// by `check.rs`. Drives tape recording (codegen-cpu), `.grad` legality, and
+    /// the CTMM Release-vs-Drop choice (escape_set == grad_tracked, ADR-0030).
+    pub grad_tracked: bool,
 }
 
 #[derive(Debug, Clone)]

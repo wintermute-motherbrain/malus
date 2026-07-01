@@ -71,8 +71,6 @@ pub enum SemaError {
     NestedLvalue { span: Span },
     /// `mut` param used as a bare rebind target (`p = e`); interior-only allowed.
     MutParamBareRebind { name: String, span: Span },
-    /// Tried to assign to a `Variable` struct field (post-V3, ADR-0016).
-    AssignVariableField { field: String, span: Span },
     /// `**` used with non-scalar operands (scalar-only in M20).
     PowOperatorScalarOnly { span: Span },
     // ── M24: kernel language v2 ─────────────────────────────────────────────────
@@ -137,7 +135,6 @@ impl SemaError {
             | MissingAxisArg { span, .. }
             | NestedLvalue { span }
             | MutParamBareRebind { span, .. }
-            | AssignVariableField { span, .. }
             | PowOperatorScalarOnly { span }
             | LetSharedOutsideKernel { span }
             | KernelIntrinsicOutsideKernel { span, .. }
@@ -204,7 +201,6 @@ impl SemaError {
             MissingAxisArg { .. } => "axis= is required",
             NestedLvalue { .. } => "nested lvalue not supported in M20",
             MutParamBareRebind { .. } => "mut param may only be mutated in place",
-            AssignVariableField { .. } => "cannot assign to a Variable struct field",
             PowOperatorScalarOnly { .. } => "** requires scalar operands",
             LetSharedOutsideKernel { .. } => "`let shared` only valid inside a kernel body",
             KernelIntrinsicOutsideKernel { .. } => "thread intrinsic only valid inside a kernel body",
@@ -325,8 +321,6 @@ impl fmt::Display for SemaError {
                 write!(f, "nested lvalue targets (`a.b[i]`, `a[i].f`) are not supported in M20"),
             SemaError::MutParamBareRebind { name, .. } =>
                 write!(f, "cannot rebind `mut` parameter '{}' — use `a[i]=e` or `s.f=e` for in-place mutation", name),
-            SemaError::AssignVariableField { field, .. } =>
-                write!(f, "cannot assign to Variable field '{}': Variable struct fields are post-V3 (see ADR-0016)", field),
             SemaError::PowOperatorScalarOnly { .. } =>
                 write!(f, "`**` requires scalar (f32) operands; tensor power is not supported in M20"),
             SemaError::LetSharedOutsideKernel { .. } =>

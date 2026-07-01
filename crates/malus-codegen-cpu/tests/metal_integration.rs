@@ -441,20 +441,20 @@ struct AdamW:
     wd: f32
 
 struct Block:
-    ln1_w: Variable<f32>
-    wq: Variable<f32>
-    wk: Variable<f32>
-    wv: Variable<f32>
-    wo: Variable<f32>
-    ln2_w: Variable<f32>
-    w1: Variable<f32>
-    w2: Variable<f32>
+    ln1_w: Tensor<f32>
+    wq: Tensor<f32>
+    wk: Tensor<f32>
+    wv: Tensor<f32>
+    wo: Tensor<f32>
+    ln2_w: Tensor<f32>
+    w1: Tensor<f32>
+    w2: Tensor<f32>
 
 struct GPT:
-    wte: Variable<f32>
-    wpe: Variable<f32>
-    ln_f: Variable<f32>
-    lm_head: Variable<f32>
+    wte: Tensor<f32>
+    wpe: Tensor<f32>
+    ln_f: Tensor<f32>
+    lm_head: Tensor<f32>
 
 struct BlockState:
     ms_ln1: Tensor<f32>
@@ -484,7 +484,7 @@ struct GPTState:
     ms_lm_head: Tensor<f32>
     vs_lm_head: Tensor<f32>
 
-fn forward(gpt: GPT, blk: Block, toks: Tensor<i32>, B: i64, T: i64, C: i64) -> Variable<f32>:
+fn forward(gpt: GPT, blk: Block, toks: Tensor<i32>, B: i64, T: i64, C: i64) -> Tensor<f32>:
     let mut pos_buf = buffer_i32(B * T)
     for b in range(B):
         for t in range(T):
@@ -672,22 +672,22 @@ fn main():
 fn test_nanogpt_forward_zero_cpu_compute() {
     let src = r#"
 struct Block:
-    ln1_w: Variable<f32>
-    wq: Variable<f32>
-    wk: Variable<f32>
-    wv: Variable<f32>
-    wo: Variable<f32>
-    ln2_w: Variable<f32>
-    w1: Variable<f32>
-    w2: Variable<f32>
+    ln1_w: Tensor<f32>
+    wq: Tensor<f32>
+    wk: Tensor<f32>
+    wv: Tensor<f32>
+    wo: Tensor<f32>
+    ln2_w: Tensor<f32>
+    w1: Tensor<f32>
+    w2: Tensor<f32>
 
 struct GPT:
-    wte: Variable<f32>
-    wpe: Variable<f32>
-    ln_f: Variable<f32>
-    lm_head: Variable<f32>
+    wte: Tensor<f32>
+    wpe: Tensor<f32>
+    ln_f: Tensor<f32>
+    lm_head: Tensor<f32>
 
-fn forward(gpt: GPT, blk: Block, toks: Tensor<i32>, B: i64, T: i64, C: i64) -> Variable<f32>:
+fn forward(gpt: GPT, blk: Block, toks: Tensor<i32>, B: i64, T: i64, C: i64) -> Tensor<f32>:
     let mut pos_buf = buffer_i32(B * T)
     for b in range(B):
         for t in range(T):
@@ -788,20 +788,20 @@ struct AdamW:
     wd: f32
 
 struct Block:
-    ln1_w: Variable<f32>
-    wq: Variable<f32>
-    wk: Variable<f32>
-    wv: Variable<f32>
-    wo: Variable<f32>
-    ln2_w: Variable<f32>
-    w1: Variable<f32>
-    w2: Variable<f32>
+    ln1_w: Tensor<f32>
+    wq: Tensor<f32>
+    wk: Tensor<f32>
+    wv: Tensor<f32>
+    wo: Tensor<f32>
+    ln2_w: Tensor<f32>
+    w1: Tensor<f32>
+    w2: Tensor<f32>
 
 struct GPT:
-    wte: Variable<f32>
-    wpe: Variable<f32>
-    ln_f: Variable<f32>
-    lm_head: Variable<f32>
+    wte: Tensor<f32>
+    wpe: Tensor<f32>
+    ln_f: Tensor<f32>
+    lm_head: Tensor<f32>
 
 struct BlockState:
     ms_ln1: Tensor<f32>
@@ -831,7 +831,7 @@ struct GPTState:
     ms_lm_head: Tensor<f32>
     vs_lm_head: Tensor<f32>
 
-fn forward(gpt: GPT, blk: Block, toks: Tensor<i32>, B: i64, T: i64, C: i64) -> Variable<f32>:
+fn forward(gpt: GPT, blk: Block, toks: Tensor<i32>, B: i64, T: i64, C: i64) -> Tensor<f32>:
     let mut pos_buf = buffer_i32(B * T)
     for b in range(B):
         for t in range(T):

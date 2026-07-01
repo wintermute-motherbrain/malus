@@ -538,6 +538,7 @@ fn test_no_main_returns_error() {
             span: Span::new(malus_syntax::FileId(0), 0, 0),
         }],
         kernels: vec![],
+        ..Default::default()
     };
 
     let symbols = mock_symbols();
@@ -1246,10 +1247,10 @@ fn main():
 fn test_variable_rc_done_when() {
     // The M13 spec done-when: wrap, identity, variable(ones/zeros), b.data, c.data.
     let src = r#"
-fn wrap(t: Tensor<f32>) -> Variable<f32>:
+fn wrap(t: Tensor<f32>) -> Tensor<f32>:
     return variable(t)
 
-fn identity(v: Variable<f32>) -> Variable<f32>:
+fn identity(v: Tensor<f32>) -> Tensor<f32>:
     return v
 
 fn main():
@@ -1668,7 +1669,7 @@ fn test_variable_field_assign_rc_balanced() {
     // Variable field assign on a mut struct: construct, reassign, drop — RC stays balanced.
     let src = r#"
 struct Model:
-    w: Variable<f32>
+    w: Tensor<f32>
 
 fn main():
     let t1 = Tensor.gpu<f32>([1.0, 2.0])

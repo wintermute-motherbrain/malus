@@ -208,8 +208,8 @@ fn collect_binops_in_expr(
 ) {
     match &expr.kind {
         TypedExprKind::BinOp { op, lhs, rhs } => {
-            let lhs_agg = lhs.ty.is_tensor() || lhs.ty.is_variable();
-            let rhs_agg = rhs.ty.is_tensor() || rhs.ty.is_variable();
+            let lhs_agg = lhs.ty.is_tensor();
+            let rhs_agg = rhs.ty.is_tensor();
             if lhs_agg && rhs_agg {
                 if elementwise_builtin_name(op).is_some() {
                     tensor_ops.insert(*op);
@@ -650,7 +650,7 @@ fn lower_kernel_explicit(kernel: &TypedKernel, kernel_id: u64) -> Result<String,
     let mut tensor_params: Vec<_> = Vec::new();
     let mut scalar_params: Vec<_> = Vec::new();
     for p in &kernel.params {
-        if p.ty.is_tensor() || p.ty.is_variable() {
+        if p.ty.is_tensor() {
             tensor_params.push(p);
         } else {
             scalar_params.push(p);

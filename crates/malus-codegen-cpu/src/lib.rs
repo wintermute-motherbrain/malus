@@ -348,7 +348,7 @@ fn parse_format_string(s: &str) -> Vec<FormatSegment> {
 
 fn cranelift_type(ty: &ResolvedTy) -> Result<Option<cranelift_codegen::ir::Type>, CodegenError> {
     match ty {
-        ResolvedTy::Tensor { .. } | ResolvedTy::Variable { .. } => Ok(Some(I64)),
+        ResolvedTy::Tensor { .. } => Ok(Some(I64)),
         ResolvedTy::Scalar(s) => Ok(Some(scalar_cranelift_type(s))),
         ResolvedTy::Bool => Ok(Some(I8)),
         ResolvedTy::Unit => Ok(None),
@@ -920,7 +920,7 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                 let elem_ty = elem_ty.clone();
                 let len = *len;
                 // If the element type owns heap resources, release each element.
-                if elem_ty.is_tensor() || elem_ty.is_variable() || elem_ty.is_struct() || elem_ty.is_enum() || elem_ty.is_array() {
+                if elem_ty.is_tensor() || elem_ty.is_struct() || elem_ty.is_enum() || elem_ty.is_array() {
                     self.emit_counted_drop_loop(ptr, &elem_ty, len)?;
                 }
                 self.call_heap_free(ptr);
@@ -965,9 +965,9 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                     let val = self.builder.ins().load(
                         cl_ty, cranelift_codegen::ir::MemFlags::trusted(), ptr, offset,
                     );
-                    // Tensor/Variable fields: retain so DropTuple's tensor_release balances
+                    // Tensor fields: retain so DropTuple's tensor_release balances
                     // with the Drop for the extracted binding. Only needed when DropTuple fires.
-                    if expr_is_ident && (ty.is_tensor() || ty.is_variable()) {
+                    if expr_is_ident && ty.is_tensor() {
                         self.call_runtime_retain(val);
                     }
                     let var = Variable::from_u32(self.next_var as u32);
@@ -1120,12 +1120,6 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                 );
                 self.call_runtime_release(handle);
             }
-            ResolvedTy::Variable { .. } => {
-                let handle = self.builder.ins().load(
-                    I64, cranelift_codegen::ir::MemFlags::trusted(), base_ptr, byte_offset,
-                );
-                self.call_runtime_release(handle);
-            }
             ResolvedTy::Struct { fields, .. } => {
                 let nested_ptr = self.builder.ins().load(
                     I64, cranelift_codegen::ir::MemFlags::trusted(), base_ptr, byte_offset,
@@ -1133,7 +1127,7 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                 let droppable: Vec<(usize, ResolvedTy)> = fields.iter()
                     .enumerate()
                     .filter_map(|(i, (_, fty))| {
-                        if fty.is_tensor() || fty.is_variable() || fty.is_struct() || fty.is_enum() {
+                        if fty.is_tensor() || fty.is_struct() || fty.is_enum() {
                             Some((i, fty.clone()))
                         } else {
                             None
@@ -1155,7 +1149,7 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                         let droppable = vfields.iter()
                             .enumerate()
                             .filter_map(|(i, (_, vty))| {
-                                if vty.is_tensor() || vty.is_variable() || vty.is_struct() || vty.is_enum() {
+                                if vty.is_tensor() || vty.is_struct() || vty.is_enum() {
                                     Some((i, vty.clone()))
                                 } else {
                                     None
@@ -1281,13 +1275,10 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
             malus_sema::ResolvedTy::Tensor { .. } => {
                 self.call_runtime_release(handle);
             }
-            malus_sema::ResolvedTy::Variable { .. } => {
-                self.call_runtime_release(handle);
-            }
             malus_sema::ResolvedTy::Struct { fields, .. } => {
                 let droppable: Vec<(usize, malus_sema::ResolvedTy)> = fields.iter().enumerate()
                     .filter_map(|(i, (_, ty))| {
-                        if ty.is_tensor() || ty.is_variable() || ty.is_struct() || ty.is_enum() || ty.is_array() {
+                        if ty.is_tensor() || ty.is_struct() || ty.is_enum() || ty.is_array() {
                             Some((i, ty.clone()))
                         } else {
                             None
@@ -1306,7 +1297,7 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                     .map(|(vi, (_, vfields))| {
                         let droppable: Vec<(usize, malus_sema::ResolvedTy)> = vfields.iter().enumerate()
                             .filter_map(|(fi, (_, fty))| {
-                                if fty.is_tensor() || fty.is_variable() || fty.is_struct() || fty.is_enum() || fty.is_array() {
+                                if fty.is_tensor() || fty.is_struct() || fty.is_enum() || fty.is_array() {
                                     Some((fi, fty.clone()))
                                 } else {
                                     None
@@ -1321,7 +1312,7 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
             malus_sema::ResolvedTy::Array { elem, len } => {
                 let inner_elem = *elem.clone();
                 let inner_len = *len;
-                if inner_elem.is_tensor() || inner_elem.is_variable() || inner_elem.is_struct() || inner_elem.is_enum() || inner_elem.is_array() {
+                if inner_elem.is_tensor() || inner_elem.is_struct() || inner_elem.is_enum() || inner_elem.is_array() {
                     self.emit_counted_drop_loop(handle, &inner_elem, inner_len)?;
                 }
                 self.call_heap_free(handle);
@@ -1384,13 +1375,13 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
 
             TypedExprKind::BinOp { op, lhs, rhs } => {
                 match (&lhs.ty, &rhs.ty) {
-                    // Variable ⊕ Variable — broadcast-aware forward + tape_record_binop.
-                    (ResolvedTy::Variable { dtype: ld }, ResolvedTy::Variable { dtype: rd })
+                    // Tensor ⊕ Tensor — matmul or broadcast-aware element-wise, plus
+                    // tape_record_binop when the result is grad-tracked (M27:
+                    // `expr.grad_tracked`, set by `grad_inference.rs`, replaces the old
+                    // the old distinct Variable type; ADR-0030).
+                    (ResolvedTy::Tensor { dtype: ld }, ResolvedTy::Tensor { dtype: rd })
                         if ld == rd && *ld == ScalarTy::F32 =>
                     {
-                        let op_tag = binop_to_optag(op).ok_or_else(|| {
-                            CodegenError::UnsupportedExpr(format!("Variable BinOp {:?} not supported on tape", op))
-                        })?;
                         let a = self.lower_expr(lhs)?;
                         let b = self.lower_expr(rhs)?;
                         let out = if *op == BinOp::Matmul {
@@ -1400,28 +1391,15 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                         } else if let Some(kernel_name) = elementwise_builtin_name(op) {
                             self.lower_broadcast_binop(kernel_name, a, b)?
                         } else {
-                            return Err(CodegenError::UnsupportedExpr(format!("Variable BinOp {:?} not supported", op)));
+                            return Err(CodegenError::UnsupportedExpr(format!("binop {:?} on tensors not supported", op)));
                         };
-                        self.call_tape_record_binop(op_tag, a, b, out);
-                        Ok(out)
-                    }
-                    // Tensor ⊕ Tensor — matmul or broadcast-aware element-wise.
-                    (ResolvedTy::Tensor { dtype: ld }, ResolvedTy::Tensor { dtype: rd })
-                        if ld == rd && *ld == ScalarTy::F32 =>
-                    {
-                        if *op == BinOp::Matmul {
-                            let a = self.lower_expr(lhs)?;
-                            let b = self.lower_expr(rhs)?;
-                            let matmul_ref = self.import_func(self.codegen.rt_tensor_matmul);
-                            let call = self.builder.ins().call(matmul_ref, &[a, b]);
-                            Ok(self.builder.inst_results(call).to_vec()[0])
-                        } else if let Some(kernel_name) = elementwise_builtin_name(op) {
-                            let a = self.lower_expr(lhs)?;
-                            let b = self.lower_expr(rhs)?;
-                            self.lower_broadcast_binop(kernel_name, a, b)
-                        } else {
-                            Err(CodegenError::UnsupportedExpr(format!("binop {:?} on tensors not supported", op)))
+                        if expr.grad_tracked {
+                            let op_tag = binop_to_optag(op).ok_or_else(|| {
+                                CodegenError::UnsupportedExpr(format!("BinOp {:?} not supported on tape", op))
+                            })?;
+                            self.call_tape_record_binop(op_tag, a, b, out);
                         }
+                        Ok(out)
                     }
                     (ResolvedTy::Tensor { .. }, ResolvedTy::Tensor { .. }) => {
                         Err(CodegenError::UnsupportedExpr("non-f32 tensor BinOp not yet supported".into()))
@@ -1468,15 +1446,19 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
 
             TypedExprKind::Unary { op, operand } => {
                 match op {
-                    UnaryOp::Neg if operand.ty.is_variable() => {
-                        // Variable neg — forward: malus_mul_scalar(x, -1.0).
+                    UnaryOp::Neg if operand.ty.is_tensor() => {
+                        // Tensor neg — forward: malus_mul_scalar(x, -1.0).
                         // No Neg GPU kernel; reuse scalar-broadcast Mul with a -1 scalar tensor.
+                        // tape_record_unary only when grad-tracked (M27 grad_inference.rs;
+                        // replaces the old the old distinct Variable type; ADR-0030).
                         let x = self.lower_expr(operand)?;
                         let neg_one = self.builder.ins().f32const(-1.0_f32);
                         let scalar_handle = self.emit_scalar_tensor(neg_one);
                         let out = self.lower_kernel_dispatch_with_handles("malus_mul_scalar", &[x, scalar_handle])?;
                         self.call_runtime_free(scalar_handle);
-                        self.call_tape_record_unary(OPTAG_NEG, x, out);
+                        if operand.grad_tracked {
+                            self.call_tape_record_unary(OPTAG_NEG, x, out);
+                        }
                         Ok(out)
                     }
                     UnaryOp::Neg => {
@@ -1541,10 +1523,10 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                 } else if self.codegen.kernel_ids.contains_key(callee.as_str()) {
                     // Unary math builtins (relu, sigmoid, tanh, exp, log, sqrt, abs)
                     // dispatched as built-in GPU kernels via kernel_dispatch.
-                    if expr.ty.is_variable() {
-                        // Variable input: lower arg first so we have x for tape_record_unary.
+                    if expr.grad_tracked {
+                        // Grad-tracked input: lower arg first so we have x for tape_record_unary.
                         let op_tag = unary_builtin_to_optag(callee).ok_or_else(|| {
-                            CodegenError::UnsupportedExpr(format!("no OpTag for Variable builtin '{callee}'"))
+                            CodegenError::UnsupportedExpr(format!("no OpTag for grad-tracked builtin '{callee}'"))
                         })?;
                         let x = self.lower_expr(&args[0])?;
                         let out = self.lower_kernel_dispatch_with_handles(callee, &[x])?;
@@ -1557,10 +1539,10 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                 } else if callee == "zeros" || callee == "ones" || callee == "randn" {
                     self.lower_zeros_ones(callee, args)
                 } else if callee == "reshape" || callee == "transpose" || callee == "permute" {
-                    self.lower_shape_op(callee, args, expr.ty.is_variable())
+                    self.lower_shape_op(callee, args, expr.grad_tracked)
                 } else if callee == "sum" && args.len() == 1 {
                     // sum(t) — whole-tensor sum (no axis).
-                    if expr.ty.is_variable() {
+                    if expr.grad_tracked {
                         let x = self.lower_expr(&args[0])?;
                         let out = self.lower_eager_cpu_op_with_handle("sum", x)?;
                         self.call_tape_record_unary(OPTAG_SUM, x, out);
@@ -1578,11 +1560,11 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                         "var"  => OPTAG_REDUCE_VAR_AXIS,
                         _      => unreachable!(),
                     };
-                    self.lower_axis_reduction(op_tag, expr.ty.is_variable(), args)
+                    self.lower_axis_reduction(op_tag, expr.grad_tracked, args)
                 } else if callee == "softmax" {
-                    self.lower_softmax(expr.ty.is_variable(), args)
+                    self.lower_softmax(expr.grad_tracked, args)
                 } else if callee == "layernorm" {
-                    self.lower_layernorm(expr.ty.is_variable(), args)
+                    self.lower_layernorm(expr.grad_tracked, args)
                 } else if callee == "gelu" {
                     let x = self.lower_expr(&args[0])?;
                     let func_id = self.codegen.func_ids.get("__gelu_fwd")
@@ -1591,18 +1573,18 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                     let func_ref = self.import_func(func_id);
                     let call = self.builder.ins().call(func_ref, &[x]);
                     let out  = self.builder.inst_results(call).to_vec()[0];
-                    if expr.ty.is_variable() {
+                    if expr.grad_tracked {
                         self.call_tape_record_unary(OPTAG_GELU, x, out);
                     }
                     Ok(out)
                 } else if callee == "embedding" {
-                    self.lower_embedding(args)
+                    self.lower_embedding(args, expr.grad_tracked)
                 } else if callee == "cross_entropy" {
-                    self.lower_cross_entropy(args)
+                    self.lower_cross_entropy(args, expr.grad_tracked)
                 } else if callee == "causal_mask" {
                     self.lower_causal_mask(args)
                 } else if callee == "variable" {
-                    // variable(t) — wrap Tensor in Variable: retain + tape_register_leaf.
+                    // variable(t) — leaf marker: retain + tape_register_leaf.
                     let handle = self.lower_expr(&args[0])?;
                     self.call_runtime_retain(handle);
                     self.call_tape_register_leaf(handle);
@@ -1764,7 +1746,7 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                 // M25: detect `t.shape[i]` / `t.strides[i]` — fuse into tensor_dim(t, i).
                 // sema types .shape as Array<I64,8>; the array itself is not materialised.
                 if let TypedExprKind::FieldAccess { base: fa_base, field } = &base.kind {
-                    if (field == "shape" || field == "strides") && (fa_base.ty.is_tensor() || fa_base.ty.is_variable()) {
+                    if (field == "shape" || field == "strides") && fa_base.ty.is_tensor() {
                         let handle = self.lower_expr(fa_base)?;
                         let idx_val = self.lower_expr(&indices[0])?;
                         let dim_ref = self.import_func(self.codegen.rt_tensor_dim);
@@ -1830,13 +1812,13 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                     let len_ref = self.import_func(self.codegen.rt_tensor_len);
                     let call = self.builder.ins().call(len_ref, &[handle]);
                     Ok(self.builder.inst_results(call).to_vec()[0])
-                } else if field == "ndim" && (base.ty.is_tensor() || base.ty.is_variable()) {
+                } else if field == "ndim" && base.ty.is_tensor() {
                     // M25: x.ndim → tensor_ndim(handle) -> i64
                     let handle = self.lower_expr(base)?;
                     let ndim_ref = self.import_func(self.codegen.rt_tensor_ndim);
                     let call = self.builder.ins().call(ndim_ref, &[handle]);
                     Ok(self.builder.inst_results(call).to_vec()[0])
-                } else if (field == "shape" || field == "strides") && (base.ty.is_tensor() || base.ty.is_variable()) {
+                } else if (field == "shape" || field == "strides") && base.ty.is_tensor() {
                     // M25: x.shape / x.strides — sema types as Array<i64,8>; consumed only
                     // via x.shape[i] which is caught in the Index arm below.  Getting the array
                     // itself is not representable at runtime (no descriptor pointer in the host);
@@ -1844,10 +1826,11 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                     // (Sema already rejected bare .shape / .strides accesses other than .shape[k].)
                     self.lower_expr(base)?; // lower for side effects (retain counts etc.)
                     Ok(self.builder.ins().iconst(I64, 0))
-                } else if field == "data" && base.ty.is_variable() {
-                    // Variable IS the tensor handle — .data just returns the same i64.
+                } else if field == "data" && base.ty.is_tensor() {
+                    // .data is a detach (M27): same handle, just no longer grad-tracked
+                    // in the typed IR (grad_inference.rs forces it false; ADR-0030).
                     self.lower_expr(base)
-                } else if field == "grad" && base.ty.is_variable() {
+                } else if field == "grad" && base.ty.is_tensor() {
                     // .grad — call tape_get_grad; returns an owned Tensor handle (D5).
                     let handle = self.lower_expr(base)?;
                     Ok(self.call_tape_get_grad(handle))
@@ -2052,7 +2035,7 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                     let ndim_v = self.builder.ins().iconst(self.codegen.ptr_type(), out_ndim as i64);
                     // dtype from expr's Tensor<dtype>
                     let dt = match &expr.ty {
-                        ResolvedTy::Tensor { dtype } | ResolvedTy::Variable { dtype } => dtype_tag(dtype),
+                        ResolvedTy::Tensor { dtype } => dtype_tag(dtype),
                         _ => 0,
                     };
                     let dt_v = self.builder.ins().iconst(I32, dt as i64);
@@ -2061,7 +2044,7 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                     let null_ptr = self.builder.ins().iconst(self.codegen.ptr_type(), 0);
                     let zero_ndim = self.builder.ins().iconst(self.codegen.ptr_type(), 0);
                     let dt = match &expr.ty {
-                        ResolvedTy::Tensor { dtype } | ResolvedTy::Variable { dtype } => dtype_tag(dtype),
+                        ResolvedTy::Tensor { dtype } => dtype_tag(dtype),
                         _ => 0,
                     };
                     let dt_v = self.builder.ins().iconst(I32, dt as i64);
@@ -2251,7 +2234,7 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
     fn emit_print_value(&mut self, arg: &malus_sema::TypedExpr) -> Result<(), CodegenError> {
         let val = self.lower_expr(arg)?;
         match &arg.ty {
-            ResolvedTy::Tensor { .. } | ResolvedTy::Variable { .. } => self.call_runtime_print(val),
+            ResolvedTy::Tensor { .. } => self.call_runtime_print(val),
             ResolvedTy::Scalar(s) if is_float_scalar(s) => {
                 let func_ref = self.import_func(self.codegen.rt_print_f32);
                 self.builder.ins().call(func_ref, &[val]);
@@ -2590,7 +2573,7 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
     fn lower_axis_reduction(
         &mut self,
         op_tag: i32,
-        is_variable: bool,
+        grad_tracked: bool,
         args: &[malus_sema::TypedExpr],
     ) -> Result<cranelift_codegen::ir::Value, CodegenError> {
         let x = self.lower_expr(&args[0])?;
@@ -2609,7 +2592,7 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
         let func_ref = self.import_func(func_id);
         let call = self.builder.ins().call(func_ref, &[x, axis, keepdim]);
         let out = self.builder.inst_results(call).to_vec()[0];
-        if is_variable {
+        if grad_tracked {
             self.call_tape_record_reduce(op_tag, x, out, axis, keepdim);
         }
         Ok(out)
@@ -2675,10 +2658,11 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
     }
 
     /// softmax(t, axis=N) — axis-only builtin.
-    /// is_variable: whether result is Variable (Variable propagates from arg0).
+    /// grad_tracked: whether the result is grad-tracked (M27 grad_inference.rs;
+    /// propagates from arg0's own grad-tracked status; ADR-0030).
     fn lower_softmax(
         &mut self,
-        is_variable: bool,
+        grad_tracked: bool,
         args: &[malus_sema::TypedExpr],
     ) -> Result<cranelift_codegen::ir::Value, CodegenError> {
         let x    = self.lower_expr(&args[0])?;
@@ -2689,7 +2673,7 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
         let func_ref = self.import_func(func_id);
         let call = self.builder.ins().call(func_ref, &[x, axis]);
         let out  = self.builder.inst_results(call).to_vec()[0];
-        if is_variable {
+        if grad_tracked {
             let keepdim_zero = self.builder.ins().iconst(I64, 0);
             self.call_tape_record_reduce(OPTAG_SOFTMAX, x, out, axis, keepdim_zero);
         }
@@ -2699,7 +2683,7 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
     /// layernorm(t, axis=N) — axis-only builtin.
     fn lower_layernorm(
         &mut self,
-        is_variable: bool,
+        grad_tracked: bool,
         args: &[malus_sema::TypedExpr],
     ) -> Result<cranelift_codegen::ir::Value, CodegenError> {
         let x    = self.lower_expr(&args[0])?;
@@ -2714,16 +2698,17 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
         let normed   = self.builder.ins().load(I64, mem, tuple_ptr, 8);
         let variance = self.builder.ins().load(I64, mem, tuple_ptr, 16);
         self.call_aggregate_release(tuple_ptr);
-        if is_variable {
+        if grad_tracked {
             self.call_tape_record_layernorm(OPTAG_LAYERNORM, x, normed, variance, axis);
         }
         Ok(normed)
     }
 
-    /// embedding(weight: Variable<f32>, indices: Tensor<i32|i64>) -> Variable<f32>
+    /// embedding(weight: Tensor<f32>, indices: Tensor<i32|i64>) -> Tensor<f32>
     fn lower_embedding(
         &mut self,
         args: &[malus_sema::TypedExpr],
+        grad_tracked: bool,
     ) -> Result<cranelift_codegen::ir::Value, CodegenError> {
         let weight  = self.lower_expr(&args[0])?;
         let indices = self.lower_expr(&args[1])?;
@@ -2733,16 +2718,19 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
         let func_ref = self.import_func(func_id);
         let call = self.builder.ins().call(func_ref, &[weight, indices]);
         let out  = self.builder.inst_results(call).to_vec()[0];
-        let tag  = self.builder.ins().iconst(I32, OPTAG_EMBEDDING as i64);
-        let rec  = self.import_func(self.codegen.rt_tape_record_embedding);
-        self.builder.ins().call(rec, &[tag, weight, indices, out]);
+        if grad_tracked {
+            let tag  = self.builder.ins().iconst(I32, OPTAG_EMBEDDING as i64);
+            let rec  = self.import_func(self.codegen.rt_tape_record_embedding);
+            self.builder.ins().call(rec, &[tag, weight, indices, out]);
+        }
         Ok(out)
     }
 
-    /// cross_entropy(logits: Variable<f32>, targets: Tensor<i32|i64>) -> Variable<f32>
+    /// cross_entropy(logits: Tensor<f32>, targets: Tensor<i32|i64>) -> Tensor<f32>
     fn lower_cross_entropy(
         &mut self,
         args: &[malus_sema::TypedExpr],
+        grad_tracked: bool,
     ) -> Result<cranelift_codegen::ir::Value, CodegenError> {
         let logits  = self.lower_expr(&args[0])?;
         let targets = self.lower_expr(&args[1])?;
@@ -2756,7 +2744,14 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
         let loss  = self.builder.ins().load(I64, mem, tuple_ptr, 8);
         let probs = self.builder.ins().load(I64, mem, tuple_ptr, 16);
         self.call_aggregate_release(tuple_ptr);
-        self.call_tape_record_cross_entropy(OPTAG_CROSS_ENTROPY, logits, loss, probs, targets);
+        if grad_tracked {
+            self.call_tape_record_cross_entropy(OPTAG_CROSS_ENTROPY, logits, loss, probs, targets);
+        } else {
+            // Not grad-tracked: `probs` is a backward-only VJP aid with no other
+            // owner (tape_record_cross_entropy normally retains it) — free it here
+            // so it doesn't leak.
+            self.call_runtime_free(probs);
+        }
         Ok(loss)
     }
 
@@ -2772,12 +2767,12 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
     }
 
     /// Lower reshape(t, d0..dn), transpose(t[, i, j]), or permute(t, p0..pn).
-    /// args[0] = tensor/variable; args[1..] = dim args (may be empty for no-arg transpose).
+    /// args[0] = tensor; args[1..] = dim args (may be empty for no-arg transpose).
     fn lower_shape_op(
         &mut self,
         callee: &str,
         args: &[malus_sema::TypedExpr],
-        is_variable: bool,
+        grad_tracked: bool,
     ) -> Result<cranelift_codegen::ir::Value, CodegenError> {
         let handle = self.lower_expr(&args[0])?;
         let dim_args = &args[1..];
@@ -2791,7 +2786,7 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
             let func_ref = self.import_func(func_id);
             let call = self.builder.ins().call(func_ref, &[handle]);
             let out  = self.builder.inst_results(call).to_vec()[0];
-            if is_variable {
+            if grad_tracked {
                 let null_ptr  = self.builder.ins().iconst(self.codegen.ptr_type(), 0);
                 let zero      = self.builder.ins().iconst(self.codegen.ptr_type(), 0);
                 self.call_tape_record_perm(OPTAG_TRANSPOSE, handle, out, null_ptr, zero);
@@ -2810,7 +2805,7 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
             let func_ref = self.import_func(func_id);
             let call = self.builder.ins().call(func_ref, &[handle, p0, p1, p2]);
             let out  = self.builder.inst_results(call).to_vec()[0];
-            if is_variable {
+            if grad_tracked {
                 let slot = self.builder.create_sized_stack_slot(
                     cranelift_codegen::ir::StackSlotData::new(
                         cranelift_codegen::ir::StackSlotKind::ExplicitSlot, 24, 3));
@@ -2859,7 +2854,7 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
             self.builder.inst_results(call).to_vec()[0]
         };
 
-        if is_variable {
+        if grad_tracked {
             if callee == "reshape" {
                 self.call_tape_record_unary(OPTAG_RESHAPE, handle, out);
             } else {

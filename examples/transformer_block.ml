@@ -1,9 +1,9 @@
-fn attention(q: Variable<f32>, k: Variable<f32>, v: Variable<f32>, mask: Tensor<f32>) -> Variable<f32>:
+fn attention(q: Tensor<f32>, k: Tensor<f32>, v: Tensor<f32>, mask: Tensor<f32>) -> Tensor<f32>:
     let scores = q @ permute(k, 0, 2, 1) + variable(mask)
     let attn = softmax(scores, axis=2)
     return attn @ v
 
-fn mlp_block(x: Variable<f32>, w1: Variable<f32>, w2: Variable<f32>) -> Variable<f32>:
+fn mlp_block(x: Tensor<f32>, w1: Tensor<f32>, w2: Tensor<f32>) -> Tensor<f32>:
     return gelu(x @ w1) @ w2
 
 fn main():

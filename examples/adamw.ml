@@ -5,7 +5,7 @@ struct AdamW:
     eps: f32
     wd: f32
 
-fn adamw_step(opt: AdamW, mut params: Array<Variable<f32>, 4>,
+fn adamw_step(opt: AdamW, mut params: Array<Tensor<f32>, 4>,
               mut ms: Array<Tensor<f32>, 4>, mut vs: Array<Tensor<f32>, 4>,
               t: i64):
     let bc1 = 1.0 - opt.beta1 ** t

@@ -16,7 +16,7 @@ fn __perturb_fwd(x: Tensor<f32>, idx: i64, delta: f32) -> Tensor<f32>:
     return __perturb_kernel[grid=[n, 1, 1], tg=[1, 1, 1]](x, idx, delta)
 
 # gpu_barrier() is only inserted by CTMM before a *drop* of a pending tensor,
-# never before a plain read — so a Variable's .grad (RC-managed, not
+# never before a plain read — so a grad-tracked tensor's .grad (RC-managed, not
 # CTMM-static-dropped) can be read before its GPU computation is visible.
 # A throwaway static-drop Tensor read reliably forces the flush.
 fn __flush():
@@ -41,7 +41,7 @@ fn __check_elem(analytic: Tensor<f32>, i: i64, fp0: f32, fm0: f32, eps: f32):
 fn __loss_add(x: Tensor<f32>, y: Tensor<f32>) -> Tensor<f32>:
     return sum(x + y)
 
-fn __loss_add_v(x: Variable<f32>, y: Variable<f32>) -> Variable<f32>:
+fn __loss_add_v(x: Tensor<f32>, y: Tensor<f32>) -> Tensor<f32>:
     return sum(x + y)
 
 fn check_add():
@@ -71,7 +71,7 @@ fn check_add():
 fn __loss_mul(x: Tensor<f32>, y: Tensor<f32>) -> Tensor<f32>:
     return sum(x * y)
 
-fn __loss_mul_v(x: Variable<f32>, y: Variable<f32>) -> Variable<f32>:
+fn __loss_mul_v(x: Tensor<f32>, y: Tensor<f32>) -> Tensor<f32>:
     return sum(x * y)
 
 fn check_mul():
@@ -103,7 +103,7 @@ fn check_mul():
 fn __loss_matmul(a: Tensor<f32>, b: Tensor<f32>) -> Tensor<f32>:
     return sum(a @ b)
 
-fn __loss_matmul_v(a: Variable<f32>, b: Variable<f32>) -> Variable<f32>:
+fn __loss_matmul_v(a: Tensor<f32>, b: Tensor<f32>) -> Tensor<f32>:
     return sum(a @ b)
 
 # matmul's gradient is exactly linear in each operand (zero finite-difference
@@ -142,7 +142,7 @@ fn check_matmul():
 fn __loss_softmax(x: Tensor<f32>, w: Tensor<f32>) -> Tensor<f32>:
     return sum(softmax(x, axis=1) * w)
 
-fn __loss_softmax_v(x: Variable<f32>, w: Variable<f32>) -> Variable<f32>:
+fn __loss_softmax_v(x: Tensor<f32>, w: Tensor<f32>) -> Tensor<f32>:
     return sum(softmax(x, axis=1) * w)
 
 fn check_softmax():
@@ -168,7 +168,7 @@ fn check_softmax():
 fn __loss_layernorm(x: Tensor<f32>, w: Tensor<f32>) -> Tensor<f32>:
     return sum(layernorm(x, axis=1) * w)
 
-fn __loss_layernorm_v(x: Variable<f32>, w: Variable<f32>) -> Variable<f32>:
+fn __loss_layernorm_v(x: Tensor<f32>, w: Tensor<f32>) -> Tensor<f32>:
     return sum(layernorm(x, axis=1) * w)
 
 fn check_layernorm():
@@ -194,7 +194,7 @@ fn check_layernorm():
 fn __loss_gelu(x: Tensor<f32>) -> Tensor<f32>:
     return sum(gelu(x))
 
-fn __loss_gelu_v(x: Variable<f32>) -> Variable<f32>:
+fn __loss_gelu_v(x: Tensor<f32>) -> Tensor<f32>:
     return sum(gelu(x))
 
 fn check_gelu():
@@ -214,11 +214,10 @@ fn check_gelu():
             __check_elem(vx.grad, i, fp[0], fm[0], eps)
 
 # ── embedding ──────────────────────────────────────────────────────────────────
-# embedding()/cross_entropy() always require Variable<f32> input (no Tensor
-# variant exists) — the numeric path re-wraps each perturbed Tensor in a
-# fresh variable() under no_grad and reads the scalar back via .data[0].
+# the numeric path re-wraps each perturbed Tensor in a fresh variable() under
+# no_grad and reads the scalar back via .data[0].
 
-fn __loss_embedding_v(weight: Variable<f32>, idx: Tensor<i32>) -> Variable<f32>:
+fn __loss_embedding_v(weight: Tensor<f32>, idx: Tensor<i32>) -> Tensor<f32>:
     return sum(embedding(weight, idx))
 
 fn check_embedding():

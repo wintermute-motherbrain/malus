@@ -143,23 +143,22 @@ pub fn register_builtins() -> HashMap<String, BuiltinSig> {
         return_placement: Some(Placement::Gpu),
     });
 
-    // cross_entropy(logits: Variable<f32>, targets: Tensor<i32|i64>) -> Variable<f32>
+    // cross_entropy(logits: Tensor<f32>, targets: Tensor<i32|i64>) -> Tensor<f32>
     // targets accept both i32 and i64; the hint guides to i32 (M19 done-when dtype).
-    // Always returns Variable (always recorded on tape).
-    let var_f32   = ResolvedTy::Variable { dtype: ScalarTy::F32 };
+    // Grad-tracked iff logits is grad-tracked (M27 grad_inference.rs).
     let tensor_i32 = ResolvedTy::Tensor { dtype: ScalarTy::I32 };
     m.insert("cross_entropy".to_string(), BuiltinSig {
-        kind: BuiltinKind::Fixed(vec![var_f32.clone(), tensor_i32.clone()]),
-        return_ty: var_f32.clone(),
+        kind: BuiltinKind::Fixed(vec![tensor_f32.clone(), tensor_i32.clone()]),
+        return_ty: tensor_f32.clone(),
         return_placement: Some(Placement::Gpu),
     });
 
-    // embedding(weight: Variable<f32>, indices: Tensor<i32|i64>) -> Variable<f32>
+    // embedding(weight: Tensor<f32>, indices: Tensor<i32|i64>) -> Tensor<f32>
     // weight is [V, D]; indices is [T]; output is [T, D].
     // Both i32 and i64 are valid index dtypes; hint guides to i32.
     m.insert("embedding".to_string(), BuiltinSig {
-        kind: BuiltinKind::Fixed(vec![var_f32.clone(), tensor_i32]),
-        return_ty: var_f32,
+        kind: BuiltinKind::Fixed(vec![tensor_f32.clone(), tensor_i32]),
+        return_ty: tensor_f32.clone(),
         return_placement: Some(Placement::Gpu),
     });
 
@@ -170,30 +169,31 @@ pub fn register_builtins() -> HashMap<String, BuiltinSig> {
         return_placement: Some(Placement::Gpu),
     });
 
-    // variable(t) -> Variable<f32> — wrap a Tensor in an RC Variable.
+    // variable(t) -> Tensor<f32> — leaf marker (M27 grad_inference.rs seeds it
+    // grad-tracked unconditionally; ADR-0030 retired the distinct `Variable` type).
     m.insert("variable".to_string(), BuiltinSig {
         kind: BuiltinKind::Fixed(vec![tensor_f32.clone()]),
-        return_ty: ResolvedTy::Variable { dtype: ScalarTy::F32 },
+        return_ty: tensor_f32.clone(),
         return_placement: Some(Placement::Gpu),
     });
 
     // tensor_print(t) — print a tensor directly (alias for print with single tensor arg).
     m.insert("tensor_print".to_string(), BuiltinSig {
-        kind: BuiltinKind::Fixed(vec![tensor_f32]),
+        kind: BuiltinKind::Fixed(vec![tensor_f32.clone()]),
         return_ty: ResolvedTy::Unit,
         return_placement: None,
     });
 
-    // backward(loss: Variable<f32>) — walk the tape in reverse, accumulate grads, clear tape.
+    // backward(loss: Tensor<f32>) — walk the tape in reverse, accumulate grads, clear tape.
     m.insert("backward".to_string(), BuiltinSig {
-        kind: BuiltinKind::Fixed(vec![ResolvedTy::Variable { dtype: ScalarTy::F32 }]),
+        kind: BuiltinKind::Fixed(vec![tensor_f32.clone()]),
         return_ty: ResolvedTy::Unit,
         return_placement: None,
     });
 
-    // zero_grad(v1, v2, ...) — clear accumulated grads for the given Variables.
+    // zero_grad(v1, v2, ...) — clear accumulated grads for the given tensors.
     m.insert("zero_grad".to_string(), BuiltinSig {
-        kind: BuiltinKind::VariadicTyped(ResolvedTy::Variable { dtype: ScalarTy::F32 }),
+        kind: BuiltinKind::VariadicTyped(tensor_f32.clone()),
         return_ty: ResolvedTy::Unit,
         return_placement: None,
     });

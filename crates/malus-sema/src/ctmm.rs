@@ -27,22 +27,41 @@
 use std::collections::{HashMap, HashSet};
 use malus_syntax::ast::Placement;
 use crate::ty::ResolvedTy;
-use crate::typed_ir::{TypedExpr, TypedExprKind, TypedFn, TypedStmt};
+use crate::typed_ir::{TypedExpr, TypedExprKind, TypedProgram, TypedStmt};
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
 /// Run the CTMM analysis on all `fn` bodies, injecting `Drop` and `GpuBarrier`
 /// nodes.  Kernel bodies are skipped.
-pub fn annotate_fns(fns: &mut Vec<TypedFn>) {
-    for f in fns.iter_mut() {
-        let var_params: Vec<(String, ResolvedTy)> = f.params.iter()
-            .filter(|p| p.ty.is_variable())
-            .map(|p| (p.name.clone(), p.ty.clone()))
+///
+/// `program.fn_param_grad` (from M27 `grad_inference.rs`, which runs first in
+/// the sema pipeline) tells us which params are grad-tracked; those need a
+/// `Release` seeded even though they aren't `let`-bound in the body — the
+/// caller retains before the call (`insert_variable_arc_retains`), so the
+/// callee must release its own reference at last use.
+///
+/// Restricted to `p.ty.is_tensor()`: `grad_tracked` is a content-based flag
+/// that can be true for an `Array`/`Struct`/`Tuple`-typed param too (e.g. an
+/// `Array<Tensor<f32>, N>` literal built from `variable()` results) — but the
+/// scalar-handle Retain/Release protocol below only applies to a bare
+/// `Tensor`. Aggregates are always RC-managed via their own `aggregate_*`
+/// mechanism regardless of grad-tracking (unaffected by M27; see
+/// `emit_drop_field` in codegen-cpu), and are borrowed by `mut` params, not
+/// owned — seeding one here would wrongly call `tensor_retain`/`tensor_release`
+/// on an aggregate box pointer.
+pub fn annotate_fns(program: &mut TypedProgram) {
+    let fn_param_grad = program.fn_param_grad.clone();
+    for f in program.fns.iter_mut() {
+        let grad_flags = fn_param_grad.get(&f.name).cloned().unwrap_or_default();
+        let grad_params: Vec<(String, ResolvedTy)> = f.params.iter()
+            .zip(grad_flags.iter().chain(std::iter::repeat(&false)))
+            .filter(|(p, g)| **g && p.ty.is_tensor())
+            .map(|(p, _)| (p.name.clone(), p.ty.clone()))
             .collect();
-        if var_params.is_empty() {
+        if grad_params.is_empty() {
             annotate_body(&mut f.body);
         } else {
-            annotate_body_seeded(&mut f.body, &var_params);
+            annotate_body_seeded(&mut f.body, &grad_params);
         }
     }
 }
@@ -74,6 +93,13 @@ fn annotate_body_seeded(body: &mut Vec<TypedStmt>, seed: &[(String, ResolvedTy)]
     // Steps 4-9: outer-scope analysis.
     let mut locals = collect_local_bindings(body);
     let mut local_types = collect_local_types(body);
+    // M27: names that must be RC-`Release`d rather than statically `Drop`ped —
+    // either seeded from the enclosing match arm/fn params (always RC; see
+    // `annotate_fns`/`annotate_match_arms`) or a top-level `let`/`let mut`
+    // binding whose value was ever grad-tracked (escape_set == grad_tracked,
+    // ADR-0030). Union over every assignment, since a binding reused across
+    // control flow with mixed grad-tracked-ness needs Release once, ever true.
+    let grad_names = collect_grad_names(body, seed);
     // Seed tensor payload bindings from the enclosing arm (tensor-only; aggregate
     // bindings are arm-local borrows freed by DropEnum on the scrutinee).
     for (n, t) in seed {
@@ -81,18 +107,77 @@ fn annotate_body_seeded(body: &mut Vec<TypedStmt>, seed: &[(String, ResolvedTy)]
         local_types.insert(n.clone(), t.clone());
     }
     let escaping = collect_escaping(body);
-    insert_assign_drops(body, &escaping);
+    insert_assign_drops(body, &escaping, &grad_names);
     let mut last_uses = find_last_uses(body, &locals, &escaping);
     // Step 7b (M12): ensure every seeded (retained) tensor payload binding has a
     // matching Drop, even if it is never used locally and does not escape.
     seed_unused_floor(&mut last_uses, seed, &escaping);
-    insert_drops(body, &last_uses, &local_types);
+    insert_drops(body, &last_uses, &local_types, &grad_names);
     // Step 8.5: inject Drop/DropStruct before early Returns inside nested scopes
     // for bindings whose end-of-scope Drop is after the control-flow node.
-    inject_early_return_unwinds(body, &local_types);
+    inject_early_return_unwinds(body, &local_types, &grad_names);
     // Step 8.6 (M12): inject drops before Break/Continue jumps.
-    inject_break_continue_unwinds(body, &local_types);
+    inject_break_continue_unwinds(body, &local_types, &grad_names);
     insert_barriers(body);
+}
+
+/// M27: collect the set of names that must be dropped via RC `Release` rather
+/// than a static `Drop` — the seeded bindings (always RC; see callers) plus any
+/// top-level `let`/`let mut` binding whose value was ever grad-tracked
+/// (`TypedExpr.grad_tracked`, set by `grad_inference.rs`), unioned across every
+/// `let` and every `Assign` reassignment anywhere in this scope.
+fn collect_grad_names(body: &[TypedStmt], seed: &[(String, ResolvedTy)]) -> HashSet<String> {
+    let mut out: HashSet<String> = seed.iter().map(|(n, _)| n.clone()).collect();
+    for s in body {
+        match s {
+            TypedStmt::Let { name, expr } => {
+                if expr.grad_tracked {
+                    out.insert(name.clone());
+                }
+            }
+            TypedStmt::LetTuple { names, expr } => {
+                if expr.grad_tracked {
+                    for (n, _) in names {
+                        out.insert(n.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    fold_assign_grad(body, &mut out);
+    out
+}
+
+fn fold_assign_grad(body: &[TypedStmt], out: &mut HashSet<String>) {
+    use crate::typed_ir::TypedAssignTarget;
+    for s in body {
+        match s {
+            TypedStmt::Assign { target: TypedAssignTarget::Ident(name), expr } => {
+                if expr.grad_tracked {
+                    out.insert(name.clone());
+                }
+            }
+            TypedStmt::If { then_body, else_body, .. } => {
+                fold_assign_grad(then_body, out);
+                if let Some(eb) = else_body {
+                    fold_assign_grad(eb, out);
+                }
+            }
+            TypedStmt::For { body: inner, .. }
+            | TypedStmt::While { body: inner, .. }
+            | TypedStmt::ForIn { body: inner, .. }
+            | TypedStmt::NoGrad { body: inner } => {
+                fold_assign_grad(inner, out);
+            }
+            TypedStmt::Match { arms, .. } => {
+                for arm in arms {
+                    fold_assign_grad(&arm.body, out);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Step 3: call `annotate_body` on each inner scope so inner bindings get
@@ -129,7 +214,7 @@ fn annotate_match_arms(body: &mut Vec<TypedStmt>) {
         if let TypedStmt::Match { arms, .. } = stmt {
             for arm in arms.iter_mut() {
                 let tensor_binds: Vec<(String, ResolvedTy)> = arm.bindings.iter()
-                    .filter(|(_, t)| t.is_tensor() || t.is_variable())
+                    .filter(|(_, t)| t.is_tensor())
                     .cloned()
                     .collect();
                 // Prepend Retain for each tensor payload in field-declaration order.
@@ -189,20 +274,21 @@ fn hoist_gpu_subexprs(body: &mut Vec<TypedStmt>) {
                 // before the Assign writes the new value. For Index/Field targets this
                 // is always needed (element release happens in codegen after RHS is fully
                 // evaluated). For Ident targets the existing self-reference guard applies.
-                let needs_hoist = is_gpu_producing(&expr)
-                    && (expr.ty.is_tensor() || expr.ty.is_variable());
+                let needs_hoist = is_gpu_producing(&expr) && expr.ty.is_tensor();
                 let expr = if needs_hoist {
                     let tmp_name = format!("__malus_tmp_{}", counter);
                     counter += 1;
                     let ty = expr.ty.clone();
                     let placement = expr.placement;
                     let span = expr.span;
+                    let grad_tracked = expr.grad_tracked;
                     hoisted.push(TypedStmt::Let { name: tmp_name.clone(), expr });
                     TypedExpr {
                         kind: TypedExprKind::Ident(tmp_name),
                         ty,
                         placement,
                         span,
+                        grad_tracked,
                     }
                 } else {
                     expr
@@ -358,8 +444,9 @@ fn hoist_if_gpu_tensor(
         let ty = operand.ty.clone();
         let placement = operand.placement;
         let span = operand.span;
+        let grad_tracked = operand.grad_tracked;
         hoisted.push(TypedStmt::Let { name: name.clone(), expr: operand });
-        TypedExpr { kind: TypedExprKind::Ident(name), ty, placement, span }
+        TypedExpr { kind: TypedExprKind::Ident(name), ty, placement, span, grad_tracked }
     } else {
         operand
     }
@@ -379,12 +466,14 @@ fn hoist_args(
             let ty = arg.ty.clone();
             let placement = arg.placement;
             let span = arg.span;
+            let grad_tracked = arg.grad_tracked;
             hoisted.push(TypedStmt::Let { name: name.clone(), expr: arg });
             new_args.push(TypedExpr {
                 kind: TypedExprKind::Ident(name),
                 ty,
                 placement,
                 span,
+                grad_tracked,
             });
         } else {
             new_args.push(arg);
@@ -406,6 +495,7 @@ fn hoist_gpu_producing_returns(body: &mut Vec<TypedStmt>) {
                 counter += 1;
                 let ret_ty = expr.ty.clone();
                 let span = expr.span;
+                let grad_tracked = expr.grad_tracked;
                 body.insert(i, TypedStmt::Let { name: name.clone(), expr });
                 body.insert(i + 1, TypedStmt::Return {
                     expr: TypedExpr {
@@ -413,6 +503,7 @@ fn hoist_gpu_producing_returns(body: &mut Vec<TypedStmt>) {
                         ty: ret_ty,
                         placement: None,
                         span,
+                        grad_tracked,
                     },
                 });
                 i += 2;
@@ -433,7 +524,7 @@ fn hoist_gpu_producing_returns(body: &mut Vec<TypedStmt>) {
 ///
 /// Must run after `hoist_gpu_subexprs` (D6 guard ensures the RHS no longer
 /// references the target, making the early Drop safe).
-fn insert_assign_drops(body: &mut Vec<TypedStmt>, escaping: &HashSet<String>) {
+fn insert_assign_drops(body: &mut Vec<TypedStmt>, escaping: &HashSet<String>, grad_names: &HashSet<String>) {
     use crate::typed_ir::TypedAssignTarget;
     let mut i = 0;
     while i < body.len() {
@@ -442,7 +533,7 @@ fn insert_assign_drops(body: &mut Vec<TypedStmt>, escaping: &HashSet<String>) {
             TypedStmt::Assign { target: TypedAssignTarget::Ident(name), expr }
                 if !escaping.contains(name) =>
             {
-                if let Some(drop_stmt) = make_drop_stmt_for_ty(name, &expr.ty) {
+                if let Some(drop_stmt) = make_drop_stmt_for_ty(name, &expr.ty, grad_names.contains(name.as_str())) {
                     body.insert(i, drop_stmt);
                     i += 1;
                 }
@@ -458,14 +549,14 @@ fn insert_assign_drops(body: &mut Vec<TypedStmt>, escaping: &HashSet<String>) {
         // inside a loop get a Drop before each inner Assign.
         match &mut body[i] {
             TypedStmt::If { then_body, else_body, .. } => {
-                insert_assign_drops(then_body, escaping);
-                if let Some(eb) = else_body { insert_assign_drops(eb, escaping); }
+                insert_assign_drops(then_body, escaping, grad_names);
+                if let Some(eb) = else_body { insert_assign_drops(eb, escaping, grad_names); }
             }
             TypedStmt::For { body: inner, .. }
             | TypedStmt::While { body: inner, .. }
             | TypedStmt::ForIn { body: inner, .. }
             | TypedStmt::NoGrad { body: inner } => {
-                insert_assign_drops(inner, escaping);
+                insert_assign_drops(inner, escaping, grad_names);
             }
             _ => {}
         }
@@ -475,10 +566,20 @@ fn insert_assign_drops(body: &mut Vec<TypedStmt>, escaping: &HashSet<String>) {
 
 /// Build the appropriate drop statement for a named binding of the given type.
 /// Returns `None` for types that own no heap resources (scalar, bool, unit).
-fn make_drop_stmt_for_ty(name: &str, ty: &ResolvedTy) -> Option<TypedStmt> {
+/// `grad_tracked` (M27, ADR-0030) only matters for the top-level `Tensor` case:
+/// grad-tracked tensors may be saved onto the tape and so need RC `Release`;
+/// everything else gets a static `Drop`. Struct/enum/tuple/array fields are
+/// always RC-managed regardless of grad-tracking (unaffected by M27; see
+/// `emit_drop_field` in codegen-cpu).
+fn make_drop_stmt_for_ty(name: &str, ty: &ResolvedTy, grad_tracked: bool) -> Option<TypedStmt> {
     match ty {
-        ResolvedTy::Variable { .. } => Some(TypedStmt::Release { name: name.to_string() }),
-        ResolvedTy::Tensor { .. } => Some(TypedStmt::Drop { name: name.to_string() }),
+        ResolvedTy::Tensor { .. } => {
+            if grad_tracked {
+                Some(TypedStmt::Release { name: name.to_string() })
+            } else {
+                Some(TypedStmt::Drop { name: name.to_string() })
+            }
+        }
         // Str is a leaked whole-program-lifetime buffer (ADR-0018). No drop needed.
         ResolvedTy::Str => None,
         ResolvedTy::Struct { fields, .. } => {
@@ -498,7 +599,7 @@ fn make_drop_stmt_for_ty(name: &str, ty: &ResolvedTy) -> Option<TypedStmt> {
             let droppable_fields: Vec<(usize, ResolvedTy)> = elements.iter()
                 .enumerate()
                 .filter_map(|(i, ty)| {
-                    if ty.is_tensor() || ty.is_variable() {
+                    if ty.is_tensor() {
                         Some((i, ty.clone()))
                     } else {
                         None
@@ -516,7 +617,7 @@ fn droppable_struct_fields(fields: &[(String, ResolvedTy)]) -> Vec<(usize, Resol
     fields.iter()
         .enumerate()
         .filter_map(|(i, (_, ty))| {
-            if ty.is_tensor() || ty.is_variable() || ty.is_struct() || ty.is_enum() {
+            if ty.is_tensor() || ty.is_struct() || ty.is_enum() {
                 Some((i, ty.clone()))
             } else {
                 None
@@ -534,7 +635,7 @@ fn droppable_enum_variants(
             let droppable = fields.iter()
                 .enumerate()
                 .filter_map(|(i, (_, ty))| {
-                    if ty.is_tensor() || ty.is_variable() || ty.is_struct() || ty.is_enum() {
+                    if ty.is_tensor() || ty.is_struct() || ty.is_enum() {
                         Some((i, ty.clone()))
                     } else {
                         None
@@ -552,6 +653,7 @@ fn insert_drops(
     body: &mut Vec<TypedStmt>,
     last_uses: &HashMap<String, usize>,
     local_types: &HashMap<String, ResolvedTy>,
+    grad_names: &HashSet<String>,
 ) {
     let mut by_idx: HashMap<usize, Vec<String>> = HashMap::new();
     for (name, last_idx) in last_uses {
@@ -571,7 +673,7 @@ fn insert_drops(
                 Some(t) => t,
                 None => continue,
             };
-            let stmt = match make_drop_stmt_for_ty(name, ty) {
+            let stmt = match make_drop_stmt_for_ty(name, ty, grad_names.contains(name.as_str())) {
                 Some(s) => s,
                 None => continue,
             };
@@ -591,6 +693,7 @@ fn insert_drops(
 fn inject_early_return_unwinds(
     body: &mut Vec<TypedStmt>,
     local_types: &HashMap<String, ResolvedTy>,
+    grad_names: &HashSet<String>,
 ) {
     // Map name → position of its Drop/DropStruct/DropEnum/DropArray in the outer body.
     let mut drop_positions: HashMap<String, usize> = HashMap::new();
@@ -633,20 +736,20 @@ fn inject_early_return_unwinds(
         }
         match &mut body[i] {
             TypedStmt::If { then_body, else_body, .. } => {
-                inject_unwind_in_body(then_body, &live_here, local_types);
+                inject_unwind_in_body(then_body, &live_here, local_types, grad_names);
                 if let Some(eb) = else_body {
-                    inject_unwind_in_body(eb, &live_here, local_types);
+                    inject_unwind_in_body(eb, &live_here, local_types, grad_names);
                 }
             }
             TypedStmt::For { body: inner, .. }
             | TypedStmt::While { body: inner, .. }
             | TypedStmt::ForIn { body: inner, .. }
             | TypedStmt::NoGrad { body: inner } => {
-                inject_unwind_in_body(inner, &live_here, local_types);
+                inject_unwind_in_body(inner, &live_here, local_types, grad_names);
             }
             TypedStmt::Match { arms, .. } => {
                 for arm in arms.iter_mut() {
-                    inject_unwind_in_body(&mut arm.body, &live_here, local_types);
+                    inject_unwind_in_body(&mut arm.body, &live_here, local_types, grad_names);
                 }
             }
             _ => {}
@@ -658,6 +761,7 @@ fn inject_unwind_in_body(
     body: &mut Vec<TypedStmt>,
     live_outer: &HashSet<String>,
     local_types: &HashMap<String, ResolvedTy>,
+    grad_names: &HashSet<String>,
 ) {
     let mut i = 0;
     while i < body.len() {
@@ -672,7 +776,7 @@ fn inject_unwind_in_body(
                     .collect();
                 to_drop.sort();
                 for name in &to_drop {
-                    if let Some(stmt) = make_unwind_drop(name, local_types) {
+                    if let Some(stmt) = make_unwind_drop(name, local_types, grad_names) {
                         body.insert(i, stmt);
                         i += 1;
                     }
@@ -685,20 +789,20 @@ fn inject_unwind_in_body(
                 // Recurse into nested control flow.
                 match &mut body[i] {
                     TypedStmt::If { then_body, else_body, .. } => {
-                        inject_unwind_in_body(then_body, live_outer, local_types);
+                        inject_unwind_in_body(then_body, live_outer, local_types, grad_names);
                         if let Some(eb) = else_body {
-                            inject_unwind_in_body(eb, live_outer, local_types);
+                            inject_unwind_in_body(eb, live_outer, local_types, grad_names);
                         }
                     }
                     TypedStmt::For { body: inner, .. }
                     | TypedStmt::While { body: inner, .. }
                     | TypedStmt::ForIn { body: inner, .. }
                     | TypedStmt::NoGrad { body: inner } => {
-                        inject_unwind_in_body(inner, live_outer, local_types);
+                        inject_unwind_in_body(inner, live_outer, local_types, grad_names);
                     }
                     TypedStmt::Match { arms, .. } => {
                         for arm in arms.iter_mut() {
-                            inject_unwind_in_body(&mut arm.body, live_outer, local_types);
+                            inject_unwind_in_body(&mut arm.body, live_outer, local_types, grad_names);
                         }
                     }
                     _ => {}
@@ -710,8 +814,12 @@ fn inject_unwind_in_body(
     }
 }
 
-fn make_unwind_drop(name: &str, local_types: &HashMap<String, ResolvedTy>) -> Option<TypedStmt> {
-    local_types.get(name).and_then(|ty| make_drop_stmt_for_ty(name, ty))
+fn make_unwind_drop(
+    name: &str,
+    local_types: &HashMap<String, ResolvedTy>,
+    grad_names: &HashSet<String>,
+) -> Option<TypedStmt> {
+    local_types.get(name).and_then(|ty| make_drop_stmt_for_ty(name, ty, grad_names.contains(name)))
 }
 
 // ── Phase 1.6 (M12): Break/Continue unwind ────────────────────────────────────
@@ -730,7 +838,11 @@ fn make_unwind_drop(name: &str, local_types: &HashMap<String, ResolvedTy>) -> Op
 // Does NOT descend into: For / While / ForIn — a Break/Continue inside a nested
 // loop belongs to that loop and was already handled when its body was annotated.
 
-fn inject_break_continue_unwinds(body: &mut Vec<TypedStmt>, local_types: &HashMap<String, ResolvedTy>) {
+fn inject_break_continue_unwinds(
+    body: &mut Vec<TypedStmt>,
+    local_types: &HashMap<String, ResolvedTy>,
+    grad_names: &HashSet<String>,
+) {
     // Map name → position of its Drop/DropStruct/DropEnum/DropArray in this body.
     let mut drop_positions: HashMap<String, usize> = HashMap::new();
     for (i, stmt) in body.iter().enumerate() {
@@ -773,7 +885,7 @@ fn inject_break_continue_unwinds(body: &mut Vec<TypedStmt>, local_types: &HashMa
                 to_drop.sort();
                 let mut inserted = 0;
                 for name in &to_drop {
-                    if let Some(stmt) = make_unwind_drop(name, local_types) {
+                    if let Some(stmt) = make_unwind_drop(name, local_types, grad_names) {
                         body.insert(i + inserted, stmt);
                         inserted += 1;
                     }
@@ -783,7 +895,7 @@ fn inject_break_continue_unwinds(body: &mut Vec<TypedStmt>, local_types: &HashMa
             }
             TypedStmt::If { .. } | TypedStmt::Match { .. } | TypedStmt::NoGrad { .. } => {
                 // Descend; do NOT descend into nested loops.
-                inject_bc_unwind_in_body_mut(body, i, &live_here, local_types);
+                inject_bc_unwind_in_body_mut(body, i, &live_here, local_types, grad_names);
             }
             _ => {}
         }
@@ -797,6 +909,7 @@ fn inject_bc_unwind_in_body(
     inner: &mut Vec<TypedStmt>,
     live_outer: &HashSet<String>,
     local_types: &HashMap<String, ResolvedTy>,
+    grad_names: &HashSet<String>,
 ) {
     let mut i = 0;
     while i < inner.len() {
@@ -809,7 +922,7 @@ fn inject_bc_unwind_in_body(
                 to_drop.sort();
                 let mut inserted = 0;
                 for name in &to_drop {
-                    if let Some(stmt) = make_unwind_drop(name, local_types) {
+                    if let Some(stmt) = make_unwind_drop(name, local_types, grad_names) {
                         inner.insert(i + inserted, stmt);
                         inserted += 1;
                     }
@@ -820,18 +933,18 @@ fn inject_bc_unwind_in_body(
             TypedStmt::If { .. } | TypedStmt::Match { .. } | TypedStmt::NoGrad { .. } => {
                 match &mut inner[i] {
                     TypedStmt::If { then_body, else_body, .. } => {
-                        inject_bc_unwind_in_body(then_body, live_outer, local_types);
+                        inject_bc_unwind_in_body(then_body, live_outer, local_types, grad_names);
                         if let Some(eb) = else_body {
-                            inject_bc_unwind_in_body(eb, live_outer, local_types);
+                            inject_bc_unwind_in_body(eb, live_outer, local_types, grad_names);
                         }
                     }
                     TypedStmt::Match { arms, .. } => {
                         for arm in arms.iter_mut() {
-                            inject_bc_unwind_in_body(&mut arm.body, live_outer, local_types);
+                            inject_bc_unwind_in_body(&mut arm.body, live_outer, local_types, grad_names);
                         }
                     }
                     TypedStmt::NoGrad { body: inner_body } => {
-                        inject_bc_unwind_in_body(inner_body, live_outer, local_types);
+                        inject_bc_unwind_in_body(inner_body, live_outer, local_types, grad_names);
                     }
                     _ => {}
                 }
@@ -850,21 +963,22 @@ fn inject_bc_unwind_in_body_mut(
     idx: usize,
     live_here: &HashSet<String>,
     local_types: &HashMap<String, ResolvedTy>,
+    grad_names: &HashSet<String>,
 ) {
     match &mut body[idx] {
         TypedStmt::If { then_body, else_body, .. } => {
-            inject_bc_unwind_in_body(then_body, live_here, local_types);
+            inject_bc_unwind_in_body(then_body, live_here, local_types, grad_names);
             if let Some(eb) = else_body {
-                inject_bc_unwind_in_body(eb, live_here, local_types);
+                inject_bc_unwind_in_body(eb, live_here, local_types, grad_names);
             }
         }
         TypedStmt::Match { arms, .. } => {
             for arm in arms.iter_mut() {
-                inject_bc_unwind_in_body(&mut arm.body, live_here, local_types);
+                inject_bc_unwind_in_body(&mut arm.body, live_here, local_types, grad_names);
             }
         }
         TypedStmt::NoGrad { body: inner } => {
-            inject_bc_unwind_in_body(inner, live_here, local_types);
+            inject_bc_unwind_in_body(inner, live_here, local_types, grad_names);
         }
         _ => {}
     }
@@ -1050,7 +1164,7 @@ fn collect_escaping_in(body: &[TypedStmt], out: &mut HashSet<String>) {
     for stmt in body {
         match stmt {
             TypedStmt::Return { expr } => collect_idents_in_expr(expr, out),
-            TypedStmt::Assign { expr, .. } if expr.ty.is_tensor() || expr.ty.is_variable() => {
+            TypedStmt::Assign { expr, .. } if expr.ty.is_tensor() => {
                 collect_idents_in_expr(expr, out);
             }
             TypedStmt::If { then_body, else_body, .. } => {
@@ -1146,9 +1260,11 @@ fn collect_idents_in_stmt(stmt: &TypedStmt, out: &mut HashSet<String>) {
 }
 
 /// Insert `Retain { name }` immediately before any `Let`/`Assign`/`Expr`/`Return`
-/// statement whose top-level expression is a `Call` with Variable-typed Ident arguments.
-/// This ensures every Variable passed to a function has a matching Retain+Release pair:
-/// the caller retains before the call, the callee releases at last use (via CTMM seeding),
+/// statement whose top-level expression is a `Call` with grad-tracked Ident arguments
+/// (M27: `expr.grad_tracked`, set by `grad_inference.rs`, replaces the old
+/// the old distinct Variable type; ADR-0030). This ensures every grad-tracked
+/// tensor passed to a function has a matching Retain+Release pair: the caller
+/// retains before the call, the callee releases at last use (via CTMM seeding),
 /// and the caller releases its own reference after the call.
 fn insert_variable_arc_retains(body: &mut Vec<TypedStmt>) {
     let mut i = 0;
@@ -1165,7 +1281,7 @@ fn insert_variable_arc_retains(body: &mut Vec<TypedStmt>) {
                 // For non-binding positions only emit retains for call args.
                 if let TypedExprKind::Call { args, .. } = &expr.kind {
                     args.iter()
-                        .filter(|a| a.ty.is_variable())
+                        .filter(|a| a.grad_tracked && a.ty.is_tensor())
                         .filter_map(|a| {
                             if let TypedExprKind::Ident(n) = &a.kind { Some(n.clone()) } else { None }
                         })
@@ -1184,13 +1300,21 @@ fn insert_variable_arc_retains(body: &mut Vec<TypedStmt>) {
     }
 }
 
+// M27: `grad_tracked` is a content-based flag — it can be true for an
+// `Array`/`Tuple`-typed expression too (e.g. `[variable(x), variable(y)]`, or
+// a tuple built from grad-tracked elements; see `grad_inference.rs`). The
+// scalar-handle Retain protocol below only applies to `Tensor`-typed values —
+// retaining an aggregate box pointer with `tensor_retain` is a type-confusion
+// bug (aggregates have their own ARC header layout and `aggregate_retain`
+// mechanism, unaffected by M27). Every arm below is therefore additionally
+// gated on `.ty.is_tensor()`.
 fn variable_arc_retains_for_expr(expr: &TypedExpr) -> Vec<String> {
     match &expr.kind {
-        // let b = a — Variable alias: retain a so b is a genuine co-owner.
-        TypedExprKind::Ident(name) if expr.ty.is_variable() => vec![name.clone()],
+        // let b = a — grad-tracked alias: retain a so b is a genuine co-owner.
+        TypedExprKind::Ident(name) if expr.grad_tracked && expr.ty.is_tensor() => vec![name.clone()],
         // let t = v.data — .data let-bind: retain v's handle so t is a genuine Tensor owner.
         TypedExprKind::FieldAccess { base, field }
-            if field == "data" && base.ty.is_variable() =>
+            if field == "data" && base.grad_tracked && base.ty.is_tensor() =>
         {
             if let TypedExprKind::Ident(n) = &base.kind {
                 vec![n.clone()]
@@ -1198,29 +1322,29 @@ fn variable_arc_retains_for_expr(expr: &TypedExpr) -> Vec<String> {
                 vec![]
             }
         }
-        // fn call: retain any Variable ident args (caller-retains ARC).
+        // fn call: retain any grad-tracked ident args (caller-retains ARC).
         TypedExprKind::Call { args, .. } => args
             .iter()
-            .filter(|a| a.ty.is_variable())
+            .filter(|a| a.grad_tracked && a.ty.is_tensor())
             .filter_map(|a| {
                 if let TypedExprKind::Ident(n) = &a.kind { Some(n.clone()) } else { None }
             })
             .collect(),
-        // Array literal: retain Variable ident elements so the slot is a genuine
+        // Array literal: retain grad-tracked ident elements so the slot is a genuine
         // co-owner alongside any binding that still references the same handle.
         TypedExprKind::ArrayLiteral { elements } => elements
             .iter()
-            .filter(|e| e.ty.is_variable())
+            .filter(|e| e.grad_tracked && e.ty.is_tensor())
             .filter_map(|e| {
                 if let TypedExprKind::Ident(n) = &e.kind { Some(n.clone()) } else { None }
             })
             .collect(),
-        // Struct literal: retain Variable ident fields so the struct slot is a genuine
+        // Struct literal: retain grad-tracked ident fields so the struct slot is a genuine
         // co-owner alongside any binding that still references the same handle.
         // (variable() calls self-retain, so only Ident sources need an extra retain here.)
         TypedExprKind::StructInit { fields, .. } => fields
             .iter()
-            .filter(|f| f.ty.is_variable())
+            .filter(|f| f.grad_tracked && f.ty.is_tensor())
             .filter_map(|f| {
                 if let TypedExprKind::Ident(n) = &f.kind { Some(n.clone()) } else { None }
             })

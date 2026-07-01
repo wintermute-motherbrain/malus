@@ -645,6 +645,12 @@ fn drops_in(stmts: &[TypedStmt]) -> Vec<&str> {
     }).collect()
 }
 
+fn releases_in(stmts: &[TypedStmt]) -> Vec<&str> {
+    stmts.iter().filter_map(|s| {
+        if let TypedStmt::Release { name } = s { Some(name.as_str()) } else { None }
+    }).collect()
+}
+
 /// Loop-local tensor `out` must be freed *inside* the for body, not after the loop.
 #[test]
 fn test_ctmm_loop_local_drop_inside_body() {
@@ -1263,7 +1269,7 @@ fn main():
 fn test_variable_field_assign_accepted() {
     let src = r#"
 struct Model:
-    w: Variable<f32>
+    w: Tensor<f32>
 
 fn main():
     let t = Tensor.gpu<f32>([1.0])
@@ -1289,5 +1295,114 @@ fn main():
     assert!(
         errors.iter().any(|e| matches!(e, SemaError::NestedLvalue { .. })),
         "expected NestedLvalue, got: {:?}", errors
+    );
+}
+
+// ── M27: grad-inference pass ──────────────────────────────────────────────────
+
+/// A tensor never passed through `variable()` is not grad-tracked and gets a
+/// static `Drop`, never an RC `Release`.
+#[test]
+fn test_grad_inference_non_derived_tensor_not_tracked() {
+    let src = r#"
+fn main():
+    let t = Tensor.gpu<f32>([1.0])
+    print(t)
+"#;
+    let prog = check_src(src).expect("check failed");
+    let kinds = flat_stmt_kinds(&prog.fns[0].body);
+    assert!(kinds.contains(&"Drop"), "expected static Drop for non-grad-tracked tensor; got {:?}", kinds);
+    assert!(!kinds.contains(&"Release"), "non-grad-tracked tensor must not be RC-released; got {:?}", kinds);
+}
+
+/// Every expression lexically inside `with no_grad:` is forced non-grad-tracked,
+/// overriding propagation — even `variable()`, which is otherwise an
+/// unconditional grad-tracked seed.
+#[test]
+fn test_grad_inference_no_grad_forces_non_tracked() {
+    let src = r#"
+fn main():
+    let t = Tensor.gpu<f32>([1.0])
+    with no_grad:
+        let v = variable(t)
+        print(v)
+"#;
+    let prog = check_src(src).expect("check failed");
+    let no_grad_body = prog.fns[0].body.iter().find_map(|s| {
+        if let TypedStmt::NoGrad { body } = s { Some(body) } else { None }
+    }).expect("expected a NoGrad stmt");
+    let kinds = flat_stmt_kinds(no_grad_body);
+    assert!(kinds.contains(&"Drop"), "no_grad-lexical variable() binding should be static-dropped; got {:?}", kinds);
+    assert!(!kinds.contains(&"Release"), "no_grad-lexical binding must not be RC-released; got {:?}", kinds);
+}
+
+/// `.data` and `.grad` are detach points: their result is never grad-tracked,
+/// regardless of the receiver — even a `variable()`-derived leaf.
+#[test]
+fn test_grad_inference_data_and_grad_are_detach_points() {
+    let src = r#"
+fn main():
+    let t = Tensor.gpu<f32>([1.0])
+    let v = variable(t)
+    let d = v.data
+    let g = v.grad
+    print(d)
+    print(g)
+"#;
+    let prog = check_src(src).expect("check failed");
+    let body = &prog.fns[0].body;
+    let drop_names = drops_in(body);
+    assert!(drop_names.contains(&"d"), "'.data' result should be static-dropped (detach); got drops: {:?}", drop_names);
+    assert!(drop_names.contains(&"g"), "'.grad' result should be static-dropped (detach); got drops: {:?}", drop_names);
+    let release_names = releases_in(body);
+    assert!(!release_names.contains(&"d"), "'.data' result must not be RC-released; got releases: {:?}", release_names);
+    assert!(!release_names.contains(&"g"), "'.grad' result must not be RC-released; got releases: {:?}", release_names);
+}
+
+/// Interprocedural: grad-tracking flows through a fn's param and return type,
+/// unioned over call sites (context-insensitive).
+#[test]
+fn test_grad_inference_interprocedural_param_and_return() {
+    let src = r#"
+fn identity(x: Tensor<f32>) -> Tensor<f32>:
+    return x
+
+fn main():
+    let t = Tensor.gpu<f32>([1.0])
+    let v = variable(t)
+    let out = identity(v)
+    print(out)
+"#;
+    let prog = check_src(src).expect("check failed");
+    let main_fn = prog.fns.iter().find(|f| f.name == "main").expect("main not found");
+    let release_names = releases_in(&main_fn.body);
+    assert!(
+        release_names.contains(&"out"),
+        "call result through a grad-tracked param/return should be RC-released; got releases: {:?}",
+        release_names
+    );
+}
+
+/// Field-sensitivity: a struct field written by a grad-tracked value at one
+/// construction site makes every read of that `(struct, field)` grad-tracked.
+#[test]
+fn test_grad_inference_struct_field_carrying() {
+    let src = r#"
+struct Model:
+    w: Tensor<f32>
+
+fn main():
+    let t = Tensor.gpu<f32>([1.0])
+    let v = variable(t)
+    let m = Model(w=v)
+    let w2 = m.w
+    print(w2)
+"#;
+    let prog = check_src(src).expect("check failed");
+    let release_names = releases_in(&prog.fns[0].body);
+    assert!(
+        release_names.contains(&"w2"),
+        "reading a grad-carrying struct field should be RC-released; got releases: {:?}",
+        release_names
     );
 }
