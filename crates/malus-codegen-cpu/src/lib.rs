@@ -974,13 +974,17 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
             // ── M10/M11: aggregate types ──────────────────────────────────────────
             TypedStmt::DropStruct { name, droppable_fields, .. } => {
                 let ptr = self.use_var(name)?;
-                // Recursively release droppable fields (at 8 + slot*8 per M13 layout),
-                // then release the struct box via aggregate ARC.
+                // M34: fields (at 8 + slot*8 per M13 layout) are released only
+                // on last-ref — a shared box (e.g. a struct bound out of a
+                // List element, ADR-0040) must not lose its fields while the
+                // container's copy is live. Then the box decrement, last.
                 let droppable_fields = droppable_fields.clone();
-                for (slot_idx, field_ty) in &droppable_fields {
-                    let offset = 8 + (*slot_idx as i32) * 8;
-                    self.emit_drop_field(ptr, offset, field_ty)?;
-                }
+                self.emit_if_last_ref(ptr, |s| {
+                    for (slot_idx, field_ty) in &droppable_fields {
+                        s.emit_drop_field(ptr, 8 + (*slot_idx as i32) * 8, field_ty)?;
+                    }
+                    Ok(())
+                })?;
                 self.call_aggregate_release(ptr);
                 Ok(false)
             }
@@ -988,7 +992,8 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
             TypedStmt::DropEnum { name, variants } => {
                 let ptr = self.use_var(name)?;
                 let variants: Vec<(u32, Vec<(usize, malus_sema::ResolvedTy)>, Vec<usize>)> = variants.clone();
-                self.emit_drop_enum_box(ptr, &variants)?;
+                self.emit_if_last_ref(ptr, |s| s.emit_enum_payload_release(ptr, &variants))?;
+                self.call_aggregate_release(ptr);
                 Ok(false)
             }
 
@@ -996,9 +1001,9 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                 let ptr = self.use_var(name)?;
                 let elem_ty = elem_ty.clone();
                 let len = *len;
-                // If the element type owns heap resources, release each element.
-                if elem_ty.is_tensor() || elem_ty.is_struct() || elem_ty.is_enum() || elem_ty.is_array() {
-                    self.emit_counted_drop_loop(ptr, &elem_ty, len)?;
+                if elem_ty.owns_heap_resources() {
+                    let len_val = self.builder.ins().iconst(I64, len as i64);
+                    self.emit_drop_elems_loop(ptr, 0, len_val, &elem_ty)?;
                 }
                 self.call_heap_free(ptr);
                 Ok(false)
@@ -1009,41 +1014,22 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
             // may alias across a call boundary (e.g. `Module::parameters`
             // returning a model's own field by identity) that neither CTMM nor
             // M29's (intraprocedural-only) borrow-inference can prove safe to
-            // free unconditionally.
-            //
-            // Ordering is load-bearing: we PEEK the refcount (a plain read, safe
-            // under this single-threaded JIT execution model — no other malus
-            // code can concurrently mutate the same box), and if it looks like 1
-            // (we're about to be the last reference), release each element
-            // *before* the one call that actually performs the atomic decrement
-            // (`call_list_release`, at the very end, common to both branches).
-            // That call may deallocate the box, so nothing after it may read
-            // through `ptr` again — reading the length and releasing elements
-            // must happen strictly before it.
+            // free unconditionally. M34: element release recurses by element
+            // type via the unified emitter — struct/list/enum elements included
+            // (pre-M34 only tensor elements were released: the `List<Struct>`
+            // leak this milestone fixes).
             TypedStmt::DropList { name, elem_ty } => {
                 let ptr = self.use_var(name)?;
                 let elem_ty = elem_ty.clone();
-                let refcount = self.builder.ins().load(I64, cranelift_codegen::ir::MemFlags::trusted(), ptr, 0);
-                let one = self.builder.ins().iconst(I64, 1);
-                let is_last = self.builder.ins().icmp(cranelift_codegen::ir::condcodes::IntCC::Equal, refcount, one);
-
-                let last_blk = self.builder.create_block();
-                let merge_blk = self.builder.create_block();
-                self.builder.ins().brif(is_last, last_blk, &[], merge_blk, &[]);
-
-                self.builder.switch_to_block(last_blk);
-                self.builder.seal_block(last_blk);
-                if elem_ty.is_tensor() {
-                    let len_val = self.builder.ins().load(I64, cranelift_codegen::ir::MemFlags::trusted(), ptr, 8);
-                    self.emit_list_element_drop_loop(ptr, len_val)?;
-                }
-                // Struct/Enum/Array-typed List elements are out of V4 scope (ADR-0034
-                // — the capstone only ever instantiates `List<Tensor<f32>>`); silently
-                // skipped rather than attempted, matching the documented fence.
-                self.builder.ins().jump(merge_blk, &[]);
-
-                self.builder.switch_to_block(merge_blk);
-                self.builder.seal_block(merge_blk);
+                self.emit_if_last_ref(ptr, |s| {
+                    if elem_ty.owns_heap_resources() {
+                        let len_val = s.builder.ins().load(
+                            I64, cranelift_codegen::ir::MemFlags::trusted(), ptr, 8,
+                        );
+                        s.emit_drop_elems_loop(ptr, 16, len_val, &elem_ty)?;
+                    }
+                    Ok(())
+                })?;
                 self.call_list_release(ptr);
                 Ok(false)
             }
@@ -1052,10 +1038,12 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
             TypedStmt::DropTuple { name, droppable_fields } => {
                 let ptr = self.use_var(name)?;
                 let droppable_fields = droppable_fields.clone();
-                for (slot_idx, field_ty) in &droppable_fields {
-                    let offset = 8 + (*slot_idx as i32) * 8;
-                    self.emit_drop_field(ptr, offset, field_ty)?;
-                }
+                self.emit_if_last_ref(ptr, |s| {
+                    for (slot_idx, field_ty) in &droppable_fields {
+                        s.emit_drop_field(ptr, 8 + (*slot_idx as i32) * 8, field_ty)?;
+                    }
+                    Ok(())
+                })?;
                 self.call_aggregate_release(ptr);
                 Ok(false)
             }
@@ -1227,74 +1215,170 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
     /// - Struct  → recursively release struct fields, then `heap_free`
     /// - Enum    → tag-switch, per-arm release, then `heap_free`
     /// All other types carry no heap resources and are skipped.
+    /// M34 (done-when #1): release exactly one owned reference to the value
+    /// in the 8-byte slot at `base_ptr + byte_offset`, recursing by type via
+    /// `emit_drop_value`. No-op for types that own no heap resources.
     fn emit_drop_field(
         &mut self,
         base_ptr: cranelift_codegen::ir::Value,
         byte_offset: i32,
         ty: &malus_sema::ResolvedTy,
     ) -> Result<(), CodegenError> {
+        if !ty.owns_heap_resources() {
+            return Ok(());
+        }
+        let handle = self.builder.ins().load(
+            I64, cranelift_codegen::ir::MemFlags::trusted(), base_ptr, byte_offset,
+        );
+        self.emit_drop_value(handle, ty)
+    }
+
+    /// M34: the single recursive drop emitter (ADR-0036 / ADR-0040). Releases
+    /// exactly one owned reference to `val` of type `ty`:
+    ///
+    ///   - `Tensor` → `tensor_release`.
+    ///   - ARC'd aggregates (struct / enum / tuple / `List`) release their
+    ///     contents ONLY on last-ref (refcount peek == 1), then decrement the
+    ///     box. A shared box — a list element also bound elsewhere, an
+    ///     aliased struct — must not have its contents freed while siblings
+    ///     hold references; pre-M34, struct/tuple/enum field release was
+    ///     unconditional (sound only under a static rc==1-at-drop invariant
+    ///     that `List` elements break).
+    ///   - `Array` is headerless and singly-owned: elements then `heap_free`,
+    ///     unconditionally.
+    ///
+    /// The peek is a plain read, safe under the single-threaded JIT execution
+    /// model. Ordering is load-bearing: the release call that may deallocate
+    /// the box is always LAST — nothing reads through `val` after it.
+    fn emit_drop_value(
+        &mut self,
+        val: cranelift_codegen::ir::Value,
+        ty: &malus_sema::ResolvedTy,
+    ) -> Result<(), CodegenError> {
         use malus_sema::ResolvedTy;
         match ty {
             ResolvedTy::Tensor { .. } => {
-                let handle = self.builder.ins().load(
-                    I64, cranelift_codegen::ir::MemFlags::trusted(), base_ptr, byte_offset,
-                );
-                self.call_runtime_release(handle);
+                self.call_runtime_release(val);
             }
             ResolvedTy::Struct { fields, .. } => {
-                let nested_ptr = self.builder.ins().load(
-                    I64, cranelift_codegen::ir::MemFlags::trusted(), base_ptr, byte_offset,
-                );
                 let droppable: Vec<(usize, ResolvedTy)> = fields.iter()
                     .enumerate()
                     .filter_map(|(i, (_, fty))| {
-                        if fty.is_tensor() || fty.is_struct() || fty.is_enum() {
-                            Some((i, fty.clone()))
-                        } else {
-                            None
-                        }
+                        if fty.owns_heap_resources() { Some((i, fty.clone())) } else { None }
                     })
                     .collect();
-                for (fidx, fty) in &droppable {
-                    self.emit_drop_field(nested_ptr, 8 + (*fidx as i32) * 8, fty)?;
-                }
-                self.call_aggregate_release(nested_ptr);
+                self.emit_if_last_ref(val, |s| {
+                    for (slot_idx, fty) in &droppable {
+                        s.emit_drop_field(val, 8 + (*slot_idx as i32) * 8, fty)?;
+                    }
+                    Ok(())
+                })?;
+                self.call_aggregate_release(val);
+            }
+            ResolvedTy::Tuple(elems) => {
+                let droppable: Vec<(usize, ResolvedTy)> = elems.iter()
+                    .enumerate()
+                    .filter_map(|(i, ety)| {
+                        if ety.owns_heap_resources() { Some((i, ety.clone())) } else { None }
+                    })
+                    .collect();
+                self.emit_if_last_ref(val, |s| {
+                    for (slot_idx, ety) in &droppable {
+                        s.emit_drop_field(val, 8 + (*slot_idx as i32) * 8, ety)?;
+                    }
+                    Ok(())
+                })?;
+                self.call_aggregate_release(val);
             }
             ResolvedTy::Enum { variants, .. } => {
-                let nested_ptr = self.builder.ins().load(
-                    I64, cranelift_codegen::ir::MemFlags::trusted(), base_ptr, byte_offset,
-                );
                 let drop_variants: Vec<(u32, Vec<(usize, ResolvedTy)>, Vec<usize>)> = variants.iter()
                     .enumerate()
                     .map(|(tag, (_, vfields))| {
                         let droppable = vfields.iter()
                             .enumerate()
                             .filter_map(|(i, (_, vty))| {
-                                if vty.is_tensor() || vty.is_struct() || vty.is_enum() {
-                                    Some((i, vty.clone()))
-                                } else {
-                                    None
-                                }
+                                if vty.owns_heap_resources() { Some((i, vty.clone())) } else { None }
                             })
                             .collect();
                         (tag as u32, droppable, vec![])
                     })
                     .collect();
-                self.emit_drop_enum_box(nested_ptr, &drop_variants)?;
+                self.emit_if_last_ref(val, |s| s.emit_enum_payload_release(val, &drop_variants))?;
+                self.call_aggregate_release(val);
+            }
+            ResolvedTy::List { elem } => {
+                let elem_ty = (**elem).clone();
+                self.emit_if_last_ref(val, |s| {
+                    if elem_ty.owns_heap_resources() {
+                        // Length word at offset 8; elements start at 16 (ADR-0034).
+                        let len_val = s.builder.ins().load(
+                            I64, cranelift_codegen::ir::MemFlags::trusted(), val, 8,
+                        );
+                        s.emit_drop_elems_loop(val, 16, len_val, &elem_ty)?;
+                    }
+                    Ok(())
+                })?;
+                self.call_list_release(val);
+            }
+            ResolvedTy::Array { elem, len } => {
+                if elem.owns_heap_resources() {
+                    let len_val = self.builder.ins().iconst(I64, *len as i64);
+                    self.emit_drop_elems_loop(val, 0, len_val, elem)?;
+                }
+                self.call_heap_free(val);
             }
             _ => {}
         }
         Ok(())
     }
 
-    /// Emit a tag-switch drop for an enum box pointer.
-    /// Each variant arm releases its droppable fields; all arms jump to a merge
-    /// block that calls `heap_free` exactly once.
-    fn emit_drop_enum_box(
+    /// Refcount peek guard shared by every ARC'd aggregate drop: runs `body`
+    /// only when the box at `ptr` is about to lose its last reference
+    /// (header word == 1). The caller performs the actual decrement AFTER
+    /// this returns — the box may be freed by that call, so `body` is the
+    /// last point anything may read through `ptr`.
+    fn emit_if_last_ref<F>(
+        &mut self,
+        ptr: cranelift_codegen::ir::Value,
+        body: F,
+    ) -> Result<(), CodegenError>
+    where
+        F: FnOnce(&mut Self) -> Result<(), CodegenError>,
+    {
+        let refcount = self.builder.ins().load(
+            I64, cranelift_codegen::ir::MemFlags::trusted(), ptr, 0,
+        );
+        let one = self.builder.ins().iconst(I64, 1);
+        let is_last = self.builder.ins().icmp(
+            cranelift_codegen::ir::condcodes::IntCC::Equal, refcount, one,
+        );
+
+        let last_blk = self.builder.create_block();
+        let merge_blk = self.builder.create_block();
+        self.builder.ins().brif(is_last, last_blk, &[], merge_blk, &[]);
+
+        self.builder.switch_to_block(last_blk);
+        self.builder.seal_block(last_blk);
+        body(self)?;
+        self.builder.ins().jump(merge_blk, &[]);
+
+        self.builder.switch_to_block(merge_blk);
+        self.builder.seal_block(merge_blk);
+        Ok(())
+    }
+
+    /// Emit a tag-switch releasing the droppable payload fields of the enum
+    /// box at `ptr`. Payload fields start at offset 16 (ARC header + tag).
+    /// Does NOT release the box itself — the caller decides when (after its
+    /// peek guard).
+    fn emit_enum_payload_release(
         &mut self,
         ptr: cranelift_codegen::ir::Value,
         variants: &[(u32, Vec<(usize, malus_sema::ResolvedTy)>, Vec<usize>)],
     ) -> Result<(), CodegenError> {
+        if variants.is_empty() {
+            return Ok(());
+        }
         // Tag is at offset 8 (after the 8-byte ARC header).
         let tag = self.builder.ins().load(
             I32, cranelift_codegen::ir::MemFlags::trusted(), ptr, 8,
@@ -1304,13 +1388,7 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
         let arm_test_blks: Vec<_> = variants.iter().map(|_| self.builder.create_block()).collect();
         let unreachable_blk = self.builder.create_block();
 
-        if let Some(&first) = arm_test_blks.first() {
-            self.builder.ins().jump(first, &[]);
-        } else {
-            // No variants — release the box and return.
-            self.call_aggregate_release(ptr);
-            return Ok(());
-        }
+        self.builder.ins().jump(arm_test_blks[0], &[]);
 
         let variants_clone: Vec<(u32, Vec<(usize, malus_sema::ResolvedTy)>, Vec<usize>)> = variants.to_vec();
         for (i, (variant_tag, droppable_fields, _)) in variants_clone.iter().enumerate() {
@@ -1330,7 +1408,6 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
             self.builder.switch_to_block(body_blk);
             self.builder.seal_block(body_blk);
 
-            // Release droppable fields (payload starts at offset 16 after ARC header + tag).
             let droppable = droppable_fields.clone();
             for (slot_idx, field_ty) in &droppable {
                 let offset = 16 + (*slot_idx as i32) * 8;
@@ -1345,126 +1422,23 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
 
         self.builder.switch_to_block(merge_blk);
         self.builder.seal_block(merge_blk);
-        self.call_aggregate_release(ptr);
-
         Ok(())
     }
 
-    /// Emit a counted loop that calls `emit_drop_field` for each element of a
-    /// fixed array at `arr_ptr`.  Elements are at `arr_ptr + i * 8`.
-    /// Only called when `elem_ty` owns heap resources.
-    fn emit_counted_drop_loop(
+    /// Emit a counted loop over 8-byte element slots starting at
+    /// `base_ptr + base_off` (0 for headerless `Array`, 16 for `List`'s ARC
+    /// header + length word), releasing each element via `emit_drop_value`.
+    /// `len_val` is a runtime value — compile-time lengths pass an `iconst`.
+    /// Unifies the pre-M34 `emit_counted_drop_loop` (Array, compile-time len,
+    /// tensor/struct/enum/array elements) and `emit_list_element_drop_loop`
+    /// (List, runtime len, tensor elements ONLY — the `List<Struct>` leak
+    /// this milestone fixes).
+    fn emit_drop_elems_loop(
         &mut self,
-        arr_ptr: cranelift_codegen::ir::Value,
-        elem_ty: &malus_sema::ResolvedTy,
-        len: usize,
-    ) -> Result<(), CodegenError> {
-        let idx_var = Variable::from_u32(self.next_var as u32);
-        self.next_var += 1;
-        self.builder.declare_var(idx_var, I64);
-        let zero = self.builder.ins().iconst(I64, 0);
-        self.builder.def_var(idx_var, zero);
-
-        let header_blk = self.builder.create_block();
-        let body_blk   = self.builder.create_block();
-        let exit_blk   = self.builder.create_block();
-
-        self.builder.ins().jump(header_blk, &[]);
-
-        self.builder.switch_to_block(header_blk);
-        let cur = self.builder.use_var(idx_var);
-        let len_val = self.builder.ins().iconst(I64, len as i64);
-        let cmp = self.builder.ins().icmp(
-            cranelift_codegen::ir::condcodes::IntCC::SignedLessThan, cur, len_val,
-        );
-        self.builder.ins().brif(cmp, body_blk, &[], exit_blk, &[]);
-
-        self.builder.switch_to_block(body_blk);
-        self.builder.seal_block(body_blk);
-        // Compute byte offset: arr_ptr + i * 8
-        let body_cur = self.builder.use_var(idx_var);
-        let eight = self.builder.ins().iconst(I64, 8);
-        let byte_off = self.builder.ins().imul(body_cur, eight);
-        let elem_ptr = self.builder.ins().iadd(arr_ptr, byte_off);
-        // Elements are values stored by value — load the handle from the slot.
-        let handle = self.builder.ins().load(
-            I64, cranelift_codegen::ir::MemFlags::trusted(), elem_ptr, 0,
-        );
-        // Drop the element at ptr=handle (the slot IS the pointer for agg types).
-        let elem_ty_clone = elem_ty.clone();
-        match &elem_ty_clone {
-            malus_sema::ResolvedTy::Tensor { .. } => {
-                self.call_runtime_release(handle);
-            }
-            malus_sema::ResolvedTy::Struct { fields, .. } => {
-                let droppable: Vec<(usize, malus_sema::ResolvedTy)> = fields.iter().enumerate()
-                    .filter_map(|(i, (_, ty))| {
-                        if ty.is_tensor() || ty.is_struct() || ty.is_enum() || ty.is_array() {
-                            Some((i, ty.clone()))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                for (slot_idx, field_ty) in &droppable {
-                    let offset = 8 + (*slot_idx as i32) * 8;
-                    self.emit_drop_field(handle, offset, field_ty)?;
-                }
-                self.call_aggregate_release(handle);
-            }
-            malus_sema::ResolvedTy::Enum { variants, .. } => {
-                let drop_variants: Vec<(u32, Vec<(usize, malus_sema::ResolvedTy)>, Vec<usize>)> = variants.iter()
-                    .enumerate()
-                    .map(|(vi, (_, vfields))| {
-                        let droppable: Vec<(usize, malus_sema::ResolvedTy)> = vfields.iter().enumerate()
-                            .filter_map(|(fi, (_, fty))| {
-                                if fty.is_tensor() || fty.is_struct() || fty.is_enum() || fty.is_array() {
-                                    Some((fi, fty.clone()))
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect();
-                        (vi as u32, droppable, vec![])
-                    })
-                    .collect();
-                self.emit_drop_enum_box(handle, &drop_variants)?;
-            }
-            malus_sema::ResolvedTy::Array { elem, len } => {
-                let inner_elem = *elem.clone();
-                let inner_len = *len;
-                if inner_elem.is_tensor() || inner_elem.is_struct() || inner_elem.is_enum() || inner_elem.is_array() {
-                    self.emit_counted_drop_loop(handle, &inner_elem, inner_len)?;
-                }
-                self.call_heap_free(handle);
-            }
-            _ => {}
-        }
-        // Advance index.
-        let cur2 = self.builder.use_var(idx_var);
-        let one = self.builder.ins().iconst(I64, 1);
-        let next = self.builder.ins().iadd(cur2, one);
-        self.builder.def_var(idx_var, next);
-        self.builder.ins().jump(header_blk, &[]);
-        self.builder.seal_block(header_blk);
-
-        self.builder.switch_to_block(exit_blk);
-        self.builder.seal_block(exit_blk);
-
-        Ok(())
-    }
-
-    /// M28: emit a loop that releases each `Tensor`-typed element of a
-    /// `List<Tensor<f32>>` at `list_ptr`, for a RUNTIME-known `len_val` (unlike
-    /// `emit_counted_drop_loop`'s compile-time `len: usize` — `List` carries its
-    /// length in the box, not the type). Elements start at offset 16 (ARC header
-    /// + length word), not `Array`'s 0. Only called when the caller has already
-    /// confirmed `elem_ty.is_tensor()` — V4 scope is `List<Tensor<f32>>` only
-    /// (ADR-0034); non-tensor List elements are not released here.
-    fn emit_list_element_drop_loop(
-        &mut self,
-        list_ptr: cranelift_codegen::ir::Value,
+        base_ptr: cranelift_codegen::ir::Value,
+        base_off: i32,
         len_val: cranelift_codegen::ir::Value,
+        elem_ty: &malus_sema::ResolvedTy,
     ) -> Result<(), CodegenError> {
         let idx_var = Variable::from_u32(self.next_var as u32);
         self.next_var += 1;
@@ -1490,12 +1464,11 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
         let body_cur = self.builder.use_var(idx_var);
         let eight = self.builder.ins().iconst(I64, 8);
         let byte_off = self.builder.ins().imul(body_cur, eight);
-        let elem_off = self.builder.ins().iadd_imm(byte_off, 16);
-        let elem_ptr = self.builder.ins().iadd(list_ptr, elem_off);
+        let elem_ptr = self.builder.ins().iadd(base_ptr, byte_off);
         let handle = self.builder.ins().load(
-            I64, cranelift_codegen::ir::MemFlags::trusted(), elem_ptr, 0,
+            I64, cranelift_codegen::ir::MemFlags::trusted(), elem_ptr, base_off,
         );
-        self.call_runtime_release(handle);
+        self.emit_drop_value(handle, elem_ty)?;
         let cur2 = self.builder.use_var(idx_var);
         let one = self.builder.ins().iconst(I64, 1);
         let next = self.builder.ins().iadd(cur2, one);

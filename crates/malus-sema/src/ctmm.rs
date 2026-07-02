@@ -734,7 +734,7 @@ fn make_drop_stmt_for_ty(name: &str, ty: &ResolvedTy) -> Option<TypedStmt> {
                 .iter()
                 .enumerate()
                 .filter_map(|(i, ty)| {
-                    if ty.is_tensor() {
+                    if ty.owns_heap_resources() {
                         Some((i, ty.clone()))
                     } else {
                         None
@@ -764,12 +764,16 @@ fn make_drop_stmt_for_ty(name: &str, ty: &ResolvedTy) -> Option<TypedStmt> {
     }
 }
 
+// M34: field/element droppability is the shared `owns_heap_resources`
+// predicate (ty.rs) — pre-M34 these filters skipped `List` (and `Array`,
+// `Tuple`) fields entirely, so a struct holding a `List<Tensor<f32>>` leaked
+// the whole list on drop.
 fn droppable_struct_fields(fields: &[(String, ResolvedTy)]) -> Vec<(usize, ResolvedTy)> {
     fields
         .iter()
         .enumerate()
         .filter_map(|(i, (_, ty))| {
-            if ty.is_tensor() || ty.is_struct() || ty.is_enum() {
+            if ty.owns_heap_resources() {
                 Some((i, ty.clone()))
             } else {
                 None
@@ -789,7 +793,7 @@ fn droppable_enum_variants(
                 .iter()
                 .enumerate()
                 .filter_map(|(i, (_, ty))| {
-                    if ty.is_tensor() || ty.is_struct() || ty.is_enum() {
+                    if ty.owns_heap_resources() {
                         Some((i, ty.clone()))
                     } else {
                         None

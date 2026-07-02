@@ -1542,3 +1542,136 @@ fn main():
 "#;
     run_metal_src(src);
 }
+
+// M34 done-when #1: a dropped `List<Block>` frees every tensor inside every
+// block. Pre-M34, DropList released only tensor-typed elements — struct
+// elements (and their tensor-holding List fields) were silently skipped.
+// The assertion is an exact refcount balance over steady-state iterations:
+// every alloc starts at rc=1 and every retain adds 1, so full cleanup means
+// releases == allocs + retains, per iteration, exactly.
+#[test]
+fn test_m34_list_of_struct_drop_frees_every_tensor() {
+    let _guard = METAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let run = |iters: i64| -> (i64, i64, i64) {
+        let src = format!(
+            r#"
+struct Block:
+    params: List<Tensor<f32>>
+
+fn make_block() -> Block:
+    return Block(params=[randn(4, 4), randn(4, 4)])
+
+fn make_blocks() -> List<Block>:
+    return [make_block(), make_block()]
+
+fn main():
+    for i in range({iters}):
+        let blocks = make_blocks()
+        print(blocks[0].params[0])
+"#
+        );
+        let user_program = parse(malus_syntax::FileId(0), &src).expect("parse failed");
+        let mut stdlib = malus_stdlib::stdlib_items();
+        stdlib.extend(user_program.items.into_iter());
+        let program = malus_syntax::ast::Program { items: stdlib };
+        let aliases = HashMap::new();
+        let typed = check(&program, &aliases).expect("type check failed");
+        let (registry, kernel_ids) =
+            malus_codegen_gpu::compile_kernels(&typed).expect("kernel compilation failed");
+        malus_runtime::runtime_init(&registry.into_hashmap());
+        let symbols = real_symbols();
+        malus_runtime::malus_rc_reset();
+        compile_and_run(&typed, &symbols, &kernel_ids).expect("JIT compile and run failed");
+        malus_runtime::malus_rc_counts()
+    };
+
+    let (ret3, rel3, alloc3) = run(3);
+    let (ret4, rel4, alloc4) = run(4);
+    let (d_ret, d_rel, d_alloc) = (ret4 - ret3, rel4 - rel3, alloc4 - alloc3);
+    assert!(d_alloc >= 4, "expected at least 4 tensor allocs per iteration, got {d_alloc}");
+    assert_eq!(
+        d_rel,
+        d_alloc + d_ret,
+        "per-iteration RC flow must balance to zero live tensors: \
+         releases {d_rel} != allocs {d_alloc} + retains {d_ret} \
+         (a shortfall means tensors inside dropped List<Block> leaked)"
+    );
+}
+
+// M34 done-when #1, nested-List arm: `List<List<Tensor<f32>>>` drops recurse
+// through the inner list boxes.
+#[test]
+fn test_m34_nested_list_drop_frees_inner_tensors() {
+    let _guard = METAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let run = |iters: i64| -> (i64, i64, i64) {
+        let src = format!(
+            r#"
+fn make_inner() -> List<Tensor<f32>>:
+    return [randn(4, 4), randn(4, 4)]
+
+fn make_nested() -> List<List<Tensor<f32>>>:
+    return [make_inner(), make_inner()]
+
+fn main():
+    for i in range({iters}):
+        let nested = make_nested()
+        print(nested[0][0])
+"#
+        );
+        let user_program = parse(malus_syntax::FileId(0), &src).expect("parse failed");
+        let mut stdlib = malus_stdlib::stdlib_items();
+        stdlib.extend(user_program.items.into_iter());
+        let program = malus_syntax::ast::Program { items: stdlib };
+        let aliases = HashMap::new();
+        let typed = check(&program, &aliases).expect("type check failed");
+        let (registry, kernel_ids) =
+            malus_codegen_gpu::compile_kernels(&typed).expect("kernel compilation failed");
+        malus_runtime::runtime_init(&registry.into_hashmap());
+        let symbols = real_symbols();
+        malus_runtime::malus_rc_reset();
+        compile_and_run(&typed, &symbols, &kernel_ids).expect("JIT compile and run failed");
+        malus_runtime::malus_rc_counts()
+    };
+
+    let (ret3, rel3, alloc3) = run(3);
+    let (ret4, rel4, alloc4) = run(4);
+    let (d_ret, d_rel, d_alloc) = (ret4 - ret3, rel4 - rel3, alloc4 - alloc3);
+    assert!(d_alloc >= 4, "expected at least 4 tensor allocs per iteration, got {d_alloc}");
+    assert_eq!(
+        d_rel,
+        d_alloc + d_ret,
+        "nested-list RC flow must balance: releases {d_rel} != allocs {d_alloc} + retains {d_ret}"
+    );
+}
+
+// M34 negative test: an ALIASED list (rc > 1 at the alias's DropList) must
+// NOT release its elements — the model's own copy is still live and must
+// keep working after the alias dies. This is the peek-guard contract.
+#[test]
+fn test_m34_aliased_list_drop_does_not_free_elements() {
+    let src = r#"
+struct GPT:
+    params: List<Tensor<f32>>
+
+trait Module:
+    fn parameters(self) -> List<Tensor<f32>>
+
+impl Module for GPT:
+    fn parameters(self) -> List<Tensor<f32>>:
+        return self.params
+
+fn peek(model: GPT):
+    let ps = model.parameters()
+    print(ps[0])
+
+fn main():
+    let gpt = GPT(params=[randn(4, 4), randn(4, 4)])
+    for i in range(5):
+        peek(gpt)
+    print(gpt.params[0])
+    print(gpt.params[1])
+"#;
+    run_metal_src(src);
+}

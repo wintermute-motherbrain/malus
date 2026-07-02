@@ -143,6 +143,26 @@ impl ResolvedTy {
             _ => None,
         }
     }
+
+    /// M34: the single predicate for "does a value of this type own heap
+    /// resources a drop must release?" — shared by CTMM's droppable-field
+    /// filters and codegen's recursive drop emitter, so a container element
+    /// or aggregate field of any of these types is never silently skipped.
+    /// `Str` is a leaked whole-program-lifetime buffer (ADR-0018) and
+    /// `Buffer` drops only as a standalone binding (`DropBuffer`), matching
+    /// pre-M34 behavior.
+    pub fn owns_heap_resources(&self) -> bool {
+        match self {
+            ResolvedTy::Tensor { .. }
+            | ResolvedTy::Struct { .. }
+            | ResolvedTy::Enum { .. }
+            | ResolvedTy::List { .. }
+            // The array box itself is heap-allocated, whatever its elements.
+            | ResolvedTy::Array { .. } => true,
+            ResolvedTy::Tuple(elems) => elems.iter().any(|t| t.owns_heap_resources()),
+            _ => false,
+        }
+    }
 }
 
 pub fn scalar_ty_name(s: &ScalarTy) -> &'static str {
