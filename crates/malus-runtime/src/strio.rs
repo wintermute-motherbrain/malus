@@ -4,10 +4,16 @@
 // heap-allocated `StrBox { ptr: *const u8, len: usize }`.  All StrBoxes are
 // leaked (whole-program lifetime per ADR-0018); none are freed.
 
+// codegen-cpu's print shim mirrors the {ptr, len} prefix (StrBoxLayout) —
+// new fields must be appended, never inserted.
 #[repr(C)]
 pub struct StrBox {
     pub ptr: *const u8,
     pub len: usize,
+    // Computed once at construction so str_char_at can index bytes directly
+    // on ASCII text instead of re-validating + scanning the whole string per
+    // call (that was O(n²) over a tokenize loop — 40s on tiny_shakespeare).
+    pub ascii: bool,
 }
 
 unsafe impl Send for StrBox {}
@@ -22,7 +28,8 @@ unsafe fn deref(handle: i64) -> &'static StrBox {
 /// Used by codegen to materialise `Lit::Str` values at JIT time.
 #[no_mangle]
 pub extern "C" fn malus_str_box(ptr: *const u8, len: usize) -> i64 {
-    let b = Box::new(StrBox { ptr, len });
+    let ascii = unsafe { std::slice::from_raw_parts(ptr, len) }.iter().all(|&b| b < 128);
+    let b = Box::new(StrBox { ptr, len, ascii });
     Box::into_raw(b) as i64
 }
 
@@ -39,8 +46,9 @@ pub extern "C" fn malus_read_file(path_handle: i64) -> i64 {
         .unwrap_or_else(|e| panic!("malus: read_file({:?}): {}", path, e));
     let bytes = content.into_bytes();
     let len = bytes.len();
+    let ascii = bytes.iter().all(|&b| b < 128);
     let ptr = Box::into_raw(bytes.into_boxed_slice()) as *const u8;
-    let sb2 = Box::new(StrBox { ptr, len });
+    let sb2 = Box::new(StrBox { ptr, len, ascii });
     Box::into_raw(sb2) as i64
 }
 
@@ -54,13 +62,20 @@ pub extern "C" fn malus_str_len(handle: i64) -> i64 {
 }
 
 /// Return the i-th Unicode scalar value (codepoint) in the string, or -1 if
-/// idx is out of range.  O(n) in the character position — suitable for small
-/// vocabularies (the tiny-Shakespeare char set is ASCII-only).
-/// Both index and return value are i64 to match malus's native integer width.
+/// idx is out of range.  O(1) for ASCII strings (char index == byte index,
+/// `ascii` precomputed at construction); O(n) in the character position only
+/// for strings containing multi-byte sequences.  Both index and return value
+/// are i64 to match malus's native integer width.
 #[no_mangle]
 pub extern "C" fn malus_str_char_at(handle: i64, idx: i64) -> i64 {
     let sb = unsafe { deref(handle) };
     let bytes = unsafe { std::slice::from_raw_parts(sb.ptr, sb.len) };
+    if sb.ascii {
+        if idx < 0 || idx as usize >= sb.len {
+            return -1;
+        }
+        return bytes[idx as usize] as i64;
+    }
     let s = std::str::from_utf8(bytes).unwrap_or("");
     match s.chars().nth(idx as usize) {
         Some(c) => c as i64,
@@ -78,7 +93,8 @@ pub extern "C" fn malus_str_from_char(c: i64) -> i64 {
     let encoded = ch.encode_utf8(&mut tmp);
     let bytes = encoded.as_bytes().to_vec();
     let len = bytes.len();
+    let ascii = ch.is_ascii();
     let ptr = Box::into_raw(bytes.into_boxed_slice()) as *const u8;
-    let sb = Box::new(StrBox { ptr, len });
+    let sb = Box::new(StrBox { ptr, len, ascii });
     Box::into_raw(sb) as i64
 }

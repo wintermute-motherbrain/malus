@@ -273,3 +273,18 @@ Supporting notes, same day:
   a 4-arg `permute` silently fell back to a CPU loop (`permute_by_perm`,
   now `cpu_fallback`-only), contradicting the M33 spec's premise that the
   4-D forward "already worked" as a GPU path.
+
+### Startup-cost correction (2026-07-02, post-M33)
+
+M30 attributed the ~40 s one-time process cost to "startup, MSL compile,
+data load/tokenize, JIT". Measured attribution: **~40.2 s of it was the
+char-tokenize loop alone** — `str_char_at` re-validated the entire 1.1 MB
+string as UTF-8 *and* scanned to the i-th char on every call (O(n²) over
+the loop; its doc even said "suitable for small vocabularies"). The whole
+compile pipeline (parse → sema → MSL compile of the full stdlib → Metal
+pipeline creation → JIT) measures 0.044 s. Fixed by precomputing an
+`ascii` flag per `StrBox` at construction: ASCII strings take an O(1)
+byte-index path (multi-byte strings keep the char-indexed scan). Tokenize:
+40.4 s → 0.32 s; whole-process `nanogpt.ml` run: ~42.5 s → **2.15 s**.
+Warm per-step median unaffected (tokenize is outside the timed region) —
+this changes no benchmark number, only the wall-clock sanity line.

@@ -1842,3 +1842,23 @@ fn test_m32_mem_budget_valve_recycles_under_pressure() {
     crate::malus_set_mem_budget(-1);
     crate::malus_pool_reset();
 }
+
+#[test]
+fn test_str_char_at_ascii_fast_path_and_utf8_fallback() {
+    use crate::strio::{malus_str_box, malus_str_char_at};
+    // ASCII: O(1) byte-index fast path (ascii flag computed at construction).
+    let ascii = b"hello";
+    let h = malus_str_box(ascii.as_ptr(), ascii.len());
+    assert_eq!(malus_str_char_at(h, 0), 'h' as i64);
+    assert_eq!(malus_str_char_at(h, 4), 'o' as i64);
+    assert_eq!(malus_str_char_at(h, 5), -1);
+    assert_eq!(malus_str_char_at(h, -1), -1);
+    // Non-ASCII: falls back to the char-indexed scan; "aé€" is 1+2+3 bytes
+    // but char index 1 must return é and 2 must return €.
+    let uni = "aé€".as_bytes();
+    let h2 = malus_str_box(uni.as_ptr(), uni.len());
+    assert_eq!(malus_str_char_at(h2, 0), 'a' as i64);
+    assert_eq!(malus_str_char_at(h2, 1), 'é' as i64);
+    assert_eq!(malus_str_char_at(h2, 2), '€' as i64);
+    assert_eq!(malus_str_char_at(h2, 3), -1);
+}
