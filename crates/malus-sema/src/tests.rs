@@ -2013,9 +2013,16 @@ fn test_retain_sites_grad_tracked_tensor_ident_is_a_tensor_site() {
 }
 
 #[test]
-fn test_retain_sites_non_grad_tracked_tensor_ident_is_not_a_site() {
+fn test_retain_sites_non_grad_tracked_tensor_ident_is_also_a_site() {
+    // M34: alias retains are unconditional on grad tracking — the alias
+    // binding's static Drop never was grad-gated, so an ungated retain is
+    // required to balance it (`let b = a; sum(b); sum(a)` double-released
+    // pre-M34). demote_safe_borrows strips the provably-redundant pairs.
     let expr = ident_expr("a", tensor_ty(), false);
-    assert!(retain_sites(&expr).is_empty());
+    let sites = retain_sites(&expr);
+    assert_eq!(sites.len(), 1);
+    assert_eq!(sites[0].target, RetainTarget::Source("a".to_string()));
+    assert_eq!(sites[0].kind, RetainKind::Tensor);
 }
 
 #[test]
@@ -2060,7 +2067,9 @@ fn test_retain_sites_non_data_field_access_is_not_a_site() {
 }
 
 #[test]
-fn test_retain_sites_array_literal_only_retains_grad_tracked_ident_elements() {
+fn test_retain_sites_array_literal_retains_all_tensor_ident_elements() {
+    // M34: element retains are unconditional on grad tracking (see the
+    // ungated-Ident test above) — both `a` and `b` are sites.
     let elements = vec![
         ident_expr("a", tensor_ty(), true),
         ident_expr("b", tensor_ty(), false),
@@ -2073,10 +2082,10 @@ fn test_retain_sites_array_literal_only_retains_grad_tracked_ident_elements() {
         grad_tracked: true,
     };
     let sites = retain_sites(&expr);
-    assert_eq!(sites.len(), 1);
-    assert_eq!(sites[0].target, RetainTarget::Source("a".to_string()));
-    assert_eq!(sites[0].shape, AliasShape::ArrayElem);
-    assert_eq!(sites[0].kind, RetainKind::Tensor);
+    assert_eq!(sites.len(), 2);
+    assert!(sites.iter().all(|s| s.shape == AliasShape::ArrayElem && s.kind == RetainKind::Tensor));
+    assert!(sites.iter().any(|s| s.target == RetainTarget::Source("a".to_string())));
+    assert!(sites.iter().any(|s| s.target == RetainTarget::Source("b".to_string())));
 }
 
 #[test]
@@ -2127,4 +2136,199 @@ fn test_retain_sites_index_expr_is_a_binding_target_site() {
     assert_eq!(sites[0].target, RetainTarget::Binding);
     assert_eq!(sites[0].shape, AliasShape::Index);
     assert_eq!(sites[0].kind, RetainKind::Tensor);
+}
+
+// ── M34: named submodules — sema lock-in tests ───────────────────────────────
+
+/// M34 (done-when #2): a trait impl may carry methods the trait doesn't
+/// declare — registered as inherent methods with the same mangling/dispatch
+/// map (`Block__forward`), so `blk.forward(x)` works without widening the
+/// Module trait's contract (ADR-0036).
+#[test]
+fn test_impl_inherent_method_beside_trait_method_dispatches() {
+    let src = r#"
+struct Block:
+    params: List<Tensor<f32>>
+
+trait Module:
+    fn parameters(self) -> List<Tensor<f32>>
+
+impl Module for Block:
+    fn parameters(self) -> List<Tensor<f32>>:
+        return self.params
+    fn forward(self, x: Tensor<f32>) -> Tensor<f32>:
+        return x @ self.params[0]
+
+fn main():
+    let blk = Block(params=[variable(Tensor.gpu<f32>([[1.0, 0.0], [0.0, 1.0]]))])
+    let y = blk.forward(Tensor.gpu<f32>([[1.0, 2.0], [3.0, 4.0]]))
+    print(y)
+"#;
+    check_src(src).expect("inherent method beside trait method should type-check");
+}
+
+/// A method whose NAME matches a trait method but whose signature diverges
+/// is still an error — inherent registration applies only to names the trait
+/// doesn't declare.
+#[test]
+fn test_impl_trait_name_with_wrong_signature_still_errors() {
+    let src = r#"
+struct Block:
+    params: List<Tensor<f32>>
+
+trait Module:
+    fn parameters(self) -> List<Tensor<f32>>
+
+impl Module for Block:
+    fn parameters(self) -> Tensor<f32>:
+        return self.params[0]
+
+fn main():
+    let blk = Block(params=[variable(Tensor.gpu<f32>([1.0]))])
+    print(blk.params[0])
+"#;
+    let errors = check_src(src).expect_err("signature mismatch must still error");
+    assert!(
+        errors.iter().any(|e| matches!(e, SemaError::ImplMethodMismatch { method, .. } if method == "parameters")),
+        "expected ImplMethodMismatch for parameters, got: {errors:?}"
+    );
+}
+
+/// M34 (done-when #2): a `for blk in list` loop variable over `List<Struct>`
+/// is a BORROW of the list-owned element — CTMM must not emit any drop for
+/// it (a per-iteration DropStruct would release fields the list still owns).
+#[test]
+fn test_forin_over_list_of_struct_loop_var_gets_no_drop() {
+    let src = r#"
+struct Block:
+    params: List<Tensor<f32>>
+
+trait Module:
+    fn parameters(self) -> List<Tensor<f32>>
+
+impl Module for Block:
+    fn parameters(self) -> List<Tensor<f32>>:
+        return self.params
+    fn forward(self, x: Tensor<f32>) -> Tensor<f32>:
+        return x @ self.params[0]
+
+fn make_blocks() -> List<Block>:
+    return [
+        Block(params=[variable(Tensor.gpu<f32>([[1.0, 0.0], [0.0, 1.0]]))]),
+        Block(params=[variable(Tensor.gpu<f32>([[1.0, 0.0], [0.0, 1.0]]))])
+    ]
+
+fn main():
+    let blocks = make_blocks()
+    let mut x = Tensor.gpu<f32>([[1.0, 2.0], [3.0, 4.0]])
+    for blk in blocks:
+        x = blk.forward(x)
+    print(x)
+"#;
+    let typed = check_src(src).expect("should type-check");
+    let main = typed.fns.iter().find(|f| f.name == "main").unwrap();
+
+    fn assert_no_drop_of(stmts: &[TypedStmt], name: &str) {
+        for s in stmts {
+            match s {
+                TypedStmt::Drop { name: n }
+                | TypedStmt::DropStruct { name: n, .. }
+                | TypedStmt::Release { name: n } => {
+                    assert_ne!(n, name, "loop var `{name}` must not be dropped/released");
+                }
+                TypedStmt::If { then_body, else_body, .. } => {
+                    assert_no_drop_of(then_body, name);
+                    if let Some(eb) = else_body {
+                        assert_no_drop_of(eb, name);
+                    }
+                }
+                TypedStmt::For { body, .. }
+                | TypedStmt::While { body, .. }
+                | TypedStmt::ForIn { body, .. }
+                | TypedStmt::NoGrad { body } => assert_no_drop_of(body, name),
+                _ => {}
+            }
+        }
+    }
+    assert_no_drop_of(&main.body, "blk");
+}
+
+/// M34 (scope 2): grad-inference propagates through `List<Struct>` element
+/// field loads — `blocks[0].params[0]`-shaped reads of variable() tensors
+/// keep grad tracking, so a loss computed through block fields is
+/// grad-tracked.
+#[test]
+fn test_grad_inference_through_list_struct_element_params() {
+    let src = r#"
+struct Block:
+    params: List<Tensor<f32>>
+
+fn make_blocks() -> List<Block>:
+    return [Block(params=[variable(Tensor.gpu<f32>([[1.0, 0.0], [0.0, 1.0]]))])]
+
+fn main():
+    let blocks = make_blocks()
+    let x = Tensor.gpu<f32>([[1.0, 2.0], [3.0, 4.0]])
+    let y = x @ blocks[0].params[0]
+    let loss = sum(y)
+    print(loss)
+"#;
+    let typed = check_src(src).expect("should type-check");
+    let main = typed.fns.iter().find(|f| f.name == "main").unwrap();
+    let loss_tracked = main.body.iter().find_map(|s| match s {
+        TypedStmt::Let { name, expr } if name == "loss" => Some(expr.grad_tracked),
+        _ => None,
+    }).expect("Let loss not found");
+    assert!(loss_tracked, "loss through blocks[0].params[0] must be grad-tracked");
+}
+
+/// M34 (done-when #3): one generic optimizer monomorphizes for BOTH module
+/// types in the recursion (per-Block application + top-level GPT
+/// application).
+#[test]
+fn test_generic_optimizer_double_monomorphization() {
+    let src = r#"
+struct Block:
+    params: List<Tensor<f32>>
+
+struct GPT:
+    blocks: List<Block>
+    params: List<Tensor<f32>>
+
+trait Module:
+    fn parameters(self) -> List<Tensor<f32>>
+
+impl Module for Block:
+    fn parameters(self) -> List<Tensor<f32>>:
+        return self.params
+
+impl Module for GPT:
+    fn parameters(self) -> List<Tensor<f32>>:
+        return self.params
+
+fn adamw<M: Module>(model: M, lr: f32):
+    let mut ps = model.parameters()
+    for i in range(len(ps)):
+        ps[i] = variable(ps[i].data * lr)
+
+fn main():
+    let gpt = GPT(
+        blocks=[Block(params=[variable(Tensor.gpu<f32>([1.0]))])],
+        params=[variable(Tensor.gpu<f32>([2.0]))]
+    )
+    for i in range(len(gpt.blocks)):
+        adamw(gpt.blocks[i], 0.5)
+    adamw(gpt, 0.5)
+    print(gpt.params[0])
+"#;
+    let typed = check_src(src).expect("should type-check");
+    let names: Vec<&str> = typed.fns.iter().map(|f| f.name.as_str()).collect();
+    assert!(
+        names.iter().any(|n| n.contains("adamw") && n.contains("Block")),
+        "expected a Block monomorphization of adamw, got fns: {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n.contains("adamw") && n.contains("GPT")),
+        "expected a GPT monomorphization of adamw, got fns: {names:?}"
+    );
 }

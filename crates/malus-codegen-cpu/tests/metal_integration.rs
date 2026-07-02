@@ -1675,3 +1675,103 @@ fn main():
 "#;
     run_metal_src(src);
 }
+
+// M34 done-when #2 + #3: the full named-submodule pattern end-to-end —
+// inherent `blk.forward(x)` dispatch on a ForIn loop var over List<Block>,
+// per-submodule optimizer recursion (adamw applied to each Block plus once
+// to GPT's own tensors), double monomorphization of one generic adamw. The
+// loss comparison proves the ps[i] = variable(...) write-back lands in each
+// submodule's identity list: frozen weights would leave the loss unchanged.
+#[test]
+fn test_m34_named_submodules_optimizer_recursion_trains() {
+    let _guard = METAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    fn modular_src(steps: i64) -> String {
+        format!(
+            r#"
+struct Block:
+    params: List<Tensor<f32>>
+
+struct GPT:
+    blocks: List<Block>
+    params: List<Tensor<f32>>
+
+trait Module:
+    fn parameters(self) -> List<Tensor<f32>>
+
+impl Module for Block:
+    fn parameters(self) -> List<Tensor<f32>>:
+        return self.params
+    fn forward(self, x: Tensor<f32>) -> Tensor<f32>:
+        let WQ = 0
+        let WO = 1
+        let a = relu(x @ self.params[WQ])
+        return a @ self.params[WO]
+
+impl Module for GPT:
+    fn parameters(self) -> List<Tensor<f32>>:
+        return self.params
+
+fn make_block() -> Block:
+    return Block(params=[variable(randn(8, 8) * 0.1), variable(randn(8, 8) * 0.1)])
+
+fn adamw<M: Module>(model: M, lr: f32):
+    let mut ps = model.parameters()
+    for i in range(len(ps)):
+        let g = ps[i].grad
+        ps[i] = variable(ps[i].data - lr * g)
+
+fn main():
+    let gpt = GPT(
+        blocks=[make_block(), make_block()],
+        params=[variable(randn(8, 8) * 0.1)]
+    )
+    let x0 = ones(4, 8)
+    let steps = {steps}
+    for s in range(steps):
+        let mut x = x0
+        for blk in gpt.blocks:
+            x = blk.forward(x)
+        let out = x @ gpt.params[0]
+        let loss = sum(out * out)
+        backward(loss)
+        for i in range(len(gpt.blocks)):
+            adamw(gpt.blocks[i], 0.05)
+        adamw(gpt, 0.05)
+        if s == steps - 1:
+            record_diff(loss.data[0])
+"#
+        )
+    }
+
+    fn typecheck(steps: i64) -> malus_sema::TypedProgram {
+        let src = modular_src(steps);
+        let mut user_program = parse(malus_syntax::FileId(0), &src).expect("parse failed");
+        let mut stdlib = malus_stdlib::stdlib_items();
+        stdlib.extend(user_program.items.drain(..));
+        let program = malus_syntax::ast::Program { items: stdlib };
+        let aliases = HashMap::new();
+        check(&program, &aliases).expect("type check failed")
+    }
+
+    let typed_1 = typecheck(1);
+    let typed_5 = typecheck(5);
+    let (registry, kernel_ids) =
+        malus_codegen_gpu::compile_kernels(&typed_1).expect("kernel compilation failed");
+    malus_runtime::runtime_init(&registry.into_hashmap());
+    let symbols = real_symbols();
+
+    malus_runtime::malus_gradcheck_reset();
+    compile_and_run(&typed_1, &symbols, &kernel_ids).expect("JIT compile and run failed");
+    let loss_first = malus_runtime::malus_gradcheck_max_diff();
+
+    malus_runtime::malus_gradcheck_reset();
+    compile_and_run(&typed_5, &symbols, &kernel_ids).expect("JIT compile and run failed");
+    let loss_last = malus_runtime::malus_gradcheck_max_diff();
+
+    assert!(
+        loss_last < loss_first * 0.9,
+        "optimizer recursion must train: loss[step0]={loss_first}, loss[step4]={loss_last} \
+         (equal losses mean the write-back never reached the submodules' identity lists)"
+    );
+}

@@ -87,17 +87,19 @@ fn source_site(name: &str, shape: AliasShape, kind: RetainKind) -> RetainSite {
 /// introduces a retain-worthy reference to, given `expr` is the RHS of a
 /// `Let`/`LetTuple`/`Assign`/`Return` statement.
 ///
-/// Tensor `Source` sites additionally require `grad_tracked` (a
-/// non-grad-tracked tensor alias needs no RC: CTMM's static-drop-only path
-/// covers it, ADR-0026 D6). `Agg` sites and `Index` element sites are
-/// structural — required regardless of `grad_tracked` (ADR-0034; for `Index`,
-/// the container's element release at its own drop is unconditional, so the
-/// binding's reference must be real even for non-grad-tracked tensors).
+/// Tensor sites are UNCONDITIONAL on grad tracking (M34). Pre-M34 they were
+/// gated on `grad_tracked` per ADR-0026 D6's claim that a non-grad alias
+/// needs no RC — but CTMM's static Drop for the alias binding was never
+/// grad-gated, so any non-grad alias whose both names were used (or whose
+/// binding was reassigned) double-released the shared handle. The retain
+/// side must mirror the drop side; `borrow_inference::demote_safe_borrows`
+/// strips the pairs that are provably redundant. `Agg` and `Index` sites are
+/// structural as before (ADR-0034 / ADR-0040).
 pub fn retain_sites(expr: &TypedExpr) -> Vec<RetainSite> {
     match &expr.kind {
         TypedExprKind::Ident(name) => {
             let mut out = Vec::new();
-            if expr.grad_tracked && expr.ty.is_tensor() {
+            if expr.ty.is_tensor() {
                 out.push(source_site(name, AliasShape::Ident, RetainKind::Tensor));
             }
             if expr.ty.is_list() {
@@ -106,7 +108,7 @@ pub fn retain_sites(expr: &TypedExpr) -> Vec<RetainSite> {
             out
         }
         TypedExprKind::FieldAccess { base, field } if field == "data" => {
-            if base.grad_tracked && base.ty.is_tensor() {
+            if base.ty.is_tensor() {
                 if let TypedExprKind::Ident(n) = &base.kind {
                     return vec![source_site(n, AliasShape::DataField, RetainKind::Tensor)];
                 }
@@ -116,7 +118,7 @@ pub fn retain_sites(expr: &TypedExpr) -> Vec<RetainSite> {
         TypedExprKind::FieldAccess { .. } => vec![],
         TypedExprKind::ArrayLiteral { elements } => elements
             .iter()
-            .filter(|e| e.grad_tracked && e.ty.is_tensor())
+            .filter(|e| e.ty.is_tensor())
             .filter_map(|e| match &e.kind {
                 TypedExprKind::Ident(n) => {
                     Some(source_site(n, AliasShape::ArrayElem, RetainKind::Tensor))
@@ -128,7 +130,7 @@ pub fn retain_sites(expr: &TypedExpr) -> Vec<RetainSite> {
             .iter()
             .filter_map(|f| match &f.kind {
                 TypedExprKind::Ident(n) => {
-                    if f.grad_tracked && f.ty.is_tensor() {
+                    if f.ty.is_tensor() {
                         Some(source_site(n, AliasShape::StructField, RetainKind::Tensor))
                     } else if f.ty.is_list() {
                         Some(source_site(n, AliasShape::StructField, RetainKind::Agg))

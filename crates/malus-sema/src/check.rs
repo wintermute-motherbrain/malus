@@ -326,22 +326,31 @@ pub fn check(
                     },
                     None => ResolvedTy::Unit,
                 };
-                // Check against the trait's declared signature (param types excluding
-                // self, and return type, must match exactly).
-                let sig_matches = trait_def.methods.iter().any(|ts| {
-                    ts.name == *mname
-                        && ts.param_tys.len() == resolved_params.len() - 1
-                        && ts.param_tys.iter().zip(resolved_params[1..].iter())
-                            .all(|(a, b)| *a == b.ty)
-                        && ts.return_ty == resolved_return
-                });
-                if !sig_matches {
-                    errors.push(SemaError::ImplMethodMismatch {
-                        trait_name: trait_name.clone(),
-                        method: mname.clone(),
-                        span: m.span,
+                // A method whose NAME is declared by the trait must match the
+                // trait's signature exactly (param types excluding self, and
+                // return type). A method the trait doesn't declare at all is
+                // an inherent method (M34): registered with the same mangling
+                // and dispatch map, callable as `x.method(...)` — e.g.
+                // `forward` living beside `parameters` in `impl Module for
+                // Block` without widening the Module trait's contract
+                // (ADR-0036).
+                let name_in_trait = trait_def.methods.iter().any(|ts| ts.name == *mname);
+                if name_in_trait {
+                    let sig_matches = trait_def.methods.iter().any(|ts| {
+                        ts.name == *mname
+                            && ts.param_tys.len() == resolved_params.len() - 1
+                            && ts.param_tys.iter().zip(resolved_params[1..].iter())
+                                .all(|(a, b)| *a == b.ty)
+                            && ts.return_ty == resolved_return
                     });
-                    continue;
+                    if !sig_matches {
+                        errors.push(SemaError::ImplMethodMismatch {
+                            trait_name: trait_name.clone(),
+                            method: mname.clone(),
+                            span: m.span,
+                        });
+                        continue;
+                    }
                 }
                 let mangled_name = format!("{for_type}__{mname}");
                 if env.functions.contains_key(&mangled_name) {
