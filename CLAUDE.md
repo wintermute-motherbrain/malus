@@ -4,7 +4,7 @@
 
 malus is a compiled ML DSL for Apple Silicon. Python-like syntax, dual compilation pipeline: `fn` bodies → Cranelift JIT (CPU), `kernel` bodies → Metal Shading Language (GPU). North star: train models like PyTorch without the Python slowness — the V5 gate is ≤2x f32 PyTorch-MPS at the real Karpathy nanoGPT config. The CTMM memory model uses escape analysis + Lobster-style borrow-inference to insert static `free` calls at compile time, falling back to reference counting only where ownership is genuinely structurally ambiguous (a `List<T>` that may alias across a call boundary, or a struct field with no provable single owner) — never for the autograd tape, which retains its own copy of anything it saves (M29, ADR-0026). There is one tensor type: `Tensor<dtype>`.
 
-## Current state: **V5 in progress — M30 done (2026-07-01), M31 next**
+## Current state: **V5 in progress — M31 done (2026-07-01), M32 next**
 
 | Milestone | Status | Crate |
 |---|---|---|
@@ -44,7 +44,7 @@ malus is a compiled ML DSL for Apple Silicon. Python-like syntax, dual compilati
 | M29 — Borrow-inference RC + benchmark (Lobster single-owner/borrow pass; ≤5% compile-time RC-reduction-ratio gate; both sides measured 2026-07-01: coarse whole-process ratio ≈ 60x vs f32 PyTorch-MPS at the toy config — the founding motivation for V5; M30's matched-methodology warm median corrected the steady-state gap to **26.187 ms/step ≈ 9.6x**) | ✅ done | `malus-sema`, `malus-runtime` |
 | **V5 — Earning the Claim** (roadmap approved 2026-07-01; see `docs/milestones/v5-plan.md`, ADRs 0035–0037) | | |
 | M30 — Honest timing baseline (`--bench` warm per-step median timer via dormant `bench_step_begin`/`bench_step_end` builtins; measured **26.187 ms/step ≈ 9.6x** vs f32 PyTorch-MPS at the toy config — the 60x coarse figure was ~5/6ths one-time startup; docs hygiene; ADR-0038) | ✅ done | `malus-runtime`, `malus-cli` |
-| M31 — Async dispatch substrate (MPS matmul joins shared command buffer; per-buffer pending flags; auto-flush on host read; `__flush()` deleted) | planned | `malus-runtime`, `malus-sema` |
+| M31 — Async dispatch substrate (MPS matmul joins shared command buffer; commit-generation pending tracking; auto-flush on host read; `__flush()` deleted; CTMM `insert_barriers` off by default behind `--static-barriers` A/B flag; GPU-error panic at flush + `MALUS_SYNC_DISPATCH=1` debug mode; measured **6.065 ms/step ≈ 2.2x** vs f32 PyTorch-MPS at the toy config, down from 26.187 — A/B with barriers re-enabled: 24.015 ms, confirming the default-off call) | ✅ done | `malus-runtime`, `malus-sema`, `malus-cli` |
 | M32 — Buffer pooling + memory budget (size-class MTLBuffer free-list) | planned | `malus-runtime` |
 | M33 — N-D permute backward + multi-head attention (rank-generic permute VJP; head-folding) | planned | `malus-runtime`, `malus-stdlib` |
 | M34 — Named submodules (`List<Struct>` recursive drop; optimizer recursion; ADR-0036) | planned | `malus-sema`, `malus-codegen-cpu`, `malus-cli` |
@@ -173,11 +173,11 @@ Compiles all MSL to MTLComputePipelineState, cached by kernel_id
      execute fn main()  →  kernel_dispatch(kernel_id, handles, count)  →  real GPU work
 ```
 
-`malus-cli/src/main.rs` runs all stages. `compile_and_run` is fully implemented; `fn main()` is JIT-compiled and executed via Cranelift. The `RuntimeSymbols` struct of thirteen `extern "C" fn` pointers is injected by the CLI (real Metal fns from `malus-runtime` on macOS); tests inject mock fns. The `kernel_ids` map (`&HashMap<String, u64>`) is produced by `compile_kernels` and passed to `compile_and_run` so the JIT'd code can bake `u64` kernel ids at `KernelCall` and unary-builtin-dispatch sites.
+`malus-cli/src/main.rs` runs all stages. `compile_and_run` is fully implemented; `fn main()` is JIT-compiled and executed via Cranelift. The `RuntimeSymbols` struct of ~50 `extern "C" fn` pointers (13 core M11 fns below plus tape/autograd, shape, string/Buffer I/O, RNG, and bench fns added M13–M30) is injected by the CLI (real Metal fns from `malus-runtime` on macOS); tests inject mock fns. The `kernel_ids` map (`&HashMap<String, u64>`) is produced by `compile_kernels` and passed to `compile_and_run` so the JIT'd code can bake `u64` kernel ids at `KernelCall` and unary-builtin-dispatch sites.
 
-## Runtime C ABI (M11 state)
+## Runtime C ABI (M11 core; see `RuntimeSymbols` in `malus-codegen-cpu/src/lib.rs` for the full current list)
 
-The thirteen runtime functions are real Metal implementations in `malus-runtime/src/metal.rs`, injected into the JIT via a `RuntimeSymbols` struct. codegen-cpu stays platform-agnostic and Metal-unaware (ADR-0008). Structs and enums are heap-allocated via libc `malloc`/`free` registered directly as JIT symbols (not in `RuntimeSymbols`).
+The core runtime functions are real Metal implementations in `malus-runtime/src/metal.rs`, injected into the JIT via a `RuntimeSymbols` struct. codegen-cpu stays platform-agnostic and Metal-unaware (ADR-0008). Structs and enums are heap-allocated via libc `malloc`/`free` registered directly as JIT symbols (not in `RuntimeSymbols`).
 
 ```c
 i64  tensor_alloc_gpu(i32 dtype_tag, const usize* shape_ptr, usize ndims, const float* data)
@@ -196,15 +196,15 @@ void tensor_retain(i64 handle)
 void tensor_release(i64 handle)
 ```
 
-The `i64` handle is a raw pointer to a heap-allocated `TensorBuffer { buffer: metal::Buffer, dtype: Dtype, len: usize, shape: Vec<usize>, ref_count: AtomicUsize }` wrapping a real `MTLBuffer` (`StorageModeShared`). The runtime owns it; `tensor_free` delegates to `tensor_release` which drops the box when the refcount hits zero. Invariant: `len == shape.iter().product()`.
+The `i64` handle is a raw pointer to a heap-allocated `TensorBuffer { buffer: metal::Buffer, dtype: Dtype, len: usize, shape: Vec<usize>, ref_count: AtomicUsize, last_write_gen: AtomicU64 }` wrapping a real `MTLBuffer` (`StorageModeShared`). The runtime owns it; `tensor_free` delegates to `tensor_release` which drops the box when the refcount hits zero. Invariant: `len == shape.iter().product()`. `last_write_gen` (M31) is the commit generation of the command buffer that last encoded a GPU write to this buffer; the buffer is *pending* iff it exceeds the last completed generation, and every host-side read (`tensor_print`, `malus_tensor_get_f32`, CPU helpers) calls `flush_if_pending` first (ADR-0035).
 
-`tensor_matmul`, `tensor_transpose`, and `tensor_sum` are eager CPU ops that call `gpu_barrier()` internally before reading buffers. Their results are ready tensors (not pending). See ADR-0012.
+`tensor_matmul` encodes `MPSMatrixMultiplication` into the shared command buffer and returns a **pending** tensor — zero commit/wait inside any op (M31). `transpose`, `sum`, and all other stdlib ops are malus `.ml` kernels dispatched through `kernel_dispatch_v2` (M25/M26); their CPU-loop ancestors survive only behind the `cpu_fallback` test feature.
 
 **dtype_tag** uses `ScalarTy` enum discriminant order: F32=0, F16=1, Bf16=2, I8=3, I16=4, I32=5, I64=6, U8=7, U16=8, U32=9, U64=10. `malus-runtime` defines an independent `Dtype` enum with `from_tag(i32)`/`to_tag() -> i32`; a drift-detection test asserts all 11 mappings. **M19+: i32 (tag 5) and i64 (tag 6) are supported for index tensors** (`embedding`, `cross_entropy` targets). All other non-f32 dtypes still panic per ADR-0006.
 
 **Device/queue:** lazy `OnceLock<MetalContext { device, command_queue, current_command_buffer, pipelines }>`; first Metal fn call triggers `Device::system_default()` (panics if absent). `runtime_init` must be called before any `kernel_dispatch` to compile MSL kernels.
 
-**gpu_barrier:** if a `current_command_buffer` exists, commits it and waits for completion; otherwise no-op.
+**gpu_barrier:** if a `current_command_buffer` exists, commits it, waits for completion, panics with the Metal error description on command-buffer failure, and advances the completed generation (M31); otherwise no-op. `MALUS_SYNC_DISPATCH=1` makes every dispatch/matmul flush immediately for per-op fault attribution.
 
 **kernel_dispatch:** looks up the `MTLComputePipelineState` by `kernel_id`, allocates an output buffer matching the first input's dtype and shape, encodes a compute pass (`setComputePipelineState`, `setBuffer` per input + output, `dispatchThreads:threadsPerThreadgroup:`), does NOT commit (commit happens in `gpu_barrier`).
 
@@ -238,9 +238,9 @@ The `i64` handle is a raw pointer to a heap-allocated `TensorBuffer { buffer: me
 | Backward kernels on GPU | ✅ M26 | Every VJP is a malus kernel + host fn (ADR-0032); `tape.rs` keeps only the tape-walk orchestration; canonical `count()==0` full-train-step gate passes |
 | Embedding backward scatter-add uses per-row gather, not atomics | Post-V4 | Deterministic and exact at nanoGPT's char-level vocab scale; `atomic<f32>`/`atomic_fetch_add_explicit` deferred as a real kernel-language feature for large-vocab efficiency (ADR-0032) |
 | Backward reductions inherit forward's ≤1024 reduced-axis cap | Post-V4 | Single-threadgroup `Array<f32,1024>` scratch (M25); grid-stride reduction to lift it deferred — never hit at nanoGPT's gate config (ADR-0032) |
-| `gpu_barrier()` is barrier-before-*drop*, not barrier-before-*read* | **V5/M31 planned** | CTMM's `insert_barriers` only flushes before a pending Tensor's static drop; RC-managed reads can see stale GPU state if nothing else triggers a flush first. Worked around per-call-site (e.g. `examples/gradient_check.ml`'s `__flush()`). M31 fixes it as a runtime guarantee: per-buffer pending tracking + auto-flush on host read (ADR-0035) |
+| Read safety was barrier-before-*drop*, not barrier-before-*read* | ✅ M31 | Fixed as a runtime guarantee: per-buffer commit-generation pending tracking + `flush_if_pending` on every host read; `__flush()` workarounds deleted; CTMM `insert_barriers` demoted to an opt-in A/B lever (off by default, `--static-barriers`), slated for deletion when V6's static commit-planner lands (ADR-0035) |
 | Flash attention | V6 | Composed attention ships V4 (ADR-0029); flash requires simdgroup_matrix + mixed precision (bf16 lands M36) |
-| Dispatch architecture is sync-per-matmul eager | **V5/M31–M32 planned** | Measured 2026-07-01 (M30 warm median): toy nanoGPT 26.187 ms/step ≈ 9.6x slower than f32 PyTorch-MPS; `tensor_matmul` does commit+waitUntilCompleted per call, fresh `MTLBuffer` per op, global-flush barriers. V5 async substrate + pooling is the response (ADR-0035, `docs/milestones/m29-benchmark-results.md` M30 addendum) |
+| Dispatch is async (M31) but allocates a fresh `MTLBuffer` + fresh MPS objects per op | **V5/M32 planned** | M31 killed sync-per-matmul: 26.187 → 6.065 ms/step (≈2.2x vs f32 PyTorch-MPS at the toy config). Remaining gap is per-op `MTLBuffer` allocation (M32 pooling), per-call `MPSMatrix`/`MPSMatrixMultiplication` churn (M32 candidate), and per-op encoder overhead (V6 fusion) — see `m29-benchmark-results.md` M31 addendum |
 | `permute` backward is hardcoded to rank ≤3 — 4-D permute has no working gradient | **V5/M33 planned** | `tape.rs:591-599` passes exactly 3 inverse indices; blocks multi-head attention (head-folding needs differentiable 4-D permute). Forward permute is already rank-generic |
 | `List<Struct>` elements leak on drop | **V5/M34 planned** | `DropList` only drops tensor elements; struct/list elements are silently skipped (`malus-codegen-cpu/src/lib.rs:1035-1037`). Only `List<Tensor<f32>>` is sound today; M34 makes drop type-directed and recursive |
 | Model save/load / checkpointing (SafeTensors) | V6 | Consciously sequenced after the V5 perf claim; deserves its own designed milestone |

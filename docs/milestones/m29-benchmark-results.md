@@ -120,3 +120,39 @@ the steady-state gap; it was the coarse whole-process ratio.
   structural, not a borrow-inference/CTMM artifact — this is exactly why
   V4 sets no hard threshold at this milestone (V4 plan: "final Nx target
   set empirically after the baseline measurement").
+
+## M31 addendum — async dispatch substrate (measured 2026-07-01)
+
+M31 killed sync-per-matmul: MPS matmul now encodes into the shared command
+buffer like every other op (zero `commit`/`waitUntilCompleted` inside any op
+function), read safety is a runtime guarantee (per-buffer commit-generation
+pending tracking + auto-flush on host read), and CTMM static barrier
+insertion is off by default (ADR-0035). Same machine, same toy config, same
+methodology as the M30 addendum:
+
+```
+$ malus examples/nanogpt.ml --bench
+malus bench: 297 warm steps, median step = 6.065ms (min=5.291ms, max=7.436ms)
+```
+
+**26.187 ms → 6.065 ms/step (4.3x faster); matched Nx ≈ 2.2x**
+(6.065 ms / 2.729 ms PyTorch-MPS f32). Not a gate — the V5 gate is M35's
+≤2x at the Karpathy config — but the toy config is now within sight of it
+before buffer pooling (M32) has landed.
+
+Supporting measurements, same day:
+
+- **A/B, static barriers re-enabled** (`--static-barriers`): 24.015 ms/step —
+  ≈ the M30 baseline. This confirms the M31 design call empirically: each
+  CTMM `GpuBarrier` is a full commit+wait fired before pending drops, so
+  leaving the pass on would have nullified the async substrate almost
+  entirely. Read-safety cannot live in static barriers under this
+  execution model.
+- **Numerics unchanged**: the 300-step loss curve is bit-identical to a
+  pre-M31 build (deterministic Philox RNG, unchanged op order) — async
+  encoding reordered nothing observable.
+- **Remaining gap attribution**: with dispatch syncs gone, the ~3.3 ms/step
+  over PyTorch is dominated by per-op `MTLBuffer` allocation (M32 buffer
+  pooling), per-call MPS object churn (`MPSMatrix`/`MPSMatrixMultiplication`
+  created per matmul — an M32 companion candidate), and per-op encoder
+  overhead (V6 fusion territory).

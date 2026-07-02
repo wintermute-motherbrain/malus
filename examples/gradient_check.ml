@@ -15,14 +15,6 @@ fn __perturb_fwd(x: Tensor<f32>, idx: i64, delta: f32) -> Tensor<f32>:
     let n = x.len
     return __perturb_kernel[grid=[n, 1, 1], tg=[1, 1, 1]](x, idx, delta)
 
-# gpu_barrier() is only inserted by CTMM before a *drop* of a pending tensor,
-# never before a plain read — so a grad-tracked tensor's .grad (RC-managed, not
-# CTMM-static-dropped) can be read before its GPU computation is visible.
-# A throwaway static-drop Tensor read reliably forces the flush.
-fn __flush():
-    let t = ones(1)
-    let _v = t[0]
-
 # Records |analytic[i] - numeric central-diff of f_t at x[i]| for every i,
 # where f_t(perturbed_x) is supplied by the caller via two pre-computed
 # scalar-loss tensors fp/fm per element — callers loop and call this once
@@ -52,7 +44,6 @@ fn check_add():
     let vy = variable(y)
     let loss = __loss_add_v(vx, vy)
     backward(loss)
-    __flush()
     let n = x.len
     with no_grad:
         for i in range(0, n):
@@ -82,7 +73,6 @@ fn check_mul():
     let vy = variable(y)
     let loss = __loss_mul_v(vx, vy)
     backward(loss)
-    __flush()
     let n = x.len
     with no_grad:
         for i in range(0, n):
@@ -119,7 +109,6 @@ fn check_matmul():
     let vb = variable(b)
     let loss = __loss_matmul_v(va, vb)
     backward(loss)
-    __flush()
     let n = a.len
     with no_grad:
         for i in range(0, n):
@@ -153,7 +142,6 @@ fn check_softmax():
     let vw = variable(w)
     let loss = __loss_softmax_v(vx, vw)
     backward(loss)
-    __flush()
     let n = x.len
     with no_grad:
         for i in range(0, n):
@@ -179,7 +167,6 @@ fn check_layernorm():
     let vw = variable(w)
     let loss = __loss_layernorm_v(vx, vw)
     backward(loss)
-    __flush()
     let n = x.len
     with no_grad:
         for i in range(0, n):
@@ -203,7 +190,6 @@ fn check_gelu():
     let vx = variable(x)
     let loss = __loss_gelu_v(vx)
     backward(loss)
-    __flush()
     let n = x.len
     with no_grad:
         for i in range(0, n):
@@ -227,7 +213,6 @@ fn check_embedding():
     let vweight = variable(weight)
     let loss = __loss_embedding_v(vweight, idx)
     backward(loss)
-    __flush()
     let n = weight.len
     with no_grad:
         for i in range(0, n):
@@ -235,7 +220,6 @@ fn check_embedding():
             let wm = __perturb_fwd(weight, i, 0.0 - eps)
             let fp = __loss_embedding_v(variable(wp), idx)
             let fm = __loss_embedding_v(variable(wm), idx)
-            __flush()
             __check_elem(vweight.grad, i, fp.data[0], fm.data[0], eps)
 
 # ── cross_entropy ────────────────────────────────────────────────────────────
@@ -247,7 +231,6 @@ fn check_cross_entropy():
     let vlogits = variable(logits)
     let loss = cross_entropy(vlogits, targets)
     backward(loss)
-    __flush()
     let n = logits.len
     with no_grad:
         for i in range(0, n):
@@ -255,7 +238,6 @@ fn check_cross_entropy():
             let lm = __perturb_fwd(logits, i, 0.0 - eps)
             let fp = cross_entropy(variable(lp), targets)
             let fm = cross_entropy(variable(lm), targets)
-            __flush()
             __check_elem(vlogits.grad, i, fp.data[0], fm.data[0], eps)
 
 fn main():

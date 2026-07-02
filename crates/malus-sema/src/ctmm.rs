@@ -175,7 +175,28 @@ fn annotate_body_seeded(body: &mut Vec<TypedStmt>, seed: &[(String, ResolvedTy)]
     inject_early_return_unwinds(body, &local_types);
     // Step 8.6 (M12): inject drops before Break/Continue jumps.
     inject_break_continue_unwinds(body, &local_types);
-    insert_barriers(body);
+    // M31 (ADR-0035): static barrier insertion is demoted to an opt-in
+    // optimization lever. Read safety is the runtime's per-buffer pending
+    // tracking + auto-flush; drops of pending tensors are memory-safe because
+    // Metal command buffers retain referenced resources.
+    if static_barriers_enabled() {
+        insert_barriers(body);
+    }
+}
+
+// Thread-local (not a process global) so parallel test threads can hold
+// different settings; `check_with_options` sets it before annotate_fns runs
+// on the same thread.
+thread_local! {
+    static STATIC_BARRIERS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub fn set_static_barriers(on: bool) {
+    STATIC_BARRIERS.with(|c| c.set(on));
+}
+
+fn static_barriers_enabled() -> bool {
+    STATIC_BARRIERS.with(|c| c.get())
 }
 
 /// Step 3: call `annotate_body` on each inner scope so inner bindings get

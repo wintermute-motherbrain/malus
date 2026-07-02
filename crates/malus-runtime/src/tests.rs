@@ -78,6 +78,8 @@ fn shape_of(handle: i64) -> Vec<usize> {
 }
 
 fn read_f32(handle: i64) -> Vec<f32> {
+    // M31: matmul results are pending; host reads flush like any other.
+    crate::metal::flush_if_pending(handle);
     let tb = unsafe { &*(handle as *const TensorBuffer) };
     let ptr = tb.buffer.contents().as_ptr() as *const f32;
     unsafe { std::slice::from_raw_parts(ptr, tb.len).to_vec() }
@@ -1602,6 +1604,101 @@ fn test_mps_matmul_3x2_broadcast_correctness() {
     let diff = max_abs_diff(&mps_out, &cpu_out);
     tensor_free(ha); tensor_free(hb); tensor_free(h_mps); tensor_free(h_cpu);
     assert!(diff < 1e-3, "MPS 3x2 broadcast matmul max-abs-diff {diff} >= 1e-3");
+}
+
+// ── M31: async dispatch substrate (ADR-0035) ─────────────────────────────────
+
+#[test]
+fn test_m31_matmul_pending_then_autoflush_on_get() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    gpu_barrier();
+    let (m, k, n) = (8, 8, 8);
+    let a_data = make_random_f32(m * k, 10.0);
+    let b_data = make_random_f32(k * n, 11.0);
+    let ha = tensor_alloc_gpu(0, [m, k].as_ptr(), 2, a_data.as_ptr());
+    let hb = tensor_alloc_gpu(0, [k, n].as_ptr(), 2, b_data.as_ptr());
+    assert!(!crate::metal::tensor_is_pending(ha), "host-initialized tensor must be ready");
+
+    let h_mps = tensor_matmul(ha, hb);
+    assert!(crate::metal::tensor_is_pending(h_mps), "matmul result must be pending (no commit inside op)");
+
+    // No gpu_barrier anywhere: the scalar read itself must flush.
+    let got = crate::metal::malus_tensor_get_f32(h_mps, 0);
+    assert!(!crate::metal::tensor_is_pending(h_mps), "read must have flushed");
+    let h_cpu = tensor_matmul_cpu(ha, hb);
+    let want = read_f32(h_cpu)[0];
+    assert!((got - want).abs() < 1e-3, "auto-flushed read {got} != cpu {want}");
+    tensor_free(ha); tensor_free(hb); tensor_free(h_mps); tensor_free(h_cpu);
+}
+
+#[test]
+fn test_m31_chained_matmuls_single_flush() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    gpu_barrier();
+    let s = 16usize;
+    let a_data = make_random_f32(s * s, 12.0);
+    let b_data = make_random_f32(s * s, 13.0);
+    let c_data = make_random_f32(s * s, 14.0);
+    let ha = tensor_alloc_gpu(0, [s, s].as_ptr(), 2, a_data.as_ptr());
+    let hb = tensor_alloc_gpu(0, [s, s].as_ptr(), 2, b_data.as_ptr());
+    let hc = tensor_alloc_gpu(0, [s, s].as_ptr(), 2, c_data.as_ptr());
+
+    // (A@B)@C — the second matmul consumes a PENDING input; encoder order in
+    // the shared command buffer must serialize it. One flush at the read.
+    let ab = tensor_matmul(ha, hb);
+    let abc = tensor_matmul(ab, hc);
+    assert!(crate::metal::tensor_is_pending(abc));
+    let got = read_f32(abc);
+
+    let ab_cpu = tensor_matmul_cpu(ha, hb);
+    let abc_cpu = tensor_matmul_cpu(ab_cpu, hc);
+    let want = read_f32(abc_cpu);
+    let diff = max_abs_diff(&got, &want);
+    tensor_free(ha); tensor_free(hb); tensor_free(hc);
+    tensor_free(ab); tensor_free(abc); tensor_free(ab_cpu); tensor_free(abc_cpu);
+    assert!(diff < 1e-2, "chained matmul max-abs-diff {diff} >= 1e-2");
+}
+
+#[test]
+fn test_m31_kernel_then_matmul_then_kernel_ordering() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    init_add_kernel();
+    gpu_barrier();
+    // x = a+a (kernel), y = x@x (MPS), z = y+y (kernel), single flush at read.
+    let a_data = vec![1.0f32, 2.0, 3.0, 4.0];
+    let ha = tensor_alloc_gpu(0, [2, 2].as_ptr(), 2, a_data.as_ptr());
+    let x = kernel_dispatch(0, [ha, ha].as_ptr(), 2);
+    let y = tensor_matmul(x, x);
+    let z = kernel_dispatch(0, [y, y].as_ptr(), 2);
+    assert!(crate::metal::tensor_is_pending(z));
+    let got = read_f32(z);
+    // a+a = [[2,4],[6,8]]; (a+a)@(a+a) = [[28,40],[60,88]]; doubled = [[56,80],[120,176]]
+    let want = vec![56.0f32, 80.0, 120.0, 176.0];
+    let diff = max_abs_diff(&got, &want);
+    tensor_free(ha); tensor_free(x); tensor_free(y); tensor_free(z);
+    assert!(diff < 1e-3, "kernel→matmul→kernel chain max-abs-diff {diff} >= 1e-3");
+}
+
+#[test]
+fn test_m31_reshape_alias_inherits_pending() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    gpu_barrier();
+    let a_data = make_random_f32(4, 15.0);
+    let b_data = make_random_f32(4, 16.0);
+    let ha = tensor_alloc_gpu(0, [2, 2].as_ptr(), 2, a_data.as_ptr());
+    let hb = tensor_alloc_gpu(0, [2, 2].as_ptr(), 2, b_data.as_ptr());
+    let h_mps = tensor_matmul(ha, hb);
+    let flat = crate::metal::tensor_reshape(h_mps, [4usize].as_ptr(), 1);
+    assert!(
+        crate::metal::tensor_is_pending(flat),
+        "reshape alias of a pending tensor must inherit the pending generation"
+    );
+    let got = read_f32(flat);
+    let h_cpu = tensor_matmul_cpu(ha, hb);
+    let want = read_f32(h_cpu);
+    let diff = max_abs_diff(&got, &want);
+    tensor_free(ha); tensor_free(hb); tensor_free(h_mps); tensor_free(flat); tensor_free(h_cpu);
+    assert!(diff < 1e-3, "reshaped pending read max-abs-diff {diff} >= 1e-3");
 }
 
 #[test]

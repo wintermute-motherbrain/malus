@@ -7,7 +7,7 @@ use objc2::runtime::ProtocolObject;
 use objc2::AnyThread;
 use objc2_foundation::NSString;
 use objc2_metal::{
-    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
+    MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue,
     MTLComputeCommandEncoder, MTLComputePipelineState, MTLCreateSystemDefaultDevice,
     MTLDevice, MTLLibrary, MTLResourceOptions, MTLSize,
 };
@@ -96,6 +96,66 @@ fn context() -> &'static MetalContext {
     })
 }
 
+// ── M31 pending tracking (ADR-0035) ──────────────────────────────────────────
+//
+// ENCODE_GEN is bumped each time a new shared command buffer is opened; the
+// open buffer's generation is always the current ENCODE_GEN value.  GPU-written
+// outputs stamp `last_write_gen` with the generation they were encoded into.
+// COMPLETED_GEN advances to ENCODE_GEN when gpu_barrier() commits+waits (the
+// lock is held across the store, and buffer creation requires the same lock,
+// so the pair can't drift under ADR-0033's single-consumer contract).
+// A buffer is pending iff last_write_gen > COMPLETED_GEN — one branch per host
+// read, zero cost on the GPU path.
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static ENCODE_GEN: AtomicU64 = AtomicU64::new(0);
+static COMPLETED_GEN: AtomicU64 = AtomicU64::new(0);
+
+/// MALUS_SYNC_DISPATCH=1 flushes after every encode, restoring per-op fault
+/// attribution when debugging GPU errors that would otherwise surface at a
+/// distant flush point.
+fn sync_dispatch() -> bool {
+    static SYNC: OnceLock<bool> = OnceLock::new();
+    *SYNC.get_or_init(|| std::env::var("MALUS_SYNC_DISPATCH").as_deref() == Ok("1"))
+}
+
+/// Lazily open the shared command buffer, returning it with its generation.
+/// Callers already hold the `current_command_buffer` lock.
+fn ensure_command_buffer<'a>(
+    ctx: &MetalContext,
+    guard: &'a mut Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
+) -> (&'a Retained<ProtocolObject<dyn MTLCommandBuffer>>, u64) {
+    if guard.is_none() {
+        let cmd_buf = ctx.command_queue
+            .commandBuffer()
+            .expect("malus: failed to create MTLCommandBuffer");
+        ENCODE_GEN.fetch_add(1, Ordering::Relaxed);
+        *guard = Some(cmd_buf);
+    }
+    (guard.as_ref().unwrap(), ENCODE_GEN.load(Ordering::Relaxed))
+}
+
+/// The M31 read guarantee: commit+wait iff uncommitted GPU work has written
+/// this buffer.  Every host-side read of tensor contents goes through here;
+/// must not be called while holding the `current_command_buffer` lock.
+pub fn flush_if_pending(handle: i64) {
+    if handle == 0 {
+        return;
+    }
+    let tb = unsafe { &*(handle as *const TensorBuffer) };
+    if tb.last_write_gen.load(Ordering::Acquire) > COMPLETED_GEN.load(Ordering::Acquire) {
+        gpu_barrier();
+    }
+}
+
+/// Test-only observability: whether `handle` has uncommitted GPU writes.
+#[doc(hidden)]
+pub fn tensor_is_pending(handle: i64) -> bool {
+    let tb = unsafe { &*(handle as *const TensorBuffer) };
+    tb.last_write_gen.load(Ordering::Acquire) > COMPLETED_GEN.load(Ordering::Acquire)
+}
+
 pub struct TensorBuffer {
     pub buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
     pub dtype: Dtype,
@@ -105,6 +165,11 @@ pub struct TensorBuffer {
     /// freed when decremented to 0 via `tensor_release`.  `tensor_free`
     /// delegates to `tensor_release`, so all free paths share one code path.
     pub ref_count: std::sync::atomic::AtomicUsize,
+    /// M31: generation of the command buffer that last encoded a GPU write to
+    /// this buffer; 0 = ready (never GPU-written, or host-initialized).
+    /// Pending iff > COMPLETED_GEN.  Reshape aliases must inherit this — they
+    /// share the underlying MTLBuffer.
+    pub last_write_gen: AtomicU64,
 }
 
 // ── Runtime init: compile all MSL kernels ─────────────────────────────────────
@@ -190,6 +255,7 @@ pub extern "C" fn tensor_alloc_gpu(
         len: n,
         shape,
         ref_count: std::sync::atomic::AtomicUsize::new(1),
+        last_write_gen: AtomicU64::new(0),
     });
     crate::alloc_inc();
     Box::into_raw(tb) as i64
@@ -265,6 +331,7 @@ pub extern "C" fn tensor_print(handle: i64) {
         print!("[]");
         return;
     }
+    flush_if_pending(handle);
     let tb = unsafe { &*(handle as *const TensorBuffer) };
     match tb.dtype {
         Dtype::I32 => {
@@ -381,6 +448,16 @@ pub extern "C" fn gpu_barrier() {
     if let Some(cmd_buf) = guard.take() {
         cmd_buf.commit();
         cmd_buf.waitUntilCompleted();
+        // Async dispatch defers errors to the flush point; they must never
+        // degrade into silent stale/garbage reads.  MALUS_SYNC_DISPATCH=1
+        // narrows a failure back to the op that encoded it.
+        if cmd_buf.status() == MTLCommandBufferStatus::Error {
+            let desc = cmd_buf.error()
+                .map(|e| e.localizedDescription().to_string())
+                .unwrap_or_else(|| "unknown Metal error".to_string());
+            panic!("malus: GPU command buffer failed: {desc} (set MALUS_SYNC_DISPATCH=1 to attribute the failing op)");
+        }
+        COMPLETED_GEN.store(ENCODE_GEN.load(Ordering::Relaxed), Ordering::Release);
     }
 }
 
@@ -388,7 +465,8 @@ pub extern "C" fn gpu_barrier() {
 //
 // CPU reference matmul — kept as ground-truth for MPS correctness tests.
 pub fn tensor_matmul_cpu(handle_a: i64, handle_b: i64) -> i64 {
-    gpu_barrier();
+    flush_if_pending(handle_a);
+    flush_if_pending(handle_b);
     let a = unsafe { &*(handle_a as *const TensorBuffer) };
     let b = unsafe { &*(handle_b as *const TensorBuffer) };
 
@@ -489,11 +567,12 @@ pub fn tensor_matmul_cpu(handle_a: i64, handle_b: i64) -> i64 {
     }
 }
 
-// MPS matmul — dispatches to the AMX coprocessor via MPSMatrixMultiplication.
-// Returns a ready tensor (gpu_barrier() + commit + waitUntilCompleted inside).
+// MPS matmul via MPSMatrixMultiplication. M31: encodes into the shared
+// command buffer like every other op — no leading barrier (encoder order +
+// hazard tracking serialize against pending kernel work in the same buffer),
+// no commit, no wait. Returns a PENDING tensor; host reads auto-flush.
 #[no_mangle]
 pub extern "C" fn tensor_matmul(handle_a: i64, handle_b: i64) -> i64 {
-    gpu_barrier(); // flush any pending element-wise kernels before MPS reads buffers
     let a = unsafe { &*(handle_a as *const TensorBuffer) };
     let b = unsafe { &*(handle_b as *const TensorBuffer) };
     let ctx = context();
@@ -524,11 +603,13 @@ pub extern "C" fn tensor_matmul(handle_a: i64, handle_b: i64) -> i64 {
                 let mat_c = MPSMatrix::initWithBuffer_descriptor(MPSMatrix::alloc(),&*c_tb.buffer, &desc_c);
                 let mm = MPSMatrixMultiplication::initWithDevice_resultRows_resultColumns_interiorColumns(
                     MPSMatrixMultiplication::alloc(),&*ctx.device, m, n, k);
-                let cmd_buf = ctx.command_queue.commandBuffer()
-                    .expect("malus: MPS matmul failed to create command buffer");
-                mm.encodeToCommandBuffer_leftMatrix_rightMatrix_resultMatrix(&*cmd_buf, &mat_a, &mat_b, &mat_c);
-                cmd_buf.commit();
-                cmd_buf.waitUntilCompleted();
+                let mut guard = ctx.current_command_buffer.lock().unwrap();
+                let (cmd_buf, gen) = ensure_command_buffer(ctx, &mut guard);
+                mm.encodeToCommandBuffer_leftMatrix_rightMatrix_resultMatrix(&**cmd_buf, &mat_a, &mat_b, &mat_c);
+                c_tb.last_write_gen.store(gen, Ordering::Release);
+            }
+            if sync_dispatch() {
+                gpu_barrier();
             }
             c_handle
         }
@@ -561,8 +642,8 @@ pub extern "C" fn tensor_matmul(handle_a: i64, handle_b: i64) -> i64 {
                 let desc_c = MPSMatrixDescriptor::matrixDescriptorWithRows_columns_rowBytes_dataType(m, n, n * 4, MPSDataType::Float32);
                 let mm = MPSMatrixMultiplication::initWithDevice_resultRows_resultColumns_interiorColumns(
                     MPSMatrixMultiplication::alloc(),&*ctx.device, m, n, k);
-                let cmd_buf = ctx.command_queue.commandBuffer()
-                    .expect("malus: MPS batched matmul failed to create command buffer");
+                let mut guard = ctx.current_command_buffer.lock().unwrap();
+                let (cmd_buf, gen) = ensure_command_buffer(ctx, &mut guard);
                 for bx in 0..batch {
                     let a_off = bx * m * k * 4;
                     let b_off = bx * k * n * 4;
@@ -570,10 +651,12 @@ pub extern "C" fn tensor_matmul(handle_a: i64, handle_b: i64) -> i64 {
                     let mat_a = MPSMatrix::initWithBuffer_offset_descriptor(MPSMatrix::alloc(),&*a.buffer, a_off, &desc_a);
                     let mat_b = MPSMatrix::initWithBuffer_offset_descriptor(MPSMatrix::alloc(),&*b.buffer, b_off, &desc_b);
                     let mat_c = MPSMatrix::initWithBuffer_offset_descriptor(MPSMatrix::alloc(),&*c_tb.buffer, c_off, &desc_c);
-                    mm.encodeToCommandBuffer_leftMatrix_rightMatrix_resultMatrix(&*cmd_buf, &mat_a, &mat_b, &mat_c);
+                    mm.encodeToCommandBuffer_leftMatrix_rightMatrix_resultMatrix(&**cmd_buf, &mat_a, &mat_b, &mat_c);
                 }
-                cmd_buf.commit();
-                cmd_buf.waitUntilCompleted();
+                c_tb.last_write_gen.store(gen, Ordering::Release);
+            }
+            if sync_dispatch() {
+                gpu_barrier();
             }
             c_handle
         }
@@ -602,17 +685,19 @@ pub extern "C" fn tensor_matmul(handle_a: i64, handle_b: i64) -> i64 {
                 let mat_b = MPSMatrix::initWithBuffer_descriptor(MPSMatrix::alloc(),&*b.buffer, &desc_b);
                 let mm = MPSMatrixMultiplication::initWithDevice_resultRows_resultColumns_interiorColumns(
                     MPSMatrixMultiplication::alloc(),&*ctx.device, m, n, k);
-                let cmd_buf = ctx.command_queue.commandBuffer()
-                    .expect("malus: MPS 3x2 matmul failed to create command buffer");
+                let mut guard = ctx.current_command_buffer.lock().unwrap();
+                let (cmd_buf, gen) = ensure_command_buffer(ctx, &mut guard);
                 for bx in 0..batch {
                     let a_off = bx * m * k * 4;
                     let c_off = bx * m * n * 4;
                     let mat_a = MPSMatrix::initWithBuffer_offset_descriptor(MPSMatrix::alloc(),&*a.buffer, a_off, &desc_a);
                     let mat_c = MPSMatrix::initWithBuffer_offset_descriptor(MPSMatrix::alloc(),&*c_tb.buffer, c_off, &desc_c);
-                    mm.encodeToCommandBuffer_leftMatrix_rightMatrix_resultMatrix(&*cmd_buf, &mat_a, &mat_b, &mat_c);
+                    mm.encodeToCommandBuffer_leftMatrix_rightMatrix_resultMatrix(&**cmd_buf, &mat_a, &mat_b, &mat_c);
                 }
-                cmd_buf.commit();
-                cmd_buf.waitUntilCompleted();
+                c_tb.last_write_gen.store(gen, Ordering::Release);
+            }
+            if sync_dispatch() {
+                gpu_barrier();
             }
             c_handle
         }
@@ -988,10 +1073,11 @@ pub(crate) fn invert_perm(perm: &[usize]) -> Vec<usize> {
     inv
 }
 
-/// Apply a fully-normalized permutation to a tensor.  No barrier — callers
-/// that read GPU data must have already called gpu_barrier().
+/// Apply a fully-normalized permutation to a tensor.  Self-flushing (M31):
+/// reads the input on the CPU, so it auto-flushes if the input is pending.
 pub(crate) fn permute_by_perm(handle: i64, perm: &[usize]) -> i64 {
     crate::cpu_compute_inc();
+    flush_if_pending(handle);
     let tb_in = unsafe { &*(handle as *const TensorBuffer) };
     let rank = tb_in.shape.len();
     assert_eq!(perm.len(), rank, "permute_by_perm: perm len {} != rank {}", perm.len(), rank);
@@ -1037,15 +1123,16 @@ pub(crate) fn reshape_to(handle: i64, new_shape: &[usize]) -> i64 {
         len:    tb.len,
         shape:  new_shape.to_vec(),
         ref_count: std::sync::atomic::AtomicUsize::new(1),
+        // Same MTLBuffer — a pending source stays pending through the alias.
+        last_write_gen: AtomicU64::new(tb.last_write_gen.load(Ordering::Acquire)),
     };
     Box::into_raw(Box::new(new_tb)) as i64
 }
 
-/// Public ABI: permute a tensor's axes.  Calls gpu_barrier() then
-/// normalize_perm + permute_by_perm.
+/// Public ABI: permute a tensor's axes via normalize_perm + permute_by_perm
+/// (which auto-flushes the input).
 #[no_mangle]
 pub extern "C" fn tensor_permute(handle: i64, perm_ptr: *const usize, ndims: usize) -> i64 {
-    gpu_barrier();
     let tb_in = unsafe { &*(handle as *const TensorBuffer) };
     let raw: Vec<usize> = if ndims == 0 || perm_ptr.is_null() {
         vec![]
@@ -1305,6 +1392,8 @@ pub extern "C" fn tensor_embedding(weight: i64, indices: i64) -> i64 {
 #[cfg(feature = "cpu_fallback")]
 pub(crate) fn tensor_scatter_add(dout: i64, indices: i64, vocab_size: i64) -> i64 {
     crate::cpu_compute_inc();
+    flush_if_pending(dout);
+    flush_if_pending(indices);
     let dout_tb = unsafe { &*(dout as *const TensorBuffer) };
     let idx_tb  = unsafe { &*(indices as *const TensorBuffer) };
     let seq_len   = dout_tb.shape[0];
@@ -1396,9 +1485,11 @@ pub extern "C" fn malus_rand_int(n: i64) -> i64 {
     (v % (n as u64)) as i64
 }
 
-/// tensor_get_f32(handle, idx) → f32. Flat row-major read after gpu_barrier; panics on OOB.
+/// tensor_get_f32(handle, idx) → f32. Flat row-major read; auto-flushes if the
+/// tensor is pending (M31 read guarantee). Panics on OOB.
 #[no_mangle]
 pub extern "C" fn malus_tensor_get_f32(handle: i64, idx: i64) -> f32 {
+    flush_if_pending(handle);
     let tb = unsafe { &*(handle as *const TensorBuffer) };
     let data = unsafe { std::slice::from_raw_parts(tb.buffer.contents().as_ptr() as *const f32, tb.len) };
     data[idx as usize]
@@ -1422,6 +1513,7 @@ pub(crate) fn broadcast_to_shape(h: i64, out_shape: &[usize]) -> i64 {
         return h;
     }
     crate::cpu_compute_inc();
+    flush_if_pending(h);
     let n = out_shape.len();
     let mut padded = vec![1usize; n - t.shape.len()];
     padded.extend_from_slice(&t.shape);
@@ -1454,6 +1546,7 @@ pub(crate) fn sum_to_shape(grad: i64, target_shape: &[usize]) -> i64 {
         return grad;
     }
     crate::cpu_compute_inc();
+    flush_if_pending(grad);
     let n = t.shape.len();
     let n_target = target_shape.len();
     let mut padded = vec![1usize; n - n_target];
@@ -1481,6 +1574,7 @@ pub(crate) fn sum_to_shape(grad: i64, target_shape: &[usize]) -> i64 {
 /// Returns an owned handle (refcount=1).
 #[cfg(feature = "cpu_fallback")]
 pub(crate) fn unsqueeze_at(h: i64, axis: usize) -> i64 {
+    flush_if_pending(h);
     let t = unsafe { &*(h as *const TensorBuffer) };
     let data = unsafe { std::slice::from_raw_parts(t.buffer.contents().as_ptr() as *const f32, t.len) };
     let mut new_shape = t.shape.clone();
@@ -1528,13 +1622,7 @@ pub extern "C" fn kernel_dispatch(kernel_id: u64, handles: *const i64, count: us
     }
 
     let mut guard = ctx.current_command_buffer.lock().unwrap();
-    if guard.is_none() {
-        let cmd_buf = ctx.command_queue
-            .commandBuffer()
-            .expect("malus: failed to create MTLCommandBuffer");
-        *guard = Some(cmd_buf);
-    }
-    let cmd_buf = guard.as_ref().unwrap();
+    let (cmd_buf, gen) = ensure_command_buffer(ctx, &mut guard);
 
     let encoder = cmd_buf
         .computeCommandEncoder()
@@ -1556,6 +1644,11 @@ pub extern "C" fn kernel_dispatch(kernel_id: u64, handles: *const i64, count: us
     };
     encoder.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
     encoder.endEncoding();
+    output_tb.last_write_gen.store(gen, Ordering::Release);
+    drop(guard);
+    if sync_dispatch() {
+        gpu_barrier();
+    }
 
     output_handle
 }
@@ -1619,13 +1712,7 @@ pub extern "C" fn kernel_dispatch_v2(
     let tg   = unsafe { std::slice::from_raw_parts(tg_dims, 3) };
 
     let mut guard = ctx.current_command_buffer.lock().unwrap();
-    if guard.is_none() {
-        let cmd_buf = ctx.command_queue
-            .commandBuffer()
-            .expect("malus: kernel_dispatch_v2 failed to create MTLCommandBuffer");
-        *guard = Some(cmd_buf);
-    }
-    let cmd_buf = guard.as_ref().unwrap();
+    let (cmd_buf, gen) = ensure_command_buffer(ctx, &mut guard);
 
     let encoder = cmd_buf
         .computeCommandEncoder()
@@ -1692,6 +1779,11 @@ pub extern "C" fn kernel_dispatch_v2(
     let tg_size   = MTLSize { width: tg[0],   height: tg[1],   depth: tg[2] };
     encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_size, tg_size);
     encoder.endEncoding();
+    output_tb.last_write_gen.store(gen, Ordering::Release);
+    drop(guard);
+    if sync_dispatch() {
+        gpu_barrier();
+    }
 
     output_handle
 }

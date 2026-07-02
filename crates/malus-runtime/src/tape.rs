@@ -906,6 +906,7 @@ mod cpu_fallback {
     }
 
     fn read(handle: i64) -> Vec<f32> {
+        crate::metal::flush_if_pending(handle);
         let t = tb(handle);
         let ptr = t.buffer.contents().as_ptr() as *const f32;
         unsafe { std::slice::from_raw_parts(ptr, t.len).to_vec() }
@@ -1066,6 +1067,7 @@ mod cpu_fallback {
 
     extern "C" fn sum_bwd(x: i64, dout: i64) -> i64 {
         let scalar_val = {
+            crate::metal::flush_if_pending(dout);
             let t = tb(dout);
             let ptr = t.buffer.contents().as_ptr() as *const f32;
             unsafe { *ptr }
@@ -1199,6 +1201,7 @@ mod cpu_fallback {
         let c = tb(probs).shape[1];
         let scale = read(dout)[0] / n as f32;
         let mut grad_data = read(probs);
+        crate::metal::flush_if_pending(targets);
         let tgt_buf = tb(targets).buffer.contents().as_ptr() as *const u8;
         let tgt_dtype = tb(targets).dtype;
         for i in 0..n {

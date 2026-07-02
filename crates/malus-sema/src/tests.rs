@@ -7,6 +7,18 @@ fn check_src(src: &str) -> Result<crate::TypedProgram, Vec<SemaError>> {
     check(&program, &HashMap::new())
 }
 
+/// M31: static barrier insertion is off by default; barrier-placement tests
+/// opt back in to keep the (flag-gated) pass's logic covered until V6
+/// deletes it.
+fn check_src_with_barriers(src: &str) -> Result<crate::TypedProgram, Vec<SemaError>> {
+    let program = parse(malus_syntax::FileId(0), src).expect("parse failed");
+    crate::check_with_options(
+        &program,
+        &HashMap::new(),
+        crate::CheckOptions { insert_static_barriers: true },
+    )
+}
+
 // ── Happy path ────────────────────────────────────────────────────────────────
 
 #[test]
@@ -21,7 +33,7 @@ fn main():
 kernel add(a: Tensor<f32>, b: Tensor<f32>) -> Tensor<f32>:
     return a + b
 "#;
-    let typed = check_src(src).expect("should type-check without errors");
+    let typed = check_src_with_barriers(src).expect("should type-check without errors");
     assert_eq!(typed.fns.len(), 1);
     assert_eq!(typed.kernels.len(), 1);
 
@@ -333,7 +345,7 @@ fn main():
     let c = a + b
     print(c)
 "#;
-    let typed = check_src(src).expect("should type-check");
+    let typed = check_src_with_barriers(src).expect("should type-check");
     let main = typed.fns.iter().find(|f| f.name == "main").unwrap();
     let has_barrier = main.body.iter().any(|s| matches!(s, TypedStmt::GpuBarrier));
     assert!(has_barrier, "GpuBarrier should be present: a + b in fn body produces a pending tensor");
@@ -351,7 +363,7 @@ fn main():
     let c = add(a, b)
     print(c)
 "#;
-    let typed = check_src(src).expect("should type-check");
+    let typed = check_src_with_barriers(src).expect("should type-check");
     let add_fn = typed.fns.iter().find(|f| f.name == "add").unwrap();
     let has_barrier = add_fn.body.iter().any(|s| matches!(s, TypedStmt::GpuBarrier));
     assert!(has_barrier, "GpuBarrier should be present before return of a tensor BinOp result");
@@ -367,7 +379,7 @@ fn main():
     let z = add(1.0, 2.0)
     print(z)
 "#;
-    let typed = check_src(src).expect("should type-check");
+    let typed = check_src_with_barriers(src).expect("should type-check");
     let add_fn = typed.fns.iter().find(|f| f.name == "add").unwrap();
     let has_barrier = add_fn.body.iter().any(|s| matches!(s, TypedStmt::GpuBarrier));
     assert!(!has_barrier, "scalar BinOp must not trigger GPU barrier insertion");

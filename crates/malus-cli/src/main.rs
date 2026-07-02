@@ -12,9 +12,12 @@ mod tests;
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let bench = args.iter().skip(1).any(|a| a == "--bench");
+    // M31 A/B lever: re-enable CTMM's static GpuBarrier insertion (each one
+    // is a full commit+wait). Undocumented; slated for deletion in V6.
+    let static_barriers = args.iter().skip(1).any(|a| a == "--static-barriers");
     let path = args.iter().skip(1).find(|a| !a.starts_with("--"));
     match path {
-        Some(path) => run_script(path, bench),
+        Some(path) => run_script(path, bench, static_barriers),
         None => run_repl(),
     }
 }
@@ -82,7 +85,7 @@ fn emit_load_error(e: &LoadError) {
     }
 }
 
-fn run_script(path: &str, bench: bool) {
+fn run_script(path: &str, bench: bool, static_barriers: bool) {
     let abs = std::path::Path::new(path);
     let loaded = match malus_loader::ModuleLoader::new().load(abs) {
         Ok(l) => l,
@@ -97,7 +100,8 @@ fn run_script(path: &str, bench: bool) {
     stdlib_items.extend(loaded.program.items.into_iter());
     let full_program = malus_syntax::ast::Program { items: stdlib_items };
 
-    let typed = match malus_sema::check(&full_program, &loaded.module_aliases) {
+    let options = malus_sema::CheckOptions { insert_static_barriers: static_barriers };
+    let typed = match malus_sema::check_with_options(&full_program, &loaded.module_aliases, options) {
         Ok(t) => t,
         Err(errors) => {
             for e in &errors {

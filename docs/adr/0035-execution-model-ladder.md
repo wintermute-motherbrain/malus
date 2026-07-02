@@ -28,6 +28,7 @@ It is also surprising that read-safety moves *from* the compiler *to* the runtim
 
 - `tensor_matmul`'s contract changes: its result is a **pending** tensor, not ready. CONTEXT.md's "Ready tensor" entry (which lists MPS ops as ready-after-wait) must be amended in M31.
 - `gpu_barrier()` stops being the ambient safety mechanism; correctness lives in `flush_if_pending` on host reads. Tests must pass with static barrier insertion disabled (M31 done-when #4) to prove the runtime guarantee stands alone.
+- (M31 implementation, 2026-07-01) `insert_barriers` is **off by default**, not merely optional: under async every static `GpuBarrier` is a full commit+wait fired before pending drops, which would re-create sync-per-drop and protects nothing (drops are memory-safe — command buffers retain resources). It survives behind an opt-in flag (`CheckOptions::insert_static_barriers` / hidden `--static-barriers`) as an A/B lever, to be deleted when V6's static commit-planner lands. GPU errors panic at the flush point with the Metal error description; `MALUS_SYNC_DISPATCH=1` restores per-op fault attribution.
 - Loss printing (or any per-step host read) forces one flush per step — the same cadence PyTorch pays for `.item()`. This is the natural pipeline boundary, not a defect.
 - Buffer pooling (M32) depends on the pending machinery: a buffer is recyclable only when its last writing generation has completed.
 - The ladder is recorded so V6 work starts from "add the static planner," not from re-debating capture.

@@ -946,13 +946,10 @@ fn adamw_gpt_params(opt: AdamW, mut gpt: GPT, mut st: GPTState, t: i64):
 "#;
 
 fn nanogpt_train_src(max_steps: i64, record_loss_at_last_step: bool) -> String {
-    // gpu_barrier() is only inserted by CTMM before a *drop* of a pending
-    // tensor, never before a plain read — loss (a Variable, RC-managed, not
-    // CTMM-static-dropped) can be read before its GPU computation is
-    // visible. A throwaway static-drop Tensor read reliably forces the
-    // flush (see examples/gradient_check.ml's __flush()).
+    // M31: `loss.data[0]` auto-flushes pending GPU work (runtime per-buffer
+    // pending tracking, ADR-0035) — no workaround read needed.
     let record_call = if record_loss_at_last_step {
-        "        if step == max_steps:\n            let flush_t = ones(1)\n            let flush_v = flush_t[0]\n            record_diff(loss.data[0])\n"
+        "        if step == max_steps:\n            record_diff(loss.data[0])\n"
     } else {
         ""
     };

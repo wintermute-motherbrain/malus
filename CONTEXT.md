@@ -58,15 +58,15 @@ Whether a tensor is logically associated with CPU or GPU. Explicit at creation, 
 _Avoid_: Device, location
 
 **In-flight tensor**:
-A tensor that has been passed to a kernel whose GPU work has not yet been committed. The compiler inserts a GPU barrier before any CPU-side access (free, read, or return) of an in-flight tensor.
+A tensor that has been passed to a GPU op whose work has not yet been committed. Since M31, freeing one is memory-safe (Metal command buffers retain referenced resources) and reads are guarded by the runtime's pending tracking / auto-flush — the compiler no longer inserts barriers for it by default.
 _Avoid_: Pending input, GPU-active tensor
 
 **Pending tensor**:
-A tensor produced by a kernel whose GPU work has not yet been committed. CPU reads of a pending tensor return stale data unless preceded by a GPU barrier.
+A tensor produced by a GPU op (custom kernel or MPS matmul) whose work has not yet been committed. Since M31, every host-side read auto-flushes first (pending tracking), so user code never observes stale data.
 _Avoid_: Pending output, uncommitted tensor
 
 **Ready tensor**:
-A tensor whose data is already materialized in the `StorageModeShared` buffer and safe to read on the CPU without a barrier. Produced by `tensor_alloc_zeros_gpu`, `tensor_alloc_ones_gpu`, and by MPS-backed ops (e.g. `tensor_matmul`) after they commit and wait. Counterpart to pending tensor.
+A tensor whose data is already materialized in the `StorageModeShared` buffer with no uncommitted GPU writes (commit-generation stamp ≤ last completed generation). Produced by host-initialized allocations (`tensor_alloc_*`, `randn`, `freeze`); since M31, MPS-backed ops (e.g. `tensor_matmul`) return *pending* tensors, and any tensor becomes ready after a flush. Counterpart to pending tensor.
 _Avoid_: CPU tensor, completed tensor
 
 **Shape metadata**:
@@ -74,7 +74,7 @@ The `shape: Vec<usize>` field on `TensorBuffer`, recording the n-dimensional ext
 _Avoid_: Tensor shape, static shape (describing a compile-time feature not yet built)
 
 **Pending set**:
-The CTMM compile-time set of tensor bindings produced or consumed by a GPU-producing expression (`KernelCall`, tensor `BinOp`, or GPU-returning `Call`) since the last `GpuBarrier`. Any CPU-side access of a binding in the pending set triggers a barrier insertion.
+The CTMM compile-time set of tensor bindings produced or consumed by a GPU-producing expression (`KernelCall`, tensor `BinOp`, or GPU-returning `Call`) since the last `GpuBarrier`, driving static barrier insertion. Since M31 that pass is off by default (an opt-in A/B lever, `--static-barriers`); read safety is the runtime's pending tracking / auto-flush. Slated for deletion when V6's static commit-planner lands.
 _Avoid_: GPU-active set
 
 **Broadcasting**:
@@ -163,7 +163,7 @@ _Avoid_: Builtin kernel, intrinsic kernel, stdlib kernel
 The type regime inside a kernel body. Tensor parameters are bound as their *element* scalar type (`f32`, not `Tensor<f32>`). The body is checked as per-thread scalar math; the final `return` expression must have the return tensor's element type. Codegen emits `x[tid]` for params and bare `name` for `let`-bound locals. This means kernel-body comparison operators yield the operand's scalar dtype (a float mask), not `Bool`. `fn`-body BinOp rules and scalar-broadcast rules do not apply inside kernels.
 _Avoid_: Scalar-space, thread-space, per-element computation
 
-### Execution (V5, planned)
+### Execution (V5 — M31 shipped)
 
 **Async dispatch substrate**:
 The V5 (M31) execution model: every GPU op — custom kernels and MPS matmul alike — encodes into the shared command buffer without committing; commits happen only when the host actually reads data. Phase 1 of the execution-model ladder (compile-time graph is the endgame; runtime lazy graph capture rejected). See ADR-0035.

@@ -126,7 +126,7 @@ pub use metal::{
     tensor_randn,
     // M22 rand_uniform + rand_int + tensor_get_f32
     malus_rand_uniform, malus_rand_int, malus_tensor_get_f32,
-    kernel_dispatch, gpu_barrier, Dtype, TensorBuffer,
+    kernel_dispatch, gpu_barrier, flush_if_pending, tensor_is_pending, Dtype, TensorBuffer,
     // M23 — extended dispatch ABI (de-risk spike retired in M24)
     kernel_dispatch_v2,
 };
