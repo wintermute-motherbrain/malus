@@ -1,15 +1,15 @@
 use std::cell::Cell;
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::AnyThread;
-use objc2_foundation::NSString;
+use objc2_foundation::{NSRange, NSString};
 use objc2_metal::{
-    MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue,
-    MTLComputeCommandEncoder, MTLComputePipelineState, MTLCreateSystemDefaultDevice,
-    MTLDevice, MTLLibrary, MTLResourceOptions, MTLSize,
+    MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus,
+    MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLComputePipelineState,
+    MTLCreateSystemDefaultDevice, MTLDevice, MTLLibrary, MTLResourceOptions, MTLSize,
 };
 use objc2_metal_performance_shaders::{
     MPSDataType, MPSMatrix, MPSMatrixDescriptor, MPSMatrixMultiplication,
@@ -71,6 +71,19 @@ struct MetalContext {
     // states — so `runtime_init` reuses an existing pipeline when the
     // source text already matches one it has compiled before.
     pipelines_by_source: Mutex<HashMap<String, Retained<ProtocolObject<dyn MTLComputePipelineState>>>>,
+    // M32 buffer pool: exact-size free-lists keyed on the MTLBuffer's
+    // allocated byte length. Each entry carries the buffer's last-use
+    // generation; it is reusable only once that generation has completed
+    // (ADR-0039). Releases can arrive out of gen order, so pop scans the
+    // bucket for the first completed entry. Leaf lock: never acquired
+    // while holding `current_command_buffer`.
+    pool: Mutex<HashMap<usize, std::collections::VecDeque<(u64, Retained<ProtocolObject<dyn MTLBuffer>>)>>>,
+    // M32: MPSMatrixMultiplication kernels cached by (result rows, result
+    // cols, interior cols) — the only init parameters that vary (transpose
+    // flags/alpha/beta are fixed by the init used). MPS kernels are
+    // stateless at encode time and reusable across command buffers; shapes
+    // are static across training steps, so the cache stays tiny.
+    mm_kernels: Mutex<HashMap<(usize, usize, usize), Retained<MPSMatrixMultiplication>>>,
 }
 
 // Safety: Metal objects are thread-safe per the Metal specification.
@@ -92,8 +105,97 @@ fn context() -> &'static MetalContext {
             current_command_buffer: Mutex::new(None),
             pipelines: Mutex::new(HashMap::new()),
             pipelines_by_source: Mutex::new(HashMap::new()),
+            pool: Mutex::new(HashMap::new()),
+            mm_kernels: Mutex::new(HashMap::new()),
         }
     })
+}
+
+// ── M32 buffer pool stats (ADR-0031 counter pattern; see malus_rc_counts) ────
+
+use std::sync::atomic::AtomicI64;
+
+static POOL_HITS: AtomicI64 = AtomicI64::new(0);
+static POOL_MISSES: AtomicI64 = AtomicI64::new(0);
+static POOLED_BYTES: AtomicI64 = AtomicI64::new(0);
+static LIVE_BYTES: AtomicI64 = AtomicI64::new(0);
+static PEAK_DEVICE_BYTES: AtomicI64 = AtomicI64::new(0);
+
+// M32 memory budget: soft ceiling on total device bytes (live + pooled),
+// enforced by the valve in `alloc_tensor_impl` — a flush-and-retry, not a
+// hard cap. Without it, a training loop that never reads the GPU never
+// advances COMPLETED_GEN, so the pool never cycles and device memory grows
+// by one step's temporaries per step. -1 = uninitialized; first read
+// derives from MALUS_MEM_BUDGET_MB (0 = unlimited) or the 8 GiB default.
+static MEM_BUDGET_BYTES: AtomicI64 = AtomicI64::new(-1);
+const DEFAULT_MEM_BUDGET_BYTES: i64 = 8 << 30;
+
+fn mem_budget_bytes() -> i64 {
+    let v = MEM_BUDGET_BYTES.load(Ordering::Relaxed);
+    if v >= 0 {
+        return v;
+    }
+    let init = match std::env::var("MALUS_MEM_BUDGET_MB").ok().and_then(|s| s.parse::<i64>().ok()) {
+        Some(0) => i64::MAX,
+        Some(mb) if mb > 0 => mb << 20,
+        _ => DEFAULT_MEM_BUDGET_BYTES,
+    };
+    MEM_BUDGET_BYTES.store(init, Ordering::Relaxed);
+    init
+}
+
+/// Test/CLI helper: override the memory budget in bytes. Negative restores
+/// the env/default-derived budget.
+pub fn malus_set_mem_budget(bytes: i64) {
+    MEM_BUDGET_BYTES.store(bytes.max(-1), Ordering::Relaxed);
+}
+
+/// (hits, misses, pooled_bytes, peak_device_bytes). Not `extern "C"` — Rust
+/// tuple, test/CLI helper only, same pattern as `malus_rc_counts`.
+pub fn malus_pool_stats() -> (i64, i64, i64, i64) {
+    (
+        POOL_HITS.load(Ordering::SeqCst),
+        POOL_MISSES.load(Ordering::SeqCst),
+        POOLED_BYTES.load(Ordering::SeqCst),
+        PEAK_DEVICE_BYTES.load(Ordering::SeqCst),
+    )
+}
+
+/// Sorted (bucket_size, entry_count) snapshot, for the leak-stabilization test.
+pub fn malus_pool_buckets() -> Vec<(usize, usize)> {
+    let pool = context().pool.lock().unwrap();
+    let mut v: Vec<(usize, usize)> = pool.iter().map(|(k, q)| (*k, q.len())).collect();
+    v.sort_unstable();
+    v
+}
+
+/// Drain the pool (dropping the pooled MTLBuffers) and zero the counters.
+/// Peak resets to the currently live bytes. Mandatory in test setup — the
+/// pool is process-global and would otherwise leak stats across tests.
+#[no_mangle]
+pub extern "C" fn malus_pool_reset() {
+    let mut pool = context().pool.lock().unwrap();
+    pool.clear();
+    POOL_HITS.store(0, Ordering::SeqCst);
+    POOL_MISSES.store(0, Ordering::SeqCst);
+    POOLED_BYTES.store(0, Ordering::SeqCst);
+    PEAK_DEVICE_BYTES.store(LIVE_BYTES.load(Ordering::SeqCst), Ordering::SeqCst);
+}
+
+/// MALUS_ALLOC_HISTOGRAM=1 records a size→count histogram of every tensor
+/// allocation request (pool hit or miss); the CLI dumps it after the run.
+fn alloc_histogram_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MALUS_ALLOC_HISTOGRAM").as_deref() == Ok("1"))
+}
+
+static ALLOC_HISTOGRAM: Mutex<Option<HashMap<usize, u64>>> = Mutex::new(None);
+
+pub fn malus_alloc_histogram() -> Vec<(usize, u64)> {
+    let guard = ALLOC_HISTOGRAM.lock().unwrap();
+    let mut v: Vec<(usize, u64)> = guard.iter().flatten().map(|(k, c)| (*k, *c)).collect();
+    v.sort_unstable();
+    v
 }
 
 // ── M31 pending tracking (ADR-0035) ──────────────────────────────────────────
@@ -156,6 +258,25 @@ pub fn tensor_is_pending(handle: i64) -> bool {
     tb.last_write_gen.load(Ordering::Acquire) > COMPLETED_GEN.load(Ordering::Acquire)
 }
 
+/// M32: per-MTLBuffer pool state, shared across reshape aliases (they wrap
+/// the same MTLBuffer, so a use through any alias must be visible when any
+/// other alias is the one released into the pool).  The Arc's strong count
+/// doubles as the alias-liveness signal: the MTLBuffer may enter the pool
+/// only when the last TensorBuffer referencing it dies (strong_count == 1).
+pub struct PoolState {
+    /// Generation of the command buffer that last encoded ANY use of this
+    /// MTLBuffer — input or output.  Write-gen alone is insufficient for
+    /// pooling: a ready buffer that is an in-flight *input* to uncommitted
+    /// work must not be recycled (the pool would hand it out for a CPU
+    /// memcpy that races the not-yet-executed GPU read).  Every encode site
+    /// must stamp every buffer it touches (ADR-0039).
+    pub last_use_gen: AtomicU64,
+}
+
+fn stamp_use(tb: &TensorBuffer, gen: u64) {
+    tb.pool_state.last_use_gen.store(gen, Ordering::Relaxed);
+}
+
 pub struct TensorBuffer {
     pub buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
     pub dtype: Dtype,
@@ -170,6 +291,8 @@ pub struct TensorBuffer {
     /// Pending iff > COMPLETED_GEN.  Reshape aliases must inherit this — they
     /// share the underlying MTLBuffer.
     pub last_write_gen: AtomicU64,
+    /// M32: shared pool state (see PoolState). Reshape aliases clone the Arc.
+    pub pool_state: Arc<PoolState>,
 }
 
 // ── Runtime init: compile all MSL kernels ─────────────────────────────────────
@@ -221,6 +344,33 @@ pub extern "C" fn tensor_alloc_gpu(
     ndims: usize,
     data: *const f32,
 ) -> i64 {
+    alloc_tensor_impl(dtype, shape_ptr, ndims, data).0
+}
+
+fn pool_pop(ctx: &MetalContext, alloc_len: usize) -> Option<Retained<ProtocolObject<dyn MTLBuffer>>> {
+    let completed = COMPLETED_GEN.load(Ordering::Acquire);
+    let mut pool = ctx.pool.lock().unwrap();
+    pool.get_mut(&alloc_len).and_then(|bucket| {
+        // Releases can arrive out of gen order (a buffer last used at
+        // gen 5 may be released after one used at gen 6), so scan for
+        // the first completed entry. Buckets hold at most a few entries
+        // per size at steady state.
+        bucket
+            .iter()
+            .position(|(g, _)| *g <= completed)
+            .and_then(|i| bucket.remove(i))
+            .map(|(_, buf)| buf)
+    })
+}
+
+/// Shared allocation path. Returns (handle, drawn_from_pool) — the zeros
+/// path must know, because pooled buffers are dirty and need a GPU fill.
+fn alloc_tensor_impl(
+    dtype: i32,
+    shape_ptr: *const usize,
+    ndims: usize,
+    data: *const f32,
+) -> (i64, bool) {
     let dt = Dtype::from_tag(dtype);
     match dt {
         Dtype::F32 | Dtype::I32 | Dtype::I64 => {}
@@ -235,9 +385,52 @@ pub extern "C" fn tensor_alloc_gpu(
     // tensors (`zeros(0)`, empty kernel output) are safe to allocate and free.
     // `tb.len` stays = n (0) so slices and shape queries remain correct.
     let alloc_len = byte_len.max(1);
-    let buffer = ctx.device
-        .newBufferWithLength_options(alloc_len, MTLResourceOptions::StorageModeShared)
-        .expect("malus: failed to allocate MTLBuffer");
+
+    if alloc_histogram_enabled() {
+        *ALLOC_HISTOGRAM.lock().unwrap()
+            .get_or_insert_with(HashMap::new)
+            .entry(alloc_len).or_insert(0) += 1;
+    }
+
+    let mut pooled_buffer = pool_pop(ctx, alloc_len);
+    if pooled_buffer.is_none() {
+        // M32 memory budget valve: a miss that would push device bytes past
+        // the budget flushes the shared command buffer once — completing the
+        // pending generations that gate reuse — and retries the pool. Only
+        // fires when this size's bucket holds (pending) entries a flush would
+        // actually unlock; first-touch sizes allocate fresh regardless, so
+        // the valve is soft (correctness over cap). Deadlock-safe only
+        // because no tensor alloc ever happens while `current_command_buffer`
+        // is held (every encode site allocates its output before taking the
+        // guard).
+        let projected = LIVE_BYTES.load(Ordering::Relaxed)
+            + POOLED_BYTES.load(Ordering::Relaxed)
+            + alloc_len as i64;
+        if projected > mem_budget_bytes()
+            && ctx.pool.lock().unwrap().get(&alloc_len).is_some_and(|b| !b.is_empty())
+        {
+            gpu_barrier();
+            pooled_buffer = pool_pop(ctx, alloc_len);
+        }
+    }
+    let pooled = pooled_buffer.is_some();
+
+    let buffer = match pooled_buffer {
+        Some(buf) => {
+            POOL_HITS.fetch_add(1, Ordering::Relaxed);
+            POOLED_BYTES.fetch_sub(alloc_len as i64, Ordering::Relaxed);
+            LIVE_BYTES.fetch_add(alloc_len as i64, Ordering::Relaxed);
+            buf
+        }
+        None => {
+            POOL_MISSES.fetch_add(1, Ordering::Relaxed);
+            let live = LIVE_BYTES.fetch_add(alloc_len as i64, Ordering::Relaxed) + alloc_len as i64;
+            PEAK_DEVICE_BYTES.fetch_max(live + POOLED_BYTES.load(Ordering::Relaxed), Ordering::Relaxed);
+            ctx.device
+                .newBufferWithLength_options(alloc_len, MTLResourceOptions::StorageModeShared)
+                .expect("malus: failed to allocate MTLBuffer")
+        }
+    };
 
     if !data.is_null() && n > 0 {
         unsafe {
@@ -256,15 +449,38 @@ pub extern "C" fn tensor_alloc_gpu(
         shape,
         ref_count: std::sync::atomic::AtomicUsize::new(1),
         last_write_gen: AtomicU64::new(0),
+        pool_state: Arc::new(PoolState { last_use_gen: AtomicU64::new(0) }),
     });
     crate::alloc_inc();
-    Box::into_raw(tb) as i64
+    (Box::into_raw(tb) as i64, pooled)
 }
 
 #[no_mangle]
 pub extern "C" fn tensor_alloc_zeros_gpu(shape_ptr: *const usize, ndims: usize) -> i64 {
-    // Metal allocates zero-initialized StorageModeShared buffers by default.
-    tensor_alloc_gpu(0, shape_ptr, ndims, std::ptr::null())
+    let (handle, pooled) = alloc_tensor_impl(0, shape_ptr, ndims, std::ptr::null());
+    if pooled {
+        // Fresh StorageModeShared buffers arrive OS-zeroed; pooled buffers
+        // are dirty. A GPU blit fill keeps zeros off the CPU hot path, and
+        // stamping the write gen makes any host read auto-flush (ADR-0035).
+        // Zero byte-pattern is a valid zero for every supported dtype.
+        let tb = unsafe { &*(handle as *const TensorBuffer) };
+        let byte_len = (tb.len * tb.dtype.element_size()).max(1);
+        let ctx = context();
+        let mut guard = ctx.current_command_buffer.lock().unwrap();
+        let (cmd_buf, gen) = ensure_command_buffer(ctx, &mut guard);
+        let blit = cmd_buf
+            .blitCommandEncoder()
+            .expect("malus: tensor_alloc_zeros_gpu failed to create MTLBlitCommandEncoder");
+        blit.fillBuffer_range_value(&*tb.buffer, NSRange { location: 0, length: byte_len }, 0);
+        blit.endEncoding();
+        tb.last_write_gen.store(gen, Ordering::Release);
+        stamp_use(tb, gen);
+        drop(guard);
+        if sync_dispatch() {
+            gpu_barrier();
+        }
+    }
+    handle
 }
 
 #[no_mangle]
@@ -313,8 +529,24 @@ pub extern "C" fn tensor_release(handle: i64) {
         panic!("malus: over-release of tensor handle {handle:#x} (refcount already zero) — likely a borrow-inference or tape-retain bug");
     }
     if prev == 1 {
+        // tape_on_release can recursively release (grad handles) — it must
+        // finish before we touch the pool lock (leaf-lock discipline).
         crate::tape::tape_on_release(handle);
-        unsafe { drop(Box::from_raw(handle as *mut TensorBuffer)); }
+        let tb = unsafe { Box::from_raw(handle as *mut TensorBuffer) };
+        let key = (tb.len * tb.dtype.element_size()).max(1);
+        // Pool the MTLBuffer only when this is the last TensorBuffer aliasing
+        // it (reshape aliases share the Arc<PoolState>); otherwise just drop
+        // the box — the surviving alias keeps the MTLBuffer alive, and the
+        // byte ledgers move only on the aliases' last death.
+        if Arc::strong_count(&tb.pool_state) == 1 {
+            let gen = tb.pool_state.last_use_gen.load(Ordering::Relaxed);
+            LIVE_BYTES.fetch_sub(key as i64, Ordering::Relaxed);
+            POOLED_BYTES.fetch_add(key as i64, Ordering::Relaxed);
+            context().pool.lock().unwrap()
+                .entry(key).or_default()
+                .push_back((gen, tb.buffer.clone()));
+        }
+        drop(tb);
     }
 }
 
@@ -567,6 +799,20 @@ pub fn tensor_matmul_cpu(handle_a: i64, handle_b: i64) -> i64 {
     }
 }
 
+// M32: cached lookup — creating an MPSMatrixMultiplication per call was
+// measurable per-op overhead. Leaf lock; released before the command-buffer
+// guard is taken at the encode sites.
+fn mps_matmul_kernel(ctx: &MetalContext, m: usize, n: usize, k: usize) -> Retained<MPSMatrixMultiplication> {
+    let mut cache = ctx.mm_kernels.lock().unwrap();
+    cache
+        .entry((m, n, k))
+        .or_insert_with(|| unsafe {
+            MPSMatrixMultiplication::initWithDevice_resultRows_resultColumns_interiorColumns(
+                MPSMatrixMultiplication::alloc(), &*ctx.device, m, n, k)
+        })
+        .clone()
+}
+
 // MPS matmul via MPSMatrixMultiplication. M31: encodes into the shared
 // command buffer like every other op — no leading barrier (encoder order +
 // hazard tracking serialize against pending kernel work in the same buffer),
@@ -601,12 +847,14 @@ pub extern "C" fn tensor_matmul(handle_a: i64, handle_b: i64) -> i64 {
                 let mat_a = MPSMatrix::initWithBuffer_descriptor(MPSMatrix::alloc(),&*a.buffer, &desc_a);
                 let mat_b = MPSMatrix::initWithBuffer_descriptor(MPSMatrix::alloc(),&*b.buffer, &desc_b);
                 let mat_c = MPSMatrix::initWithBuffer_descriptor(MPSMatrix::alloc(),&*c_tb.buffer, &desc_c);
-                let mm = MPSMatrixMultiplication::initWithDevice_resultRows_resultColumns_interiorColumns(
-                    MPSMatrixMultiplication::alloc(),&*ctx.device, m, n, k);
+                let mm = mps_matmul_kernel(ctx, m, n, k);
                 let mut guard = ctx.current_command_buffer.lock().unwrap();
                 let (cmd_buf, gen) = ensure_command_buffer(ctx, &mut guard);
                 mm.encodeToCommandBuffer_leftMatrix_rightMatrix_resultMatrix(&**cmd_buf, &mat_a, &mat_b, &mat_c);
                 c_tb.last_write_gen.store(gen, Ordering::Release);
+                stamp_use(a, gen);
+                stamp_use(b, gen);
+                stamp_use(c_tb, gen);
             }
             if sync_dispatch() {
                 gpu_barrier();
@@ -640,8 +888,7 @@ pub extern "C" fn tensor_matmul(handle_a: i64, handle_b: i64) -> i64 {
                 let desc_a = MPSMatrixDescriptor::matrixDescriptorWithRows_columns_rowBytes_dataType(m, k, k * 4, MPSDataType::Float32);
                 let desc_b = MPSMatrixDescriptor::matrixDescriptorWithRows_columns_rowBytes_dataType(k, n, n * 4, MPSDataType::Float32);
                 let desc_c = MPSMatrixDescriptor::matrixDescriptorWithRows_columns_rowBytes_dataType(m, n, n * 4, MPSDataType::Float32);
-                let mm = MPSMatrixMultiplication::initWithDevice_resultRows_resultColumns_interiorColumns(
-                    MPSMatrixMultiplication::alloc(),&*ctx.device, m, n, k);
+                let mm = mps_matmul_kernel(ctx, m, n, k);
                 let mut guard = ctx.current_command_buffer.lock().unwrap();
                 let (cmd_buf, gen) = ensure_command_buffer(ctx, &mut guard);
                 for bx in 0..batch {
@@ -654,6 +901,9 @@ pub extern "C" fn tensor_matmul(handle_a: i64, handle_b: i64) -> i64 {
                     mm.encodeToCommandBuffer_leftMatrix_rightMatrix_resultMatrix(&**cmd_buf, &mat_a, &mat_b, &mat_c);
                 }
                 c_tb.last_write_gen.store(gen, Ordering::Release);
+                stamp_use(a, gen);
+                stamp_use(b, gen);
+                stamp_use(c_tb, gen);
             }
             if sync_dispatch() {
                 gpu_barrier();
@@ -683,8 +933,7 @@ pub extern "C" fn tensor_matmul(handle_a: i64, handle_b: i64) -> i64 {
                 let desc_c = MPSMatrixDescriptor::matrixDescriptorWithRows_columns_rowBytes_dataType(m, n, n * 4, MPSDataType::Float32);
                 // B is the same 2-D matrix for every batch slice
                 let mat_b = MPSMatrix::initWithBuffer_descriptor(MPSMatrix::alloc(),&*b.buffer, &desc_b);
-                let mm = MPSMatrixMultiplication::initWithDevice_resultRows_resultColumns_interiorColumns(
-                    MPSMatrixMultiplication::alloc(),&*ctx.device, m, n, k);
+                let mm = mps_matmul_kernel(ctx, m, n, k);
                 let mut guard = ctx.current_command_buffer.lock().unwrap();
                 let (cmd_buf, gen) = ensure_command_buffer(ctx, &mut guard);
                 for bx in 0..batch {
@@ -695,6 +944,9 @@ pub extern "C" fn tensor_matmul(handle_a: i64, handle_b: i64) -> i64 {
                     mm.encodeToCommandBuffer_leftMatrix_rightMatrix_resultMatrix(&**cmd_buf, &mat_a, &mat_b, &mat_c);
                 }
                 c_tb.last_write_gen.store(gen, Ordering::Release);
+                stamp_use(a, gen);
+                stamp_use(b, gen);
+                stamp_use(c_tb, gen);
             }
             if sync_dispatch() {
                 gpu_barrier();
@@ -1125,6 +1377,9 @@ pub(crate) fn reshape_to(handle: i64, new_shape: &[usize]) -> i64 {
         ref_count: std::sync::atomic::AtomicUsize::new(1),
         // Same MTLBuffer — a pending source stays pending through the alias.
         last_write_gen: AtomicU64::new(tb.last_write_gen.load(Ordering::Acquire)),
+        // Shared, not snapshotted: uses keep happening after alias creation,
+        // and the pool gates on the *latest* use through any alias.
+        pool_state: tb.pool_state.clone(),
     };
     Box::into_raw(Box::new(new_tb)) as i64
 }
@@ -1645,6 +1900,10 @@ pub extern "C" fn kernel_dispatch(kernel_id: u64, handles: *const i64, count: us
     encoder.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
     encoder.endEncoding();
     output_tb.last_write_gen.store(gen, Ordering::Release);
+    for input in &inputs {
+        stamp_use(input, gen);
+    }
+    stamp_use(output_tb, gen);
     drop(guard);
     if sync_dispatch() {
         gpu_barrier();
@@ -1725,18 +1984,16 @@ pub extern "C" fn kernel_dispatch_v2(
     unsafe { encoder.setBuffer_offset_atIndex(Some(&*output_tb.buffer), 0, handle_count) };
 
     if uniforms_bytes > 0 && !uniforms.is_null() {
-        let uniform_buf = ctx.device
-            .newBufferWithLength_options(uniforms_bytes, MTLResourceOptions::StorageModeShared)
-            .expect("malus: kernel_dispatch_v2 failed to allocate uniform buffer");
+        // M32: setBytes instead of a per-dispatch MTLBuffer — Metal copies
+        // the bytes into the command buffer immediately (≤4 KB limit; the
+        // uniforms blob is a handful of scalars).
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                uniforms as *const u8,
-                uniform_buf.contents().as_ptr() as *mut u8,
+            encoder.setBytes_length_atIndex(
+                std::ptr::NonNull::new_unchecked(uniforms as *mut std::ffi::c_void),
                 uniforms_bytes,
+                handle_count + 1,
             );
         }
-        unsafe { encoder.setBuffer_offset_atIndex(Some(&*uniform_buf), 0, handle_count + 1) };
-        // uniform_buf drops here; the Metal encoder retains it until command buffer completion.
     }
 
     // D5 TensorMeta binding convention: bind a {u32 ndim; u32 shape[8]; u32 strides[8]} for
@@ -1759,19 +2016,16 @@ pub extern "C" fn kernel_dispatch_v2(
             meta[1 + k] = tb.shape[k] as u32;
             meta[9 + k] = strides[k] as u32;
         }
+        // M32: setBytes instead of a per-tensor MTLBuffer (68 bytes each,
+        // N+1 per dispatch) — Metal copies immediately, so the stack array
+        // lifetime is fine.
         let meta_bytes = 17 * std::mem::size_of::<u32>();
-        let meta_buf = ctx.device
-            .newBufferWithLength_options(meta_bytes, MTLResourceOptions::StorageModeShared)
-            .expect("malus: kernel_dispatch_v2 failed to allocate TensorMeta buffer");
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                meta.as_ptr() as *const u8,
-                meta_buf.contents().as_ptr() as *mut u8,
+            encoder.setBytes_length_atIndex(
+                std::ptr::NonNull::new_unchecked(meta.as_ptr() as *mut std::ffi::c_void),
                 meta_bytes,
+                handle_count + 2 + idx_offset,
             );
-        }
-        unsafe {
-            encoder.setBuffer_offset_atIndex(Some(&*meta_buf), 0, handle_count + 2 + idx_offset);
         }
     }
 
@@ -1780,6 +2034,10 @@ pub extern "C" fn kernel_dispatch_v2(
     encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_size, tg_size);
     encoder.endEncoding();
     output_tb.last_write_gen.store(gen, Ordering::Release);
+    for input in &inputs {
+        stamp_use(input, gen);
+    }
+    stamp_use(output_tb, gen);
     drop(guard);
     if sync_dispatch() {
         gpu_barrier();

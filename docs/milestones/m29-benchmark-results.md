@@ -156,3 +156,57 @@ Supporting measurements, same day:
   pooling), per-call MPS object churn (`MPSMatrix`/`MPSMatrixMultiplication`
   created per matmul — an M32 companion candidate), and per-op encoder
   overhead (V6 fusion territory).
+
+## M32 addendum — buffer pooling + memory budget (measured 2026-07-01)
+
+M32 recycles `MTLBuffer`s through a generation-gated exact-size pool
+(ADR-0039), fills pooled `zeros` via GPU blit, replaces the per-dispatch
+uniforms/TensorMeta `MTLBuffer`s with `setBytes`, and caches
+`MPSMatrixMultiplication` kernels by shape. Same machine, same toy config,
+same methodology as the M30/M31 addenda:
+
+```
+$ malus examples/nanogpt.ml --bench          (5 runs)
+medians: 2.422 / 2.477 / 2.604 / 3.651 / 3.729 ms   (min 2.03, max 6.60)
+malus pool: 113731 hits / 29217 misses (79.6% hit rate), peak device 204.7 MB
+```
+
+**6.065 ms → ~2.6 ms/step (median-of-5 runs 2.604 ms); matched Nx ≈ 0.95x —
+parity with PyTorch-MPS f32 (2.729 ms) at the toy config.** Run-to-run
+medians are bimodal (2.4–2.6 vs 3.6–3.7, likely thermal/scheduler state), so
+the honest statement is "0.9–1.4x, ≈ parity", not the best run. Not the
+gate — M35's ≤2x at the Karpathy config is — but the toy config now sits at
+the level the V5 plan hoped to reach only after fusion.
+
+Supporting measurements, same day:
+
+- **Numerics unchanged**: 300-step loss curve bit-identical to the M31
+  build (fully-overwritten outputs make dirty pooled buffers invisible;
+  blit-filled zeros are exact).
+- **Allocation histogram** (`MALUS_ALLOC_HISTOGRAM=1`, the M32 spec
+  deliverable): exactly 10 distinct sizes over the whole run (4 B–32 KB,
+  all already powers of two). Size-class rounding would be a no-op —
+  exact-size buckets confirmed. The 20% misses are gen-gated (pending
+  entries between flush points), not size scatter; only V6's commit
+  planner can convert those.
+- **Memory-budget proxy at capstone dims** (single-head 6L/384d/T=256/B=64,
+  12 steps): peak device **12.9 GB** (of which ~8.8 GB is end-state pooled
+  temporaries), 541 ms/step, 77.7% hit rate. Peak is set during step 1
+  (first-touch misses for one step's whole temp footprint). Head-folded
+  multi-head multiplies only the `[B,T,T]`-shaped attention tensors by
+  H=6 (≈ +3 GB analytic) → expected real-capstone peak ≈ 16 GB —
+  comfortable headroom on the 48 GB target. A naive B=384 (=B·H)
+  everything-×6 upper bound measured 49.9 GB and swapped (76 s/step); it
+  over-bounds activations 6x and is not representative.
+- **Memory-budget valve**: read-free loops (no host read → no flush → pool
+  never cycles → unbounded growth, a pre-existing M31 behavior) are now
+  bounded by a soft valve — on an over-budget miss whose bucket holds
+  pending entries, flush once and retry (default 8 GiB,
+  `MALUS_MEM_BUDGET_MB`). Unit-tested; realistic loops never hit it.
+- **Pre-existing bugs discovered** (not M32 regressions; reproduced on the
+  M31 build): (a) a loop-carried `let mut x` tensor reassigned across
+  `for` iterations under the tape trips the M29 over-release detector in
+  `backward()`; (b) a 6-deep chain of block-fn calls frees the loss tensor
+  early — `loss.data` after `backward()`+`adamw()` reads a freed buffer
+  (returns 0 pre-M32, recycled garbage post-M32). Both need a sema/tape
+  root-cause pass — candidates for M33/M34 hardening scope.

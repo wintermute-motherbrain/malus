@@ -129,6 +129,9 @@ pub use metal::{
     kernel_dispatch, gpu_barrier, flush_if_pending, tensor_is_pending, Dtype, TensorBuffer,
     // M23 — extended dispatch ABI (de-risk spike retired in M24)
     kernel_dispatch_v2,
+    // M32 — buffer pool observability + memory budget
+    malus_pool_stats, malus_pool_buckets, malus_pool_reset, malus_alloc_histogram,
+    malus_set_mem_budget,
 };
 
 // M26 / ADR-0031 / ADR-0032: retired CPU forward fallback (replaced by malus

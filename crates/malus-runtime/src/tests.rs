@@ -107,14 +107,16 @@ fn test_tensor_alloc_roundtrip() {
 #[test]
 fn test_tensor_alloc_null_data() {
     let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // M32: with the buffer pool, a null-data alloc may receive a dirty
+    // recycled buffer — contents are unspecified. Every caller either
+    // passes data, fully overwrites on GPU, or uses tensor_alloc_zeros_gpu.
     let shape = [4usize];
     let handle = tensor_alloc_gpu(0, shape.as_ptr(), 1, std::ptr::null());
     assert!(handle != 0);
 
     let tb = unsafe { &*(handle as *const TensorBuffer) };
-    let ptr = tb.buffer.contents().as_ptr() as *const f32;
-    let slice = unsafe { std::slice::from_raw_parts(ptr, tb.len) };
-    assert!(slice.iter().all(|v| *v == 0.0), "buffer should be zeroed");
+    assert_eq!(tb.len, 4);
+    assert_eq!(tb.shape, &[4]);
 
     tensor_free(handle);
 }
@@ -1785,4 +1787,58 @@ fn test_bench_report_even_count_averages_middle() {
     assert_eq!(r.median, Duration::from_millis(25));
 
     crate::bench::bench_reset();
+}
+
+// ── M32: buffer pool + memory budget (ADR-0039) ──────────────────────────────
+
+#[test]
+fn test_m32_zeros_pool_hit_is_blit_filled() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    crate::malus_pool_reset();
+
+    // CPU-written tensor: last_use_gen stays 0, so it is reusable the moment
+    // it is released — guaranteeing the zeros alloc below is a pool hit.
+    let dirty = alloc_f32(&[7.5; 256]);
+    tensor_free(dirty);
+
+    let shape = [256usize];
+    let z = tensor_alloc_zeros_gpu(shape.as_ptr(), 1);
+    let (hits, _, _, _) = crate::malus_pool_stats();
+    assert_eq!(hits, 1, "zeros must draw the just-released same-size buffer from the pool");
+    assert_eq!(read_f32(z), vec![0.0; 256], "pooled buffer is dirty — the blit fill must zero it");
+    tensor_free(z);
+
+    crate::malus_pool_reset();
+}
+
+#[test]
+fn test_m32_mem_budget_valve_recycles_under_pressure() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    crate::malus_pool_reset();
+
+    // A read-free loop never advances COMPLETED_GEN on its own, so pooled
+    // matmul outputs stay pending and every alloc would miss — the exact
+    // silent-training failure mode. A tight budget must make the valve
+    // flush and recycle instead of growing device memory per iteration.
+    let a = alloc_2d(&[1.0; 256], 16, 16);
+    let b = alloc_2d(&[1.0; 256], 16, 16);
+    crate::malus_set_mem_budget(4000);
+
+    for _ in 0..64 {
+        let c = tensor_matmul(a, b);
+        tensor_free(c);
+    }
+
+    let (hits, _, pooled, peak) = crate::malus_pool_stats();
+    assert!(hits >= 32, "valve must recycle pooled outputs under budget pressure, got {hits} hits");
+    assert!(
+        peak <= 8192,
+        "peak device bytes must stay near the budget (2 KB live inputs + cycling 1 KB outputs), got {peak}"
+    );
+    assert!(pooled <= 4096, "pool must not accumulate per-iteration outputs, got {pooled} B pooled");
+
+    tensor_free(a);
+    tensor_free(b);
+    crate::malus_set_mem_budget(-1);
+    crate::malus_pool_reset();
 }

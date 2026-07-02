@@ -945,11 +945,16 @@ fn adamw_gpt_params(opt: AdamW, mut gpt: GPT, mut st: GPTState, t: i64):
     gpt.lm_head = variable(gpt.lm_head.data - opt.lr * m_hat_lm / (sqrt(v_hat_lm) + opt.eps))
 "#;
 
-fn nanogpt_train_src(max_steps: i64, record_loss_at_last_step: bool) -> String {
+fn nanogpt_train_src(max_steps: i64, record_loss_at_last_step: bool, read_loss_every_step: bool) -> String {
     // M31: `loss.data[0]` auto-flushes pending GPU work (runtime per-buffer
     // pending tracking, ADR-0035) — no workaround read needed.
+    // M32: `read_loss_every_step` matches how a real training loop behaves
+    // (loss logging); the per-step flush is what lets the buffer pool cycle,
+    // so the pool-stabilization assertion runs against that shape.
     let record_call = if record_loss_at_last_step {
         "        if step == max_steps:\n            record_diff(loss.data[0])\n"
+    } else if read_loss_every_step {
+        "        let observed_loss = loss.data[0]\n"
     } else {
         ""
     };
@@ -1039,7 +1044,7 @@ fn main():
 #[test]
 fn test_v4_m3_full_step_zero_cpu_compute() {
     let _guard = METAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let src = nanogpt_train_src(2, false);
+    let src = nanogpt_train_src(2, false, false);
     let user_program = parse(malus_syntax::FileId(0), &src).expect("parse failed");
     let mut stdlib = malus_stdlib::stdlib_items();
     stdlib.extend(user_program.items.into_iter());
@@ -1081,8 +1086,8 @@ fn test_v4_m3_full_step_zero_cpu_compute() {
 fn test_v4_m29_rc_leak_assertion() {
     let _guard = METAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-    let run = |max_steps: i64| -> (i64, i64, i64) {
-        let src = nanogpt_train_src(max_steps, false);
+    let run = |max_steps: i64| -> ((i64, i64, i64), i64, Vec<(usize, usize)>) {
+        let src = nanogpt_train_src(max_steps, false, true);
         let user_program = parse(malus_syntax::FileId(0), &src).expect("parse failed");
         let mut stdlib = malus_stdlib::stdlib_items();
         stdlib.extend(user_program.items.into_iter());
@@ -1094,13 +1099,15 @@ fn test_v4_m29_rc_leak_assertion() {
         malus_runtime::runtime_init(&registry.into_hashmap());
         let symbols = real_symbols();
         malus_runtime::malus_rc_reset();
+        malus_runtime::malus_pool_reset();
         compile_and_run(&typed, &symbols, &kernel_ids).expect("JIT compile and run failed");
-        malus_runtime::malus_rc_counts()
+        let (_, _, pooled_bytes, _) = malus_runtime::malus_pool_stats();
+        (malus_runtime::malus_rc_counts(), pooled_bytes, malus_runtime::malus_pool_buckets())
     };
 
-    let (r2, rel2, a2) = run(2);
-    let (r3, rel3, a3) = run(3);
-    let (r4, rel4, a4) = run(4);
+    let ((r2, rel2, a2), _, _) = run(2);
+    let ((r3, rel3, a3), pooled3, buckets3) = run(3);
+    let ((r4, rel4, a4), pooled4, buckets4) = run(4);
     let delta_a = (r3 - r2, rel3 - rel2, a3 - a2);
     let delta_b = (r4 - r3, rel4 - rel3, a4 - a3);
 
@@ -1109,6 +1116,19 @@ fn test_v4_m29_rc_leak_assertion() {
         "M29 leak assertion: per-iteration RC delta must be constant across \
          steady-state steps — step2->3 delta {delta_a:?} vs step3->4 delta \
          {delta_b:?}; a growing delta means memory leaks per iteration"
+    );
+
+    // M32 pool stabilization: steady-state steps recycle the same buffers,
+    // so the end-of-run pool must be byte- and bucket-identical regardless
+    // of step count. Per-step growth here means some alloc path bypasses
+    // the pool on the way in but feeds it on the way out (the zeros-bypass
+    // failure mode this assertion was written to catch).
+    assert_eq!(
+        (pooled3, &buckets3),
+        (pooled4, &buckets4),
+        "M32 pool assertion: pool must stabilize across steady-state steps — \
+         3-step end state ({pooled3} B, {buckets3:?}) vs 4-step end state \
+         ({pooled4} B, {buckets4:?}); growth means a per-step pool leak"
     );
 }
 
@@ -1370,7 +1390,7 @@ fn test_nanogpt_loss_decreases() {
     // full pipeline rebuild is both redundant and, empirically, unreliable
     // when it immediately follows another compile_and_run in this process.
     fn typecheck(max_steps: i64) -> malus_sema::TypedProgram {
-        let src = nanogpt_train_src(max_steps, true);
+        let src = nanogpt_train_src(max_steps, true, false);
         let mut user_program = parse(malus_syntax::FileId(0), &src).expect("parse failed");
         let mut stdlib = malus_stdlib::stdlib_items();
         stdlib.extend(user_program.items.drain(..));

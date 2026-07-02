@@ -205,6 +205,22 @@ fn run_script(path: &str, bench: bool, static_barriers: bool) {
                      bench_step_begin()/bench_step_end() around >3 steps"
                 ),
             }
+            let (hits, misses, pooled, peak) = malus_runtime::malus_pool_stats();
+            println!(
+                "malus pool: {hits} hits / {misses} misses ({:.1}% hit rate), \
+                 {:.1} MB pooled, peak device {:.1} MB",
+                if hits + misses > 0 { 100.0 * hits as f64 / (hits + misses) as f64 } else { 0.0 },
+                pooled as f64 / 1e6,
+                peak as f64 / 1e6,
+            );
+        }
+
+        let histogram = malus_runtime::malus_alloc_histogram();
+        if !histogram.is_empty() {
+            println!("malus alloc histogram (bytes → count):");
+            for (size, count) in histogram {
+                println!("  {size:>12}  {count}");
+            }
         }
     }
 

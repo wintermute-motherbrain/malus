@@ -3,7 +3,7 @@
 **Crates:** `malus-runtime`
 **Track:** perf
 **Depends on:** M31 (pooling a buffer requires knowing its GPU work completed — the pending tracking from M31 answers that)
-**Status:** planned
+**Status:** done (2026-07-01) — toy warm median 6.065 → ~2.6 ms/step ≈ **parity (0.95x) with f32 PyTorch-MPS** at the toy config; capstone-dims proxy peak 12.9 GB (≈16 GB with head-folding correction) on the 48 GB target; exact-size buckets confirmed by the allocation histogram (10 distinct sizes, all powers of two). Companions shipped: zeros blit-fill, `setBytes` for uniforms/TensorMeta, `MPSMatrixMultiplication` cache, soft memory-budget valve (`MALUS_MEM_BUDGET_MB`, default 8 GiB). See ADR-0039 and the M32 addendum in `m29-benchmark-results.md`.
 
 Every op currently allocates a fresh `MTLBuffer` (`StorageModeShared`) and frees it at its CTMM drop point. At capstone scale that is thousands of ~1–100 MB device allocations per step. Recycle them.
 

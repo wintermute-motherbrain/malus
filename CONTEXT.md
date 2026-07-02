@@ -173,6 +173,18 @@ _Avoid_: lazy evaluation, graph capture, deferred execution
 The V5 runtime read-safety guarantee: each `TensorBuffer` records whether uncommitted GPU work has written it (a commit-generation stamp); any host-side read of a pending buffer flushes first. Replaces per-call-site `__flush()` workarounds and demotes CTMM static barrier insertion from correctness mechanism to optimization. See ADR-0035.
 _Avoid_: barrier-before-read (the gap it fixes, not the mechanism), read fence
 
+**Buffer pool**:
+The M32 `MTLBuffer` recycling layer inside `MetalContext`: exact-byte-size free-lists, fed by `tensor_release`-at-zero and drawn from by `tensor_alloc_*`. A **pool hit** reuses a completed buffer; a **pool miss** allocates fresh. Invisible below the C ABI. See ADR-0039.
+_Avoid_: buffer cache, allocator (it recycles; the OS/Metal still allocates on miss)
+
+**Last-use generation**:
+The pool's reuse gate (M32): the commit generation of the command buffer that last encoded *any* use of an `MTLBuffer` — input or output — stamped at every encode site, shared across reshape aliases via `Arc<PoolState>`. A pooled buffer is reusable only once this generation has completed. Distinct from the last-*write* generation, which gates host reads (M31): a ready-to-read buffer may still be an in-flight input to uncommitted work.
+_Avoid_: last-write generation (the read-safety stamp, not the reuse gate), pending flag
+
+**Memory budget**:
+The soft ceiling on device bytes (live + pooled; `MALUS_MEM_BUDGET_MB`, default 8 GiB). On an over-budget pool miss whose bucket holds pending entries, the allocator flushes once and retries the pool — a recycling trigger, not a hard cap; a retry miss still allocates fresh. Bounds the memory of read-free loops, which never flush and so would never cycle the pool. See ADR-0039.
+_Avoid_: memory cap / OOM limit (allocation never fails on it), eviction (nothing is evicted)
+
 **Head-folding**:
 Expressing multi-head attention with the existing 3-D batched matmul by folding batch and head dims: `[B,T,C] → reshape [B,T,H,hs] → permute (0,2,1,3) → reshape [B*H,T,hs]`, and unfolding after. Requires the rank-generic permute VJP (V5/M33); avoids adding 4-D matmul.
 _Avoid_: 4-D matmul (not shipped), multi-head reshape (vague)
