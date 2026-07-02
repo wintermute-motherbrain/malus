@@ -3,7 +3,27 @@
 **Crates:** `malus-sema`, `malus-codegen-cpu`, `malus-cli` (lint), `examples/`
 **Track:** capability
 **Depends on:** M28 machinery; independent of M31–M33
-**Status:** planned
+**Status:** done (2026-07-02) — see the M34 addendum in `m29-benchmark-results.md` and ADR-0040
+
+**Implementation decisions (2026-07-02 grilling session + findings):**
+- The Block sketch below is superseded: a Block stores its tensors in ONE
+  per-block identity list (`struct Block { params: List<Tensor<f32>> }`) with
+  block-LOCAL index constants (`WQ = 0` …), read inline in `forward`. Named
+  tensor fields would break the ADR-0034 write-back invariant — the optimizer
+  writes list slots, so field reads would go stale after step 1.
+- Optimizer state: `struct Moments { ms, vs }`, one per submodule in a
+  `List<Moments>` parallel to `blocks`, plus one for GPT's own tensors. The
+  generic `adamw` signature is unchanged; recursion happens at the call site.
+- `blk.forward(x)` required a small language-surface change: a trait impl may
+  carry methods the trait doesn't declare (registered as inherent, same
+  mangling/dispatch); name-matches-trait-with-diverging-signature still errors.
+- Drop semantics unified on the refcount-peek guard: ALL ARC'd aggregates
+  (struct/enum/tuple/List) release contents only on last-ref. Pre-M34
+  struct/tuple field release was unconditional — unsound for a struct bound
+  out of a List element.
+- Done-when #0 grew a third bug, found by systematic probing: non-grad-tracked
+  tensor alias retains were grad-gated while the alias's Drop was not
+  (double-release). All three fixes are in; see ADR-0040 and the M34 addendum.
 
 Let the capstone be written the way a PyTorch user would write it: `GPT { blocks: List<Block>, ... }` with `impl Module for Block`, six layers deep, no flat-list index arithmetic. See ADR-0036 for the composition contract.
 

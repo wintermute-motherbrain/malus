@@ -288,3 +288,58 @@ byte-index path (multi-byte strings keep the char-indexed scan). Tokenize:
 40.4 s → 0.32 s; whole-process `nanogpt.ml` run: ~42.5 s → **2.15 s**.
 Warm per-step median unaffected (tokenize is outside the timed region) —
 this changes no benchmark number, only the wall-clock sanity line.
+
+## M34 addendum — named submodules + three lifetime-bug fixes (measured 2026-07-02)
+
+M34 is a capability milestone (recursive drop, named submodules, optimizer
+recursion — see the spec and ADR-0036/0040); its perf obligation is only
+"don't regress the harness". Same machine, same methodology:
+
+```
+$ malus examples/nanogpt.ml --bench          (flat harness, unchanged file*)
+medians: 5.822 / 5.828 / 5.862 / 5.878 ms    (M33 baseline: 5.762 ms)
+$ malus examples/nanogpt_modular.ml --bench  (new 2-block modular form, informal)
+medians: 10.311 / 10.339 / 10.339 ms
+```
+
+- **Flat harness: ~5.85 ms ≈ +1% vs M33** — within this machine's recorded
+  session noise. Pool hit rate moved 80% → 74% (peak device 205 → 256 MB):
+  the ungated alias retains (below) hold tensors to their full, correct
+  lifetimes; the old number was partly early-free unsoundness.
+- **Modular 2-block form: ~10.3 ms**, i.e. ~1.77x the 1-block flat step —
+  sublinear in block count (embeddings/lm_head/data prep amortize). No
+  pathological cost from List<Struct> access, method dispatch, or
+  per-submodule optimizer calls. NOT a like-for-like architecture; recorded
+  as the structural preview of the M35 capstone form, not a baseline.
+- **Modular RC ratio (reported, not gated)**: 7 RC ops / 74 tensor bindings
+  = 9.5% across the example's user fns (`test_m34_modular_example_rc_ratio_
+  reported`). The M29 ≤5% gate on the existing corpus stays green.
+
+Done-when #0 outcome — the two M32-addendum bugs plus one more found by
+systematic probing, all three pre-existing (reproduced on pre-M34 HEAD),
+all fixed with Metal regression tests:
+
+- **(a) loop-carried `let mut` over-release**: CTMM's hoist-temp counter was
+  per-*body*; outer body and loop body each minted `__malus_tmp_0`, the
+  outer last-use scan attributed the inner temp's uses to the outer name,
+  and the resulting stray post-loop Drop resolved (via codegen's flat
+  variable map) to the inner temp — double-releasing the last iteration's
+  value. Fixed: one function-unique counter threaded through all scopes.
+- **(b) "loss.data reads a freed buffer"**: binding a container-element read
+  (`let w = model.params[k]`) emitted a Drop with no balancing retain — the
+  bind stole the container's reference. The tape's saved-operand retains
+  masked each theft until backward()'s auto-clear, then corruption (0s,
+  recycled garbage, up to SIGSEGV with two binds per element per step).
+  Fixed: retain-on-bind for container-element reads (ADR-0040); the
+  nanogpt.ml "inline reads only" rule is no longer load-bearing.
+- **(c) non-grad alias double-release** (found during M34 verification):
+  tensor alias retains were gated on `grad_tracked` (ADR-0026 D6) but the
+  alias's static Drop never was — `let b = a; sum(b); sum(a)` with plain
+  tensors, or the natural forward-loop shape `let mut x = x0;
+  for blk in blocks: x = blk.forward(x)`, double-released. Surfaced at
+  step 4+ of modular training as a matmul on a freed (shape-[]) tensor.
+  Fixed: alias retains unconditional on tensor type;
+  `demote_safe_borrows` strips the provably-redundant pairs.
+
+*the flat harness file changed only in one comment (the retired inline-read
+rule); code identical.

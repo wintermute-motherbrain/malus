@@ -193,6 +193,22 @@ _Avoid_: 4-D matmul (not shipped), multi-head reshape (vague)
 The V5 (M34) Module-composition pattern: the generic optimizer is applied per submodule, so each submodule's `parameters()` identity list receives the slot writes. `parameters()` results are never concatenated — a merged list would be a fresh snapshot and the optimizer would silently update the snapshot instead of the model (the ADR-0034 write-back hazard). See ADR-0036.
 _Avoid_: parameter concat (rejected), flat parameter list (the V4 form this replaces)
 
+**Submodule**:
+A struct implementing `Module` stored inside another module (`GPT { blocks: List<Block> }`). Each submodule owns exactly one identity list of its trainable tensors, read via block-LOCAL index constants; composition is by optimizer recursion, never by merging lists. See ADR-0036.
+_Avoid_: child module (PyTorch-ism; fine informally), layer (a Block is one transformer layer but "submodule" is the composition term)
+
+**Moments**:
+Per-submodule AdamW optimizer state: `struct Moments { ms: List<Tensor<f32>>, vs: List<Tensor<f32>> }`, held by the training loop in a `List<Moments>` parallel to the model's submodules (plus one for the top-level module's own tensors) — mirroring the parameter structure, per ADR-0036. The model never carries optimizer state.
+_Avoid_: optimizer state on the model (rejected; diverges from PyTorch's optimizer-owns-state contract)
+
+**Inherent method**:
+A method in a trait impl whose name the trait does not declare (`fn forward` beside `fn parameters` in `impl Module for Block`, M34). Registered with the same mangling and static dispatch as trait methods; callable as `x.method(...)`. A method whose name matches a trait method must still match its signature exactly.
+_Avoid_: extension method, default method (neither mechanism exists)
+
+**Retain-on-bind (container elements)**:
+The M34 rule (ADR-0040) that binding a container-element read (`let w = model.params[k]`) bumps the NEW binding's reference immediately after the bind — the container owns the element, so the binding's later drop must release its own reference, not steal the container's. Transient inline reads (`x @ model.params[WQ]` as an operand) are untouched borrows and cost nothing.
+_Avoid_: inline-read rule (the pre-M34 workaround this retires as a constraint; inline reads survive only as a hot-path optimization)
+
 **Autocast** (V5/M36, planned):
 Mixed-precision training semantics: parameters/gradients/optimizer state stay f32; matmuls and forward elementwise kernels compute in bf16; reductions accumulate in f32. bf16-first because it needs no loss scaling. Surface finalized at M36 (recommendation: a `with autocast:` scope mirroring `no_grad`). See ADR-0037.
 _Avoid_: half precision (imprecise — bf16, not f16), quantization (different technique)
@@ -248,11 +264,11 @@ _Avoid_: clear gradients, reset gradients
 ### Types (V1)
 
 **Tuple**:
-An anonymous product type with positional fields. Constructed with `(expr, expr, ...)` (minimum 2 elements). Fields accessed via positional dot notation (`x.0`, `x.1`) or destructured in a `let` binding (`let (a, b) = x`). `let mut (a, b) = x` makes all bindings mutable. Heap-allocated like `Struct`; `DropTuple` releases tensor/variable fields via `tensor_release` then frees the box. Valid as local bindings and `fn` return types. Flat-only: element types may not themselves be tuples. Tuple elements may not appear as struct fields or array elements. `match` on tuples is deferred.
+An anonymous product type with positional fields. Constructed with `(expr, expr, ...)` (minimum 2 elements). Fields accessed via positional dot notation (`x.0`, `x.1`) or destructured in a `let` binding (`let (a, b) = x`). `let mut (a, b) = x` makes all bindings mutable. Heap-allocated like `Struct`; `DropTuple` releases owned fields on last-ref (refcount peek, M34) then decrements the box. Valid as local bindings and `fn` return types. Flat-only: element types may not themselves be tuples. Tuple elements may not appear as struct fields or array elements. `match` on tuples is deferred.
 _Avoid_: anonymous struct (informal description, not the canonical term)
 
 **Struct**:
-A user-defined product type with named, typed fields. Constructed with keyword arguments: `Layer(weights=w, bias=b)`. Fields accessed with dot notation: `layer.weights`. Tensor fields are moved into the struct at construction (ownership transfers; no retain is emitted). `DropStruct` releases each tensor field via `tensor_release`, freeing the tensor when the refcount hits zero.
+A user-defined product type with named, typed fields. Constructed with keyword arguments: `Layer(weights=w, bias=b)`. Fields accessed with dot notation: `layer.weights`. A named tensor source is retained at construction (the struct's copy owns its own reference; the source binding's later drop is balanced — borrow-inference removes the pair when the construction is the source's last use). `DropStruct` releases fields only on last-ref (refcount peek, M34) — a struct box shared as a `List` element must not lose its fields while the container's copy is live — then decrements the box.
 _Avoid_: Record, dataclass
 
 **Enum**:
@@ -268,7 +284,7 @@ A compile-time-sized sequence: `[expr1, expr2, ...]`. Type is `Array<T, N>` wher
 _Avoid_: List, dynamic array, vector
 
 **`List<T>`** (V4):
-A sequence type added in V4-M5, fixed-length at construction (`lst.push` deferred post-V4). Used as the return type of `Module.parameters()` — critically, `parameters()` returns a model's stored list **by identity** (a borrow of the model's own field), not a fresh literal, so that a generic optimizer's slot reassignment (`ps[i] = variable(...)`) is visible on the model's next use. That identity-return creates aliasing across a call boundary, which is why `List<T>` is itself a **reference-counted aggregate** — an ARC header (`RetainAgg`/`ReleaseAgg`, the same dormant-until-M28 mechanism structs/tuples/enums use) plus a length word, NOT `Array`'s headerless escape-analysis-only static drop. Tensor *elements* inside a `List` still use the ordinary tensor lifetime rules (tape-RC / static-free), unaffected by the container's own RC. Supports indexing, `for x in list` iteration, and `len(lst)`. `Dict` is post-V4. See ADR-0034.
+A sequence type added in V4-M5, fixed-length at construction (`lst.push` deferred post-V4). Used as the return type of `Module.parameters()` — critically, `parameters()` returns a model's stored list **by identity** (a borrow of the model's own field), not a fresh literal, so that a generic optimizer's slot reassignment (`ps[i] = variable(...)`) is visible on the model's next use. That identity-return creates aliasing across a call boundary, which is why `List<T>` is itself a **reference-counted aggregate** — an ARC header (`RetainAgg`/`ReleaseAgg`, the same dormant-until-M28 mechanism structs/tuples/enums use) plus a length word, NOT `Array`'s headerless escape-analysis-only static drop. Tensor *elements* inside a `List` still use the ordinary tensor lifetime rules (tape-RC / static-free), unaffected by the container's own RC. When the container's refcount hits zero its elements are released recursively by element type (tensor, struct, nested `List` — M34; pre-M34 only tensor elements were released and `List<Struct>` leaked). Binding an element read (`let w = ps[i]`) is sound: the binding is retained on bind (ADR-0040). Supports indexing, `for x in list` iteration (the loop variable is a borrow of the list-owned element — never dropped), and `len(lst)`. `Dict` is post-V4. See ADR-0034.
 _Avoid_: Vec, dynamic array, vector (fine informally; List is the canonical term); "escape-analysis RC same as Array" (wrong — List is container-RC, Array is not)
 
 **Trait**:
