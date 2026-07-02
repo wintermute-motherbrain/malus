@@ -210,3 +210,66 @@ Supporting measurements, same day:
   early — `loss.data` after `backward()`+`adamw()` reads a freed buffer
   (returns 0 pre-M32, recycled garbage post-M32). Both need a sema/tape
   root-cause pass — candidates for M33/M34 hardening scope.
+
+## M33 addendum — N-D permute + multi-head attention (measured 2026-07-02)
+
+M33 is a capability milestone (rank-generic permute VJP + head-folded
+multi-head attention), but it changes the benchmark harness itself:
+`examples/nanogpt.ml` and `bench/nanogpt_pytorch.py` are now **true
+multi-head (H=4, hs=8)** in lockstep, per the ADR-0038 amendment (benchmark
+architecture changes must land on both sides simultaneously, with an
+explicit re-baseline — the Nx ratio carries across the change; absolute
+step-time history does not).
+
+Same machine, same methodology. The machine ran hot this session: the
+unmodified M32 HEAD re-measured **3.662 ms** (vs 2.4–3.7 bimodal recorded at
+M32), so all comparisons below are same-session, interleaved.
+
+**Single-head (old architecture), A/B for the specialized-kernel decision:**
+
+```
+HEAD (M32 build):                        3.662 ms
+M33, 2-D/3-D fast paths kept (A):        3.736 / 3.752 / 3.748 ms
+M33, all permutes via generic kernel(B): 4.011 / 3.901 / 4.034 ms
+```
+
+B is a consistent ~6.5% regression outside run-to-run noise → **the
+`__transpose_2d_kernel`/`__permute_3d_kernel` fast paths stay** (A ships).
+The rank-generic `__permute_nd_kernel` serves rank ≥ 4, the
+`transpose(t,i,j)` axis-swap form, and **every** tape-side permute VJP —
+the tape path is a single rank-generic call (done-when #1); the specialized
+kernels survive purely as an eager-forward codegen fast path. A (3.75) vs
+HEAD (3.66) ≈ 2%: the rank-generic backward costs nothing measurable.
+
+**New MHA baseline pair (back-to-back, 300 steps):**
+
+```
+malus  examples/nanogpt.ml  --bench:   5.762 ms/step  (min 5.508, max 6.400)
+PyTorch-MPS nanogpt_pytorch.py:        2.693 ms/step  (min 2.556, max 3.075)
+matched Nx ≈ 2.14x
+```
+
+The step went 3.75 → 5.76 ms on the malus side: six extra permute
+dispatches per step (Q/K/V fold + unfold, forward and backward) at
+~0.25 ms/dispatch of per-op encoder overhead — the known V6-fusion gap,
+now visible because MHA is dispatch-heavier. PyTorch absorbs the same head
+split for ~0 ms (its transpose is a lazy view; materialization fuses into
+the following op). This is the honest toy number going forward; parity
+(0.95x) remains the recorded result *for the single-head architecture* at
+M32.
+
+Supporting notes, same day:
+
+- **Pre-existing scale mismatch found and retired**: pre-M33,
+  `nanogpt_pytorch.py` scaled scores by 0.35355 (=1/√8) while
+  `examples/nanogpt.ml` used 0.17678 (=1/√32) — the "exactly matched"
+  benchmark pair disagreed on attention scale. Both now compute
+  1/√hs = 0.35355 by construction.
+- **Loss trajectory** (MHA, 300 steps): 4.86 → ~2.6, healthy; end-to-end
+  MHA gradient check (`check_mha` in `examples/gradient_check.ml`) passes
+  at 1e-3 alongside 4-D permute checks for `(0,2,1,3)` and `(1,2,3,0)`.
+- **Full-step CPU-counter gate** (`test_v4_m28_full_step_zero_cpu_compute`,
+  now head-folded MHA): 0 — the rank-4 forward permute went GPU. Pre-M33
+  a 4-arg `permute` silently fell back to a CPU loop (`permute_by_perm`,
+  now `cpu_fallback`-only), contradicting the M33 spec's premise that the
+  4-D forward "already worked" as a GPU path.

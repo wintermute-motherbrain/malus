@@ -109,23 +109,25 @@ pub enum BwdSlot {
     AbsBwd            = 14,
     NegBwd            = 15,
     SumBwd            = 16,
-    PermuteBwd2D      = 17,
-    PermuteBwd3D      = 18,
-    ReduceSumAxisBwd  = 19,
-    ReduceMeanAxisBwd = 20,
-    ReduceMaxAxisBwd  = 21,
-    ReduceVarAxisBwd  = 22,
-    SoftmaxBwd        = 23,
-    LayernormBwd      = 24,
-    GeluBwd           = 25,
-    CrossEntropyBwd   = 26,
-    EmbeddingBwd      = 27,
-    MatmulBwdA        = 28,
-    MatmulBwdB        = 29,
-    GradAcc           = 30,
+    // M33: one rank-generic slot holds the *forward* N-D permute host fn
+    // (__permute_nd_fwd); the Transpose VJP calls it with the inverse perm.
+    // Same forward-fn-as-backward-slot convention as ExpBwd/NegBwd/GradAcc.
+    PermuteNdFwd      = 17,
+    ReduceSumAxisBwd  = 18,
+    ReduceMeanAxisBwd = 19,
+    ReduceMaxAxisBwd  = 20,
+    ReduceVarAxisBwd  = 21,
+    SoftmaxBwd        = 22,
+    LayernormBwd      = 23,
+    GeluBwd           = 24,
+    CrossEntropyBwd   = 25,
+    EmbeddingBwd      = 26,
+    MatmulBwdA        = 27,
+    MatmulBwdB        = 28,
+    GradAcc           = 29,
 }
 
-pub const N_BWD_SLOTS: usize = 31;
+pub const N_BWD_SLOTS: usize = 30;
 
 thread_local! {
     static BWD_SLOTS: RefCell<[usize; N_BWD_SLOTS]> = const { RefCell::new([0; N_BWD_SLOTS]) };
@@ -144,7 +146,7 @@ pub extern "C" fn tape_register_backward_fn(slot: i32, func_ptr: usize) {
     });
 }
 
-fn bwd_slot(slot: BwdSlot) -> usize {
+pub(crate) fn bwd_slot(slot: BwdSlot) -> usize {
     let ptr = BWD_SLOTS.with(|s| s.borrow()[slot as usize]);
     if ptr != 0 {
         return ptr;
@@ -580,23 +582,16 @@ pub extern "C" fn backward(loss: i64) {
             OpTag::Transpose => {
                 // B = permute(A, perm)  ->  dA = permute(dB, inverse_perm).
                 // Computing the inverse perm is scalar index arithmetic over
-                // a length<=3 list — orchestration, not tensor compute
+                // a length<=8 list — orchestration, not tensor compute
                 // (ADR-0031) — so it stays in Rust; the actual gather is the
-                // malus permute_bwd kernel.
+                // rank-generic malus __permute_nd_kernel via the same forward
+                // host fn the eager path uses (M33).
                 let x = node.saved[0];
                 let rank = tb(x).shape.len();
                 let raw: Vec<usize> = node.meta.iter().map(|&v| v as usize).collect();
                 let perm = normalize_perm(&raw, rank);
                 let inv  = invert_perm(&perm);
-                let dx = if rank == 2 {
-                    let f: extern "C" fn(i64) -> i64 =
-                        unsafe { std::mem::transmute(bwd_slot(BwdSlot::PermuteBwd2D)) };
-                    f(dout)
-                } else {
-                    let f: extern "C" fn(i64, i64, i64, i64) -> i64 =
-                        unsafe { std::mem::transmute(bwd_slot(BwdSlot::PermuteBwd3D)) };
-                    f(dout, inv[0] as i64, inv[1] as i64, inv[2] as i64)
-                };
+                let dx = crate::metal::permute_nd_gpu(dout, &inv);
                 accumulate_grad(&mut grads, x, dx);
             }
             OpTag::Reshape => {
@@ -889,8 +884,7 @@ mod cpu_fallback {
         tape_register_backward_fn(BwdSlot::AbsBwd as i32, abs_bwd as *const () as usize);
         tape_register_backward_fn(BwdSlot::NegBwd as i32, neg_bwd as *const () as usize);
         tape_register_backward_fn(BwdSlot::SumBwd as i32, sum_bwd as *const () as usize);
-        tape_register_backward_fn(BwdSlot::PermuteBwd2D as i32, permute_bwd_2d as *const () as usize);
-        tape_register_backward_fn(BwdSlot::PermuteBwd3D as i32, permute_bwd_3d as *const () as usize);
+        tape_register_backward_fn(BwdSlot::PermuteNdFwd as i32, permute_nd_fwd as *const () as usize);
         tape_register_backward_fn(BwdSlot::ReduceSumAxisBwd as i32, reduce_sum_axis_bwd as *const () as usize);
         tape_register_backward_fn(BwdSlot::ReduceMeanAxisBwd as i32, reduce_mean_axis_bwd as *const () as usize);
         tape_register_backward_fn(BwdSlot::ReduceMaxAxisBwd as i32, reduce_max_axis_bwd as *const () as usize);
@@ -1075,9 +1069,17 @@ mod cpu_fallback {
         elem_apply(x, |_| scalar_val)
     }
 
-    extern "C" fn permute_bwd_2d(dout: i64) -> i64 { permute_by_perm(dout, &[1, 0]) }
-    extern "C" fn permute_bwd_3d(dout: i64, inv0: i64, inv1: i64, inv2: i64) -> i64 {
-        permute_by_perm(dout, &[inv0 as usize, inv1 as usize, inv2 as usize])
+    // Mock for the PermuteNdFwd slot: same 9-arg ABI as the JIT'd
+    // __permute_nd_fwd — only the first rank(x) perm entries are meaningful.
+    extern "C" fn permute_nd_fwd(
+        x: i64,
+        p0: i64, p1: i64, p2: i64, p3: i64,
+        p4: i64, p5: i64, p6: i64, p7: i64,
+    ) -> i64 {
+        let rank = tb(x).shape.len();
+        let all = [p0, p1, p2, p3, p4, p5, p6, p7];
+        let perm: Vec<usize> = all[..rank].iter().map(|&v| v as usize).collect();
+        permute_by_perm(x, &perm)
     }
 
     extern "C" fn reduce_sum_axis_bwd(x: i64, dout: i64, axis: i64) -> i64 {

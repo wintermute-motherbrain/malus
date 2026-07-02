@@ -222,6 +222,124 @@ fn check_embedding():
             let fm = __loss_embedding_v(variable(wm), idx)
             __check_elem(vweight.grad, i, fp.data[0], fm.data[0], eps)
 
+# ── 4-D permute (M33) ────────────────────────────────────────────────────────
+# sum(permute(x)) alone has an all-ones gradient regardless of the perm —
+# degenerate — so dot with a fixed position-dependent weight of the permuted
+# shape. Two perms: the attention perm (0,2,1,3) (its own inverse) and a full
+# cycle (1,2,3,0) whose inverse (3,0,1,2) is a different permutation.
+
+fn __loss_perm4a(x: Tensor<f32>, w: Tensor<f32>) -> Tensor<f32>:
+    return sum(permute(reshape(x, 2, 3, 2, 2), 0, 2, 1, 3) * reshape(w, 2, 2, 3, 2))
+
+fn __loss_perm4a_v(x: Tensor<f32>, w: Tensor<f32>) -> Tensor<f32>:
+    return sum(permute(reshape(x, 2, 3, 2, 2), 0, 2, 1, 3) * reshape(w, 2, 2, 3, 2))
+
+fn __loss_perm4b(x: Tensor<f32>, w: Tensor<f32>) -> Tensor<f32>:
+    return sum(permute(reshape(x, 2, 3, 2, 2), 1, 2, 3, 0) * reshape(w, 3, 2, 2, 2))
+
+fn __loss_perm4b_v(x: Tensor<f32>, w: Tensor<f32>) -> Tensor<f32>:
+    return sum(permute(reshape(x, 2, 3, 2, 2), 1, 2, 3, 0) * reshape(w, 3, 2, 2, 2))
+
+fn check_permute_4d():
+    let eps = 0.01
+    let x = Tensor.gpu<f32>([0.3, -1.2, 0.7, 1.5, -0.4, 0.9, -0.8, 0.2,
+                             1.1, -0.6, 0.5, -1.4, 0.8, 0.1, -0.9, 1.3,
+                             -0.2, 0.6, -1.1, 0.4, 1.0, -0.7, 0.35, -0.15])
+    let w = Tensor.gpu<f32>([0.5, -0.3, 0.8, 0.2, -0.6, 1.0, 0.4, -0.9,
+                             0.7, -0.1, 0.3, 0.6, -0.4, 0.9, -0.2, 0.15,
+                             1.2, -0.5, 0.25, -0.75, 0.55, 0.05, -1.0, 0.45])
+    let vx = variable(x)
+    let vw = variable(w)
+    let loss = __loss_perm4a_v(vx, vw)
+    backward(loss)
+    let n = x.len
+    with no_grad:
+        for i in range(0, n):
+            let xp = __perturb_fwd(x, i, eps)
+            let xm = __perturb_fwd(x, i, 0.0 - eps)
+            let fp = __loss_perm4a(xp, w)
+            let fm = __loss_perm4a(xm, w)
+            __check_elem(vx.grad, i, fp[0], fm[0], eps)
+    # grads accumulate per underlying handle across backward() calls —
+    # zero them before checking the second perm on the same tensors.
+    zero_grad(vx, vw)
+    let loss2 = __loss_perm4b_v(vx, vw)
+    backward(loss2)
+    with no_grad:
+        for i in range(0, n):
+            let xp = __perturb_fwd(x, i, eps)
+            let xm = __perturb_fwd(x, i, 0.0 - eps)
+            let fp = __loss_perm4b(xp, w)
+            let fm = __loss_perm4b(xm, w)
+            __check_elem(vx.grad, i, fp[0], fm[0], eps)
+
+# ── multi-head attention block (M33 done-when #3) ────────────────────────────
+# Head-folded MHA at B=2, T=2, C=4, H=2 (hs=2): the full
+# reshape → permute(0,2,1,3) → fold → scores/softmax/attn@V → unfold chain.
+# Checked end-to-end against finite differences wrt the input x and wq.
+
+fn __loss_mha(x: Tensor<f32>, wq: Tensor<f32>, wk: Tensor<f32>, wv: Tensor<f32>, w: Tensor<f32>) -> Tensor<f32>:
+    let B = 2
+    let T = 2
+    let C = 4
+    let H = 2
+    let hs = 2
+    let Q = reshape(permute(reshape(x @ wq, B, T, H, hs), 0, 2, 1, 3), B * H, T, hs)
+    let K = reshape(permute(reshape(x @ wk, B, T, H, hs), 0, 2, 1, 3), B * H, T, hs)
+    let V = reshape(permute(reshape(x @ wv, B, T, H, hs), 0, 2, 1, 3), B * H, T, hs)
+    let Kt = permute(K, 0, 2, 1)
+    let attn = softmax(Q @ Kt, axis=2)
+    let att_out = reshape(permute(reshape(attn @ V, B, H, T, hs), 0, 2, 1, 3), B * T, C)
+    return sum(att_out * w)
+
+fn __loss_mha_v(x: Tensor<f32>, wq: Tensor<f32>, wk: Tensor<f32>, wv: Tensor<f32>, w: Tensor<f32>) -> Tensor<f32>:
+    let B = 2
+    let T = 2
+    let C = 4
+    let H = 2
+    let hs = 2
+    let Q = reshape(permute(reshape(x @ wq, B, T, H, hs), 0, 2, 1, 3), B * H, T, hs)
+    let K = reshape(permute(reshape(x @ wk, B, T, H, hs), 0, 2, 1, 3), B * H, T, hs)
+    let V = reshape(permute(reshape(x @ wv, B, T, H, hs), 0, 2, 1, 3), B * H, T, hs)
+    let Kt = permute(K, 0, 2, 1)
+    let attn = softmax(Q @ Kt, axis=2)
+    let att_out = reshape(permute(reshape(attn @ V, B, H, T, hs), 0, 2, 1, 3), B * T, C)
+    return sum(att_out * w)
+
+fn check_mha():
+    let eps = 0.01
+    let x = Tensor.gpu<f32>([[0.4, -0.7, 0.9, 0.1], [-0.3, 0.8, -0.5, 0.6],
+                             [1.0, -0.2, 0.3, -0.8], [0.2, 0.5, -1.1, 0.7]])
+    let wq = Tensor.gpu<f32>([[0.3, -0.4, 0.2, 0.5], [-0.2, 0.6, -0.3, 0.1],
+                              [0.5, 0.2, -0.6, -0.1], [-0.4, 0.3, 0.4, -0.2]])
+    let wk = Tensor.gpu<f32>([[0.2, 0.5, -0.3, 0.4], [0.6, -0.2, 0.1, -0.5],
+                              [-0.1, 0.3, 0.5, 0.2], [0.4, -0.6, -0.2, 0.3]])
+    let wv = Tensor.gpu<f32>([[-0.3, 0.4, 0.6, -0.2], [0.5, 0.1, -0.4, 0.3],
+                              [0.2, -0.5, 0.3, 0.6], [-0.6, 0.2, 0.1, -0.4]])
+    let w = Tensor.gpu<f32>([[0.5, -0.3, 0.7, 0.2], [-0.4, 0.8, 0.1, -0.6],
+                             [0.3, 0.6, -0.2, 0.9], [-0.7, 0.15, 0.45, -0.25]])
+    let vx = variable(x)
+    let vwq = variable(wq)
+    let vwk = variable(wk)
+    let vwv = variable(wv)
+    let vw = variable(w)
+    let loss = __loss_mha_v(vx, vwq, vwk, vwv, vw)
+    backward(loss)
+    let n = x.len
+    with no_grad:
+        for i in range(0, n):
+            let xp = __perturb_fwd(x, i, eps)
+            let xm = __perturb_fwd(x, i, 0.0 - eps)
+            let fp = __loss_mha(xp, wq, wk, wv, w)
+            let fm = __loss_mha(xm, wq, wk, wv, w)
+            __check_elem(vx.grad, i, fp[0], fm[0], eps)
+        for i in range(0, n):
+            let qp = __perturb_fwd(wq, i, eps)
+            let qm = __perturb_fwd(wq, i, 0.0 - eps)
+            let fp = __loss_mha(x, qp, wk, wv, w)
+            let fm = __loss_mha(x, qm, wk, wv, w)
+            __check_elem(vwq.grad, i, fp[0], fm[0], eps)
+
 # ── cross_entropy ────────────────────────────────────────────────────────────
 
 fn check_cross_entropy():
@@ -258,6 +376,10 @@ fn main():
     check_embedding()
     println("check_cross_entropy")
     check_cross_entropy()
+    println("check_permute_4d")
+    check_permute_4d()
+    println("check_mha")
+    check_mha()
 
     with no_grad:
         let w = variable(Tensor.gpu<f32>([[0.1], [0.2]]))

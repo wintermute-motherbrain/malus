@@ -27,3 +27,22 @@ The M30 measurement itself was surprising enough to justify recording: the M29 c
 - `bench_step_begin`/`bench_step_end` are permanent language builtins with a trivial contract: no-ops unless the host process enabled bench mode. They are not general-purpose timers; a user-facing `time_ns()` remains future work if ever needed.
 - The warmup count (3) and the flush-inside-region rule are part of the number's definition. A result reported without them is not a "warm per-step median" (see CONTEXT.md).
 - The toy-config benchmark (`bench/nanogpt_step.sh`) is the dispatch-overhead regression check — manual, not a CI assert (wall-clock gates flake). The M35 capstone gate is a separate, harder measurement at the Karpathy config.
+
+## Amendment (M33, 2026-07-02): benchmark-architecture changes require lockstep + re-baseline
+
+"This methodology is fixed" above governs *how* the number is measured.
+M33 changed *what* is measured: `examples/nanogpt.ml` — which is the
+benchmark harness — became true multi-head attention. The rule this sets:
+
+- A change to the benchmarked program's architecture must land in
+  `examples/nanogpt.ml` and `bench/nanogpt_pytorch.py` **in the same
+  commit**, dims and op structure matched. A one-sided change silently
+  turns the Nx ratio apples-to-oranges (M33 found the pair had in fact
+  already drifted: the PyTorch side scaled attention by 1/√8 while malus
+  used 1/√32).
+- Each such change gets an explicit re-baseline addendum in
+  `m29-benchmark-results.md`, with same-session interleaved measurements
+  of old-HEAD and new. **The Nx ratio carries across the change; absolute
+  step-time history does not** — post-M33 step times (MHA) are not
+  comparable to M30–M32 step times (single-head) and must not be quoted
+  against each other.

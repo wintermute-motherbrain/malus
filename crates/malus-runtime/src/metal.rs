@@ -1325,8 +1325,26 @@ pub(crate) fn invert_perm(perm: &[usize]) -> Vec<usize> {
     inv
 }
 
-/// Apply a fully-normalized permutation to a tensor.  Self-flushing (M31):
+/// Apply a fully-normalized permutation on the GPU via the rank-generic
+/// __permute_nd_fwd host fn (M33), reached through the same slot table the
+/// tape uses (compile_and_run registers it; cpu_fallback self-registers a
+/// CPU mock).  Pads the perm to 8 entries; the callee reads only rank(x).
+pub(crate) fn permute_nd_gpu(handle: i64, perm: &[usize]) -> i64 {
+    assert!(perm.len() <= 8, "malus: permute supports rank <= 8, got rank {}", perm.len());
+    let f: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64 = unsafe {
+        std::mem::transmute(crate::tape::bwd_slot(crate::tape::BwdSlot::PermuteNdFwd))
+    };
+    let mut p = [0i64; 8];
+    for (i, &v) in perm.iter().enumerate() {
+        p[i] = v as i64;
+    }
+    f(handle, p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7])
+}
+
+/// CPU reference permute, kept only for the cpu_fallback mock wiring —
+/// production permutes go through permute_nd_gpu.  Self-flushing (M31):
 /// reads the input on the CPU, so it auto-flushes if the input is pending.
+#[cfg(feature = "cpu_fallback")]
 pub(crate) fn permute_by_perm(handle: i64, perm: &[usize]) -> i64 {
     crate::cpu_compute_inc();
     flush_if_pending(handle);
@@ -1384,8 +1402,8 @@ pub(crate) fn reshape_to(handle: i64, new_shape: &[usize]) -> i64 {
     Box::into_raw(Box::new(new_tb)) as i64
 }
 
-/// Public ABI: permute a tensor's axes via normalize_perm + permute_by_perm
-/// (which auto-flushes the input).
+/// Public ABI: permute a tensor's axes via normalize_perm (validation +
+/// 0-arg/2-arg canonicalization) + the rank-generic GPU path (M33).
 #[no_mangle]
 pub extern "C" fn tensor_permute(handle: i64, perm_ptr: *const usize, ndims: usize) -> i64 {
     let tb_in = unsafe { &*(handle as *const TensorBuffer) };
@@ -1395,7 +1413,7 @@ pub extern "C" fn tensor_permute(handle: i64, perm_ptr: *const usize, ndims: usi
         unsafe { std::slice::from_raw_parts(perm_ptr, ndims) }.to_vec()
     };
     let perm = normalize_perm(&raw, tb_in.shape.len());
-    permute_by_perm(handle, &perm)
+    permute_nd_gpu(handle, &perm)
 }
 
 /// Public ABI: zero-copy reshape.  Panics on element-count mismatch (ADR-0013).

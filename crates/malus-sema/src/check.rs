@@ -2456,8 +2456,25 @@ fn check_kernel_launch(
     };
     let tgrid = check_expr(&grid_ast, Some(&array3_i64), ctx)?;
     let ttg   = check_expr(&tg_ast,   Some(&array3_i64), ctx)?;
+    // out= accepts Array<i64,N> for 1<=N<=8 (TensorMeta's rank ceiling); the
+    // literal's length fixes N. Non-literal out exprs keep the legacy len-3 contract.
     let tout_shape = if let Some(e) = out_expr.as_ref() {
-        Some(check_expr(e, Some(&array3_i64), ctx)?)
+        let out_len = match &e.kind {
+            malus_syntax::ast::ExprKind::ArrayLiteral { elements } => elements.len(),
+            _ => 3,
+        };
+        if out_len == 0 || out_len > 8 {
+            ctx.errors.push(SemaError::UnknownReductionArg {
+                name: format!("out= array must have 1..=8 elements, got {out_len}"),
+                span,
+            });
+            return None;
+        }
+        let out_arr_ty = ResolvedTy::Array {
+            elem: Box::new(ResolvedTy::Scalar(ScalarTy::I64)),
+            len: out_len,
+        };
+        Some(check_expr(e, Some(&out_arr_ty), ctx)?)
     } else {
         None
     };

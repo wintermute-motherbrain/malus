@@ -46,17 +46,27 @@ fn forward(model: GPT, toks: Tensor<i32>, B: i64, T: i64, C: i64) -> Tensor<f32>
     let pe = embedding(model.params[WPE], pos_toks)
     let x = te + pe
     let xn1 = layernorm(x, axis=1) * model.params[LN1_W]
-    let Q = reshape(xn1 @ model.params[WQ], B, T, C)
-    let K = reshape(xn1 @ model.params[WK], B, T, C)
-    let V = reshape(xn1 @ model.params[WV], B, T, C)
+    # M33: true multi-head attention via head-folding (ADR-0029 composed form):
+    # [B*T,C] → reshape [B,T,H,hs] → permute (0,2,1,3) → reshape [B*H,T,hs],
+    # so the existing 3-D batched matmul treats B*H as the batch dim.
+    # The zero-copy reshape after each permute is valid because permute
+    # MATERIALIZES a fresh contiguous buffer (ADR-0023's trust-the-caller
+    # contract) — this is the one place that invariant is load-bearing.
+    let H = 4
+    let hs = C / H
+    let Q = reshape(permute(reshape(xn1 @ model.params[WQ], B, T, H, hs), 0, 2, 1, 3), B * H, T, hs)
+    let K = reshape(permute(reshape(xn1 @ model.params[WK], B, T, H, hs), 0, 2, 1, 3), B * H, T, hs)
+    let V = reshape(permute(reshape(xn1 @ model.params[WV], B, T, H, hs), 0, 2, 1, 3), B * H, T, hs)
     let Kt = permute(K, 0, 2, 1)
-    let scale = variable(ones(1, 1) * 0.17678)
+    # 1/sqrt(hs) = 1/sqrt(8)
+    let scale = variable(ones(1, 1) * 0.35355)
     let scores = (Q @ Kt) * scale
     let mask = causal_mask(T)
     let vmask = variable(mask)
     let masked = scores + vmask
     let attn = softmax(masked, axis=2)
-    let att_out = reshape(attn @ V, B * T, C)
+    # Unfold: [B*H,T,hs] → [B,H,T,hs] → permute (0,2,1,3) → [B,T,H,hs] → [B*T,C].
+    let att_out = reshape(permute(reshape(attn @ V, B, H, T, hs), 0, 2, 1, 3), B * T, C)
     let proj = att_out @ model.params[WO]
     let x2 = x + proj
     let xn2 = layernorm(x2, axis=1) * model.params[LN2_W]

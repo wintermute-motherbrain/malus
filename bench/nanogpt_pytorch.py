@@ -25,12 +25,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# Dims matched exactly to examples/nanogpt.ml's fn main() (C, T, B, V, C4).
+# Dims matched exactly to examples/nanogpt.ml's fn main() (C, T, B, V, C4);
+# H (heads) matches forward()'s head-folded multi-head attention (M33).
 C = 32
 T = 16
 B = 4
 V = 128
 C4 = 128
+H = 4
+HS = C // H
 INIT_SCALE = 0.02
 
 
@@ -58,13 +61,15 @@ class Block(nn.Module):
         q = xn1 @ self.wq
         k = xn1 @ self.wk
         v = xn1 @ self.wv
-        q = q.view(-1, T, C)
-        k = k.view(-1, T, C)
-        v = v.view(-1, T, C)
+        # M33 lockstep with examples/nanogpt.ml: head-folded multi-head —
+        # [B*T,C] → [B,T,H,hs] → transpose(1,2) → [B*H,T,hs]; scale 1/sqrt(hs).
+        q = q.view(-1, T, H, HS).transpose(1, 2).reshape(-1, T, HS)
+        k = k.view(-1, T, H, HS).transpose(1, 2).reshape(-1, T, HS)
+        v = v.view(-1, T, H, HS).transpose(1, 2).reshape(-1, T, HS)
         scores = (q @ k.transpose(-2, -1)) * 0.35355
         scores = scores + self.causal_mask
         attn = F.softmax(scores, dim=-1)
-        att_out = (attn @ v).reshape(-1, C)
+        att_out = (attn @ v).view(-1, H, T, HS).transpose(1, 2).reshape(-1, C)
         x = x + (att_out @ self.wo)
         xn2 = F.layer_norm(x, (C,), weight=None, bias=None) * self.ln2_w
         hidden = F.gelu(xn2 @ self.w1, approximate="tanh")

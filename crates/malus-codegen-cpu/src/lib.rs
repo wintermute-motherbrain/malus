@@ -204,20 +204,19 @@ const BWD_SLOT_FNS: &[(i32, &str)] = &[
     (14, "__abs_bwd"),
     (15, "__scale_fwd"),         // NegBwd: dx = dout * -1.0
     (16, "__sum_bwd"),
-    (17, "__permute_bwd_2d"),
-    (18, "__permute_bwd_3d"),
-    (19, "__reduce_sum_axis_bwd"),
-    (20, "__reduce_mean_axis_bwd"),
-    (21, "__reduce_max_axis_bwd"),
-    (22, "__reduce_var_axis_bwd"),
-    (23, "__softmax_bwd"),
-    (24, "__layernorm_bwd"),
-    (25, "__gelu_bwd"),
-    (26, "__cross_entropy_bwd"),
-    (27, "__embedding_bwd"),
-    (28, "__matmul_bwd_a"),
-    (29, "__matmul_bwd_b"),
-    (30, "__broadcast_add_fwd"), // GradAcc
+    (17, "__permute_nd_fwd"),    // PermuteNdFwd: rank-generic forward doubles as the VJP (inverse perm)
+    (18, "__reduce_sum_axis_bwd"),
+    (19, "__reduce_mean_axis_bwd"),
+    (20, "__reduce_max_axis_bwd"),
+    (21, "__reduce_var_axis_bwd"),
+    (22, "__softmax_bwd"),
+    (23, "__layernorm_bwd"),
+    (24, "__gelu_bwd"),
+    (25, "__cross_entropy_bwd"),
+    (26, "__embedding_bwd"),
+    (27, "__matmul_bwd_a"),
+    (28, "__matmul_bwd_b"),
+    (29, "__broadcast_add_fwd"), // GradAcc
 ];
 
 // ── Error ─────────────────────────────────────────────────────────────────────
@@ -2230,16 +2229,20 @@ impl<'a, 'm> FnTranslator<'a, 'm> {
                 // If out_shape is provided: use it (Array<i64, N>); out_ndim = runtime len from type.
                 // If absent: pass null/0 — runtime uses first input's shape.
                 let (out_shape_ptr, out_ndim_val, out_dtype_val) = if let Some(os) = out_shape {
-                    // The out_shape expr is an Array<i64, 3> (same form as grid/tg).
+                    // The out_shape expr is an Array<i64, N> with 1<=N<=8 (sema-enforced).
+                    let os_len: i32 = match &os.ty {
+                        ResolvedTy::Array { len, .. } => *len as i32,
+                        _ => 3,
+                    };
                     let os_arr = self.lower_expr(os)?;
                     let out_slot = self.builder.create_sized_stack_slot(
                         cranelift_codegen::ir::StackSlotData::new(
                             cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
-                            24,
+                            (os_len as u32) * 8,
                             3,
                         )
                     );
-                    for dim in 0..3i32 {
+                    for dim in 0..os_len {
                         let off = self.builder.ins().iconst(self.codegen.ptr_type(), (dim as i64) * 8);
                         let src = self.builder.ins().iadd(os_arr, off);
                         let v = self.builder.ins().load(I64, cranelift_codegen::ir::MemFlags::trusted(), src, 0);

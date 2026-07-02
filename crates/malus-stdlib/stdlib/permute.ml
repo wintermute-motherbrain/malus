@@ -65,3 +65,62 @@ fn __permute_3d_fwd(x: Tensor<f32>, p0: i64, p1: i64, p2: i64) -> Tensor<f32>:
     let os2 = x.shape[p2]
     let n = os0 * os1 * os2
     return __permute_3d_kernel[grid=[n, 1, 1], tg=[1, 1, 1], out=[os0, os1, os2]](x, p0, p1, p2, os1, os2)
+
+# --- N-D permute (rank 1..8): output[i0..i_{r-1}] = x[perm-gathered] ---
+# One thread per output element, tg=[1,1,1]: every thread is its own
+# threadgroup, so the `let shared pbuf` scratch is thread-private — no
+# barrier needed. Callers pass the FULL normalized perm in p0..p7 (entries
+# beyond x.ndim are ignored); validation happens in Rust normalize_perm
+# before dispatch.
+#
+# Decomposition peels output dims from the last: out.shape[dd] ==
+# x.shape[perm[dd]], and the gather stride for output dim dd is
+# x.strides[perm[dd]]. No % operator: subtract-trick.
+kernel __permute_nd_kernel(x: Tensor<f32>, p0: i32, p1: i32, p2: i32, p3: i32, p4: i32, p5: i32, p6: i32, p7: i32) -> Tensor<f32>:
+    let flat = thread_id()
+    let ndim = x.ndim
+    let shared pbuf: Array<i32, 8>
+    pbuf[0] = p0
+    pbuf[1] = p1
+    pbuf[2] = p2
+    pbuf[3] = p3
+    pbuf[4] = p4
+    pbuf[5] = p5
+    pbuf[6] = p6
+    pbuf[7] = p7
+    let mut rem = flat
+    let mut in_flat = 0
+    for d in range(0, ndim):
+        let dd = ndim - 1 - d
+        let sz = x.shape[pbuf[dd]]
+        let q = rem / sz
+        let i = rem - q * sz
+        rem = q
+        in_flat = in_flat + i * x.strides[pbuf[dd]]
+    out[flat] = x[in_flat]
+
+# Host fn: rank is runtime, but the out= literal's length must be static, so
+# branch per rank (same pattern as __reduce_sum_fwd). Only the first `ndim`
+# perm entries are read — x.shape[p_k] with k < ndim is in-range because the
+# Rust caller (tensor_permute / the tape's Transpose arm) normalizes and
+# validates the perm first.
+fn __permute_nd_fwd(x: Tensor<f32>, p0: i64, p1: i64, p2: i64, p3: i64, p4: i64, p5: i64, p6: i64, p7: i64) -> Tensor<f32>:
+    let ndim = x.ndim
+    let mut n = 1
+    for k in range(0, ndim):
+        n = n * x.shape[k]
+    if ndim == 1:
+        return __permute_nd_kernel[grid=[n, 1, 1], tg=[1, 1, 1], out=[x.shape[p0], 0, 0, 0, 0, 0, 0, 0]](x, p0, p1, p2, p3, p4, p5, p6, p7)
+    if ndim == 2:
+        return __permute_nd_kernel[grid=[n, 1, 1], tg=[1, 1, 1], out=[x.shape[p0], x.shape[p1], 0, 0, 0, 0, 0, 0]](x, p0, p1, p2, p3, p4, p5, p6, p7)
+    if ndim == 3:
+        return __permute_nd_kernel[grid=[n, 1, 1], tg=[1, 1, 1], out=[x.shape[p0], x.shape[p1], x.shape[p2], 0, 0, 0, 0, 0]](x, p0, p1, p2, p3, p4, p5, p6, p7)
+    if ndim == 4:
+        return __permute_nd_kernel[grid=[n, 1, 1], tg=[1, 1, 1], out=[x.shape[p0], x.shape[p1], x.shape[p2], x.shape[p3], 0, 0, 0, 0]](x, p0, p1, p2, p3, p4, p5, p6, p7)
+    if ndim == 5:
+        return __permute_nd_kernel[grid=[n, 1, 1], tg=[1, 1, 1], out=[x.shape[p0], x.shape[p1], x.shape[p2], x.shape[p3], x.shape[p4], 0, 0, 0]](x, p0, p1, p2, p3, p4, p5, p6, p7)
+    if ndim == 6:
+        return __permute_nd_kernel[grid=[n, 1, 1], tg=[1, 1, 1], out=[x.shape[p0], x.shape[p1], x.shape[p2], x.shape[p3], x.shape[p4], x.shape[p5], 0, 0]](x, p0, p1, p2, p3, p4, p5, p6, p7)
+    if ndim == 7:
+        return __permute_nd_kernel[grid=[n, 1, 1], tg=[1, 1, 1], out=[x.shape[p0], x.shape[p1], x.shape[p2], x.shape[p3], x.shape[p4], x.shape[p5], x.shape[p6], 0]](x, p0, p1, p2, p3, p4, p5, p6, p7)
+    return __permute_nd_kernel[grid=[n, 1, 1], tg=[1, 1, 1], out=[x.shape[p0], x.shape[p1], x.shape[p2], x.shape[p3], x.shape[p4], x.shape[p5], x.shape[p6], x.shape[p7]]](x, p0, p1, p2, p3, p4, p5, p6, p7)

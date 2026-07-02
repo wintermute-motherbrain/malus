@@ -22,7 +22,6 @@ static BWD_ELEMENTWISE_SRC: &str = include_str!("../stdlib/backward/elementwise_
 static BWD_REDUCE_SRC:      &str = include_str!("../stdlib/backward/reduce_bwd.ml");
 static BWD_TRANSFORMER_SRC: &str = include_str!("../stdlib/backward/transformer_bwd.ml");
 static BWD_MATMUL_SRC:      &str = include_str!("../stdlib/backward/matmul_bwd.ml");
-static BWD_PERMUTE_SRC:     &str = include_str!("../stdlib/backward/permute_bwd.ml");
 
 const FILES: &[(&str, &str)] = &[
     ("stdlib/gelu.ml",          GELU_SRC),
@@ -42,7 +41,6 @@ const FILES: &[(&str, &str)] = &[
     ("stdlib/backward/reduce_bwd.ml",      BWD_REDUCE_SRC),
     ("stdlib/backward/transformer_bwd.ml", BWD_TRANSFORMER_SRC),
     ("stdlib/backward/matmul_bwd.ml",      BWD_MATMUL_SRC),
-    ("stdlib/backward/permute_bwd.ml",     BWD_PERMUTE_SRC),
 ];
 
 pub fn stdlib_items() -> Vec<Item> {
