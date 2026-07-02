@@ -1421,3 +1421,124 @@ fn test_nanogpt_loss_decreases() {
         "loss did not decrease by the expected margin: loss[0]={loss_first}, loss[9]={loss_last}"
     );
 }
+
+// M34 done-when #0, bug (a): a loop-carried `let mut` tensor reassigned across
+// `for` iterations under the tape tripped the M29 over-release detector in
+// backward(). Root cause: CTMM's hoist-temp counter was per-*body*, so the
+// outer body and the loop body each minted `__malus_tmp_0`; the outer last-use
+// scan recorded the inner temp's uses under the outer temp's name and emitted
+// a stray Drop after the For, which codegen's flat per-fn variable map resolved
+// to the *inner* temp — double-releasing the final iteration's hoisted value.
+// Fixed by threading one function-unique counter through every nested scope.
+#[test]
+fn test_m34_loop_carried_mut_reassign_under_tape_no_over_release() {
+    // The nested GPU-producing call arg (`x @ w` inside relu) is what forces a
+    // hoist temp inside the loop; the outer `randn * 0.1` forces one outside.
+    let src = r#"
+fn main():
+    let w = variable(randn(4, 4) * 0.1)
+    let mut x = variable(ones(4, 4))
+    for i in range(3):
+        x = relu(x @ w)
+    let loss = sum(x)
+    backward(loss)
+    println(loss)
+"#;
+    run_metal_src(src);
+}
+
+// Same root cause, second manifestation: the stray post-loop Drop freed a box
+// whose address was reused, so a later read saw a garbage TensorBuffer
+// (tensor_dim panicked on an out-of-range rank instead of the over-release
+// detector firing).
+#[test]
+fn test_m34_loop_carried_mut_loss_reassign_no_use_after_free() {
+    let src = r#"
+fn main():
+    let w = variable(randn(4, 4) * 0.1)
+    let mut loss = zeros(1)
+    for i in range(3):
+        let x = ones(4, 4) @ w
+        loss = sum(x)
+    backward(loss)
+    println(loss)
+"#;
+    run_metal_src(src);
+}
+
+// M34 done-when #0, bug (b): binding a container-element read (`let w =
+// model.params[k]`) emitted a Drop for the binding with no balancing Retain —
+// the drop stole the reference the container owned. Untaped, a repeated bind
+// of the same element was a deterministic over-release panic; under the tape
+// the theft was masked one-for-one by saved-operand retains until backward()
+// auto-cleared the tape, after which the corruption surfaced as reads of
+// freed/recycled buffers (the M32-addendum "loss.data reads a freed buffer",
+// up to and including a segfault). Fixed by `insert_container_read_retains`:
+// every bound element read gets its own reference on the new binding.
+#[test]
+fn test_m34_repeated_list_element_bind_untaped_no_over_release() {
+    let src = r#"
+fn make_params() -> List<Tensor<f32>>:
+    return [randn(4, 4) * 0.1, randn(4, 4) * 0.1]
+
+fn main():
+    let params = make_params()
+    for k in range(10):
+        let w = params[0]
+        let y = ones(4, 4) @ w
+        println(sum(y))
+"#;
+    run_metal_src(src);
+}
+
+#[test]
+fn test_m34_block_fn_chain_element_binds_train_loop_no_corruption() {
+    // Pre-fix this segfaulted: two binds per element per step exceeded the
+    // one-per-lifetime masking retain, and the tape clear at backward() freed
+    // params out from under the model.
+    let src = r#"
+struct GPT:
+    params: List<Tensor<f32>>
+
+trait Module:
+    fn parameters(self) -> List<Tensor<f32>>
+
+impl Module for GPT:
+    fn parameters(self) -> List<Tensor<f32>>:
+        return self.params
+
+fn block(model: GPT, x: Tensor<f32>, k: i64) -> Tensor<f32>:
+    let w = model.params[k]
+    let w2 = model.params[k]
+    return relu((x @ w) + (x @ w2) * 0.0)
+
+fn adamw<M: Module>(model: M, lr: f32):
+    let mut ps = model.parameters()
+    for i in range(len(ps)):
+        let g = ps[i].grad
+        ps[i] = variable(ps[i].data - lr * g)
+
+fn main():
+    let gpt = GPT(params=[
+        variable(randn(8, 8) * 0.1),
+        variable(randn(8, 8) * 0.1),
+        variable(randn(8, 8) * 0.1),
+        variable(randn(8, 8) * 0.1),
+        variable(randn(8, 8) * 0.1),
+        variable(randn(8, 8) * 0.1)
+    ])
+    let x0 = ones(4, 8)
+    for s in range(5):
+        let x1 = block(gpt, x0, 0)
+        let x2 = block(gpt, x1, 1)
+        let x3 = block(gpt, x2, 2)
+        let x4 = block(gpt, x3, 3)
+        let x5 = block(gpt, x4, 4)
+        let x6 = block(gpt, x5, 5)
+        let loss = sum(x6)
+        backward(loss)
+        adamw(gpt, 0.01)
+        println(loss.data)
+"#;
+    run_metal_src(src);
+}

@@ -34,7 +34,7 @@
 // for this class of aliasing).
 
 use std::collections::{HashMap, HashSet};
-use crate::retain_sites::{retain_sites, AliasShape, RetainKind};
+use crate::retain_sites::{retain_sites, AliasShape, RetainKind, RetainTarget};
 use crate::typed_ir::{TypedAssignTarget, TypedExpr, TypedStmt};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -198,7 +198,13 @@ fn plain_alias_source(expr: &TypedExpr) -> Option<String> {
             s.kind == RetainKind::Tensor
                 && matches!(s.shape, AliasShape::Ident | AliasShape::DataField)
         })
-        .map(|s| s.source)
+        .and_then(|s| match s.target {
+            RetainTarget::Source(name) => Some(name),
+            // `Binding`-target sites (Index element reads) are never
+            // demotion candidates: the container's ownership of the element
+            // is real and independent of intraprocedural liveness.
+            RetainTarget::Binding => None,
+        })
 }
 
 /// For every top-level `let name = StructInit{...}` or `let name =
@@ -214,7 +220,9 @@ fn struct_init_field_sources(body: &[TypedStmt]) -> HashMap<String, usize> {
             if site.kind == RetainKind::Tensor
                 && matches!(site.shape, AliasShape::StructField | AliasShape::ArrayElem)
             {
-                out.insert(site.source, i);
+                if let RetainTarget::Source(name) = site.target {
+                    out.insert(name, i);
+                }
             }
         }
     }

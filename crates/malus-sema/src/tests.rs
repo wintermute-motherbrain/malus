@@ -989,6 +989,83 @@ fn main():
     );
 }
 
+/// M34 done-when #0, bug (a): hoist-temp names must be unique per *function*,
+/// not per body. A per-body counter minted `__malus_tmp_0` in both the outer
+/// body and a loop body; the outer last-use scan then saw the inner temp's
+/// uses under the outer temp's name and emitted a stray Drop after the For —
+/// a double release of the final iteration's hoisted value at runtime.
+#[test]
+fn test_ctmm_hoist_temp_names_unique_across_nesting_levels() {
+    let src = r#"
+fn main():
+    let w = variable(randn(4, 4) * 0.1)
+    let mut x = variable(ones(4, 4))
+    for i in range(3):
+        x = relu(x @ w)
+    let loss = sum(x)
+    backward(loss)
+    print(loss)
+"#;
+    let typed = check_src(src).expect("should type-check");
+    let main = typed.fns.iter().find(|f| f.name == "main").unwrap();
+
+    fn collect_temp_lets<'a>(stmts: &'a [TypedStmt], out: &mut Vec<&'a str>) {
+        for s in stmts {
+            match s {
+                TypedStmt::Let { name, .. }
+                    if name.starts_with("__malus_tmp") || name.starts_with("__malus_ret") =>
+                {
+                    out.push(name.as_str())
+                }
+                TypedStmt::If { then_body, else_body, .. } => {
+                    collect_temp_lets(then_body, out);
+                    if let Some(eb) = else_body {
+                        collect_temp_lets(eb, out);
+                    }
+                }
+                TypedStmt::For { body, .. }
+                | TypedStmt::While { body, .. }
+                | TypedStmt::ForIn { body, .. }
+                | TypedStmt::NoGrad { body } => collect_temp_lets(body, out),
+                TypedStmt::Match { arms, .. } => {
+                    for arm in arms {
+                        collect_temp_lets(&arm.body, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut names = Vec::new();
+    collect_temp_lets(&main.body, &mut names);
+    assert!(!names.is_empty(), "expected hoist temps in this program");
+    let mut deduped = names.clone();
+    deduped.sort();
+    deduped.dedup();
+    assert_eq!(
+        deduped.len(),
+        names.len(),
+        "hoist-temp names must be unique within a fn, got: {names:?}"
+    );
+
+    // And the stray-Drop shape specifically: every temp dropped in the outer
+    // body must also be Let-bound in the outer body.
+    let outer_lets: Vec<&str> = main.body.iter().filter_map(|s| match s {
+        TypedStmt::Let { name, .. } if name.starts_with("__malus_") => Some(name.as_str()),
+        _ => None,
+    }).collect();
+    for s in &main.body {
+        if let TypedStmt::Drop { name } = s {
+            if name.starts_with("__malus_") {
+                assert!(
+                    outer_lets.contains(&name.as_str()),
+                    "outer body drops temp {name} it never bound (stray drop); outer lets: {outer_lets:?}"
+                );
+            }
+        }
+    }
+}
+
 // ── Phase 5: 2-D nested tensor literals ──────────────────────────────────────
 
 #[test]
@@ -1699,32 +1776,17 @@ fn main():
     assert_eq!(drop_name, "ps");
 }
 
-/// CAPSTONE DESIGN CONSTRAINT (not an M28 bug, a pre-existing CTMM property
-/// this milestone's nanoGPT rewrite must respect): binding `let x =
-/// model.params[i]` — a plain alias of a grad-tracked tensor read out of a
-/// `List` — gets its OWN drop at `x`'s last use, exactly as if `x` had been
-/// freshly allocated. Since `x` is really an ALIAS of the tensor still owned
-/// by `model.params`, that drop would incorrectly decrement (and, on a
-/// repeated call with the same model, eventually free) the shared tensor out
-/// from under the caller. `forward()` must therefore reference
-/// `model.params[i]` INLINE at each use site (matching the existing,
-/// already-correct V3 pattern of writing `blk.wq` inline rather than binding
-/// `let wq = blk.wq`) — never bind a struct/list tensor read to a persistent
-/// local name. Index-typed scalar constants (`let WQ = 1`) are fine, since
-/// they're plain i64 values with no ownership.
-///
-/// M29 (ADR-0026): this binding's drop is now emitted as a static `Drop`
-/// rather than the pre-M29 `Release` (D6 — the two already lowered to the
-/// identical runtime decrement, so the rename doesn't change the underlying
-/// hazard). The hazard itself is UNCHANGED by M29 and remains open post-M29:
-/// `insert_variable_arc_retains`'s alias-retain protocol (D2/D3) only
-/// recognizes bare-`Ident` and `.data`-`FieldAccess` RHS shapes;
-/// `model.params[0]` is an `Index` expression, a third shape M29's
-/// intraprocedural borrow-inference doesn't classify (see ADR-0026 "Out of
-/// Scope" — proving `ln1_w`'s lifetime nests inside `model`'s needs
-/// interprocedural analysis this milestone doesn't have).
+/// M34 (done-when #0, bug (b)): binding `let x = model.params[i]` used to be
+/// a documented capstone design constraint — the binding's Drop stole the
+/// reference the list owned (no balancing retain existed for the `Index`
+/// shape), so `forward()` had to read `model.params[i]` INLINE at every use
+/// site. `insert_container_read_retains` closes that hazard: the binding gets
+/// its own reference (`Retain{x}` immediately after the `Let`), its Drop
+/// releases exactly that reference, and the list's ownership is untouched.
+/// Binding container-element reads is now sound; the inline-read rule is no
+/// longer load-bearing.
 #[test]
-fn test_list_indexed_tensor_alias_gets_drop_capstone_design_constraint() {
+fn test_list_indexed_tensor_bind_gets_retain_and_drop() {
     let src = r#"
 struct GPT:
     params: List<Tensor<f32>>
@@ -1744,7 +1806,14 @@ fn main():
     let drops = drops_in(&forward.body);
     assert!(
         drops.contains(&"ln1_w"),
-        "expected ln1_w to get its own Drop (documenting the aliasing risk), got: {:?}", drops
+        "expected ln1_w to get its own Drop, got: {:?}", drops
+    );
+    let let_idx = forward.body.iter().position(|s| {
+        matches!(s, TypedStmt::Let { name, .. } if name == "ln1_w")
+    }).expect("Let ln1_w not found");
+    assert!(
+        matches!(forward.body.get(let_idx + 1), Some(TypedStmt::Retain { name }) if name == "ln1_w"),
+        "expected Retain(ln1_w) immediately after its Let; body:\n{:#?}", forward.body
     );
 }
 
@@ -1906,7 +1975,7 @@ fn main():
 // surface, one per `AliasShape`/`RetainKind`, plus the documented `Index`
 // no-retain arm.
 
-use crate::retain_sites::{retain_sites, AliasShape, RetainKind};
+use crate::retain_sites::{retain_sites, AliasShape, RetainKind, RetainTarget};
 use crate::ResolvedTy;
 use malus_syntax::ast::Placement;
 use malus_syntax::Span;
@@ -1938,7 +2007,7 @@ fn test_retain_sites_grad_tracked_tensor_ident_is_a_tensor_site() {
     let expr = ident_expr("a", tensor_ty(), true);
     let sites = retain_sites(&expr);
     assert_eq!(sites.len(), 1);
-    assert_eq!(sites[0].source, "a");
+    assert_eq!(sites[0].target, RetainTarget::Source("a".to_string()));
     assert_eq!(sites[0].shape, AliasShape::Ident);
     assert_eq!(sites[0].kind, RetainKind::Tensor);
 }
@@ -1955,9 +2024,9 @@ fn test_retain_sites_list_ident_is_a_listagg_site_regardless_of_grad_tracked() {
     let expr = ident_expr("ps", list_of_tensor_ty(), false);
     let sites = retain_sites(&expr);
     assert_eq!(sites.len(), 1);
-    assert_eq!(sites[0].source, "ps");
+    assert_eq!(sites[0].target, RetainTarget::Source("ps".to_string()));
     assert_eq!(sites[0].shape, AliasShape::Ident);
-    assert_eq!(sites[0].kind, RetainKind::ListAgg);
+    assert_eq!(sites[0].kind, RetainKind::Agg);
 }
 
 #[test]
@@ -1972,7 +2041,7 @@ fn test_retain_sites_data_field_of_grad_tracked_tensor_is_datafield_site() {
     };
     let sites = retain_sites(&expr);
     assert_eq!(sites.len(), 1);
-    assert_eq!(sites[0].source, "v");
+    assert_eq!(sites[0].target, RetainTarget::Source("v".to_string()));
     assert_eq!(sites[0].shape, AliasShape::DataField);
     assert_eq!(sites[0].kind, RetainKind::Tensor);
 }
@@ -2005,7 +2074,7 @@ fn test_retain_sites_array_literal_only_retains_grad_tracked_ident_elements() {
     };
     let sites = retain_sites(&expr);
     assert_eq!(sites.len(), 1);
-    assert_eq!(sites[0].source, "a");
+    assert_eq!(sites[0].target, RetainTarget::Source("a".to_string()));
     assert_eq!(sites[0].shape, AliasShape::ArrayElem);
     assert_eq!(sites[0].kind, RetainKind::Tensor);
 }
@@ -2025,19 +2094,19 @@ fn test_retain_sites_struct_init_recognizes_tensor_and_list_fields() {
     };
     let sites = retain_sites(&expr);
     assert_eq!(sites.len(), 2);
-    assert!(sites.iter().any(|s| s.source == "w"
+    assert!(sites.iter().any(|s| s.target == RetainTarget::Source("w".to_string())
         && s.shape == AliasShape::StructField
         && s.kind == RetainKind::Tensor));
-    assert!(sites.iter().any(|s| s.source == "ps"
+    assert!(sites.iter().any(|s| s.target == RetainTarget::Source("ps".to_string())
         && s.shape == AliasShape::StructField
-        && s.kind == RetainKind::ListAgg));
+        && s.kind == RetainKind::Agg));
 }
 
 #[test]
-fn test_retain_sites_index_expr_is_never_a_site() {
-    // `model.params[0]` — the documented open hazard (ADR-0026 "Out of
-    // Scope"): named explicitly in `AliasShape::Index` so the gap is visible
-    // in retain_sites.rs itself, but it never yields a site either way.
+fn test_retain_sites_index_expr_is_a_binding_target_site() {
+    // `model.params[0]` — M34 (done-when #0, bug (b)): a bound container-
+    // element read gets its own reference, bumped on the NEW binding (the
+    // container owns the element; there is no source name to retain).
     let base = ident_expr("params", list_of_tensor_ty(), false);
     let index = TypedExpr {
         kind: TypedExprKind::Lit(malus_syntax::ast::Lit::Int(0)),
@@ -2053,5 +2122,9 @@ fn test_retain_sites_index_expr_is_never_a_site() {
         span: dummy_span(),
         grad_tracked: true,
     };
-    assert!(retain_sites(&expr).is_empty());
+    let sites = retain_sites(&expr);
+    assert_eq!(sites.len(), 1);
+    assert_eq!(sites[0].target, RetainTarget::Binding);
+    assert_eq!(sites[0].shape, AliasShape::Index);
+    assert_eq!(sites[0].kind, RetainKind::Tensor);
 }

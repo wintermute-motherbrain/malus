@@ -111,6 +111,13 @@ fn run_script(path: &str, bench: bool, static_barriers: bool) {
         }
     };
 
+    if std::env::var("MALUS_DUMP_IR").is_ok() {
+        for f in &typed.fns {
+            eprintln!("=== fn {} ===\n{:#?}", f.name, f.body);
+        }
+        std::process::exit(0);
+    }
+
     #[cfg(target_os = "macos")]
     {
         let (registry, kernel_ids) = match malus_codegen_gpu::compile_kernels(&typed) {

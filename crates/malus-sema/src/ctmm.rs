@@ -61,7 +61,16 @@ pub fn annotate_fns(program: &mut TypedProgram) {
         if !param_names.is_empty() {
             insert_param_return_retains(&mut f.body, &param_names);
         }
-        annotate_body(&mut f.body);
+        // One hoist-temp counter per *function*, threaded through every nested
+        // scope. A per-body counter would mint the same `__malus_tmp_0` in the
+        // outer body and inside a loop; the outer last-use scan (which recurses
+        // into control-flow nodes to treat them as opaque use sites) then sees
+        // the inner temp's uses under the outer temp's name and emits a stray
+        // Drop after the loop — codegen's flat per-fn variable map resolves it
+        // to the *inner* temp, double-releasing the final iteration's value
+        // (the M32-addendum loop-carried-reassignment over-release).
+        let mut tmp_counter = 0u32;
+        annotate_body(&mut f.body, &mut tmp_counter);
         // M29 (ADR-0026, D3): remove provably-redundant Retain+Drop/Release
         // pairs left by the (still-correct, still-conservative) machinery
         // above — a post-process cleanup, not a replacement analysis. See
@@ -131,28 +140,35 @@ fn insert_param_return_retains(body: &mut Vec<TypedStmt>, param_names: &HashSet<
 
 // ── Core analysis ─────────────────────────────────────────────────────────────
 
-fn annotate_body(body: &mut Vec<TypedStmt>) {
-    annotate_body_seeded(body, &[]);
+fn annotate_body(body: &mut Vec<TypedStmt>, tmp_counter: &mut u32) {
+    annotate_body_seeded(body, &[], tmp_counter);
 }
 
 /// Core CTMM pass.  `seed` carries tensor payload bindings from a surrounding
 /// match arm so they are treated as arm-scoped locals (retain-on-bind, M12).
-fn annotate_body_seeded(body: &mut Vec<TypedStmt>, seed: &[(String, ResolvedTy)]) {
+/// `tmp_counter` is function-unique (see `annotate_fns`) so hoist temps never
+/// collide across nesting levels.
+fn annotate_body_seeded(
+    body: &mut Vec<TypedStmt>,
+    seed: &[(String, ResolvedTy)],
+    tmp_counter: &mut u32,
+) {
     // Steps 1-2: hoist GPU subexpressions and GPU-producing returns in the outer
     // body.  Control-flow nodes are passed through unchanged — their inner bodies
     // will be hoisted in step 3 when `annotate_body` recurses into them.
-    hoist_gpu_subexprs(body);
+    hoist_gpu_subexprs(body, tmp_counter);
+    insert_container_read_retains(body, tmp_counter);
     insert_variable_arc_retains(body);
     insert_list_retains(body);
-    hoist_gpu_producing_returns(body);
+    hoist_gpu_producing_returns(body, tmp_counter);
 
     // Step 3: recurse into each inner scope *before* running the outer passes.
     // This gives inner bindings their own `Drop` and `GpuBarrier` nodes, and
     // means the outer passes can treat `If`/`For`/`While` as opaque use sites.
-    recurse_into_inner_scopes(body);
+    recurse_into_inner_scopes(body, tmp_counter);
 
     // Step 3b (M12): retain tensor match-arm payload bindings + recurse into arms.
-    annotate_match_arms(body);
+    annotate_match_arms(body, tmp_counter);
 
     // Steps 4-9: outer-scope analysis.
     let mut locals = collect_local_bindings(body);
@@ -201,7 +217,7 @@ fn static_barriers_enabled() -> bool {
 
 /// Step 3: call `annotate_body` on each inner scope so inner bindings get
 /// their own `Drop`/`GpuBarrier` nodes.
-fn recurse_into_inner_scopes(body: &mut Vec<TypedStmt>) {
+fn recurse_into_inner_scopes(body: &mut Vec<TypedStmt>, tmp_counter: &mut u32) {
     for stmt in body.iter_mut() {
         match stmt {
             TypedStmt::If {
@@ -209,16 +225,16 @@ fn recurse_into_inner_scopes(body: &mut Vec<TypedStmt>) {
                 else_body,
                 ..
             } => {
-                annotate_body(then_body);
+                annotate_body(then_body, tmp_counter);
                 if let Some(eb) = else_body {
-                    annotate_body(eb);
+                    annotate_body(eb, tmp_counter);
                 }
             }
             TypedStmt::For { body, .. }
             | TypedStmt::While { body, .. }
             | TypedStmt::ForIn { body, .. }
             | TypedStmt::NoGrad { body } => {
-                annotate_body(body);
+                annotate_body(body, tmp_counter);
             }
             _ => {}
         }
@@ -234,7 +250,7 @@ fn recurse_into_inner_scopes(body: &mut Vec<TypedStmt>) {
 ///
 /// Nested matches inside an arm are handled automatically because
 /// `annotate_body_seeded` calls `annotate_match_arms` again on the arm body.
-fn annotate_match_arms(body: &mut Vec<TypedStmt>) {
+fn annotate_match_arms(body: &mut Vec<TypedStmt>, tmp_counter: &mut u32) {
     for stmt in body.iter_mut() {
         if let TypedStmt::Match { arms, .. } = stmt {
             for arm in arms.iter_mut() {
@@ -248,7 +264,7 @@ fn annotate_match_arms(body: &mut Vec<TypedStmt>) {
                 for (name, _) in tensor_binds.iter().rev() {
                     arm.body.insert(0, TypedStmt::Retain { name: name.clone() });
                 }
-                annotate_body_seeded(&mut arm.body, &tensor_binds);
+                annotate_body_seeded(&mut arm.body, &tensor_binds, tmp_counter);
             }
         }
     }
@@ -282,20 +298,19 @@ fn is_gpu_producing(expr: &TypedExpr) -> bool {
 
 // ── Step 1: GPU subexpression hoisting ───────────────────────────────────────
 
-fn hoist_gpu_subexprs(body: &mut Vec<TypedStmt>) {
-    let mut counter = 0u32;
+fn hoist_gpu_subexprs(body: &mut Vec<TypedStmt>, counter: &mut u32) {
     let mut result: Vec<TypedStmt> = Vec::with_capacity(body.len());
     for stmt in body.drain(..) {
         match stmt {
             TypedStmt::Let { name, expr } => {
                 let mut hoisted = Vec::new();
-                let expr = hoist_gpu_in_expr(expr, &mut hoisted, &mut counter);
+                let expr = hoist_gpu_in_expr(expr, &mut hoisted, counter);
                 result.extend(hoisted);
                 result.push(TypedStmt::Let { name, expr });
             }
             TypedStmt::Assign { target, expr } => {
                 let mut hoisted = Vec::new();
-                let expr = hoist_gpu_in_expr(expr, &mut hoisted, &mut counter);
+                let expr = hoist_gpu_in_expr(expr, &mut hoisted, counter);
                 // D6 guard: if the RHS is still GPU-producing and yields a tensor or
                 // variable, hoist it into a temp so the old slot can be safely released
                 // before the Assign writes the new value. For Index/Field targets this
@@ -304,7 +319,7 @@ fn hoist_gpu_subexprs(body: &mut Vec<TypedStmt>) {
                 let needs_hoist = is_gpu_producing(&expr) && expr.ty.is_tensor();
                 let expr = if needs_hoist {
                     let tmp_name = format!("__malus_tmp_{}", counter);
-                    counter += 1;
+                    *counter += 1;
                     let ty = expr.ty.clone();
                     let placement = expr.placement;
                     let span = expr.span;
@@ -328,13 +343,13 @@ fn hoist_gpu_subexprs(body: &mut Vec<TypedStmt>) {
             }
             TypedStmt::Return { expr } => {
                 let mut hoisted = Vec::new();
-                let expr = hoist_gpu_in_expr(expr, &mut hoisted, &mut counter);
+                let expr = hoist_gpu_in_expr(expr, &mut hoisted, counter);
                 result.extend(hoisted);
                 result.push(TypedStmt::Return { expr });
             }
             TypedStmt::Expr(expr) => {
                 let mut hoisted = Vec::new();
-                let expr = hoist_gpu_in_expr(expr, &mut hoisted, &mut counter);
+                let expr = hoist_gpu_in_expr(expr, &mut hoisted, counter);
                 result.extend(hoisted);
                 result.push(TypedStmt::Expr(expr));
             }
@@ -557,9 +572,8 @@ fn hoist_args(
 
 // ── Step 2: GPU-producing return hoisting ─────────────────────────────────────
 
-fn hoist_gpu_producing_returns(body: &mut Vec<TypedStmt>) {
+fn hoist_gpu_producing_returns(body: &mut Vec<TypedStmt>, counter: &mut u32) {
     let mut i = 0;
-    let mut counter = 0u32;
     while i < body.len() {
         if let TypedStmt::Return { expr } = &body[i] {
             if is_gpu_producing(expr) && expr.ty.is_tensor() {
@@ -569,7 +583,7 @@ fn hoist_gpu_producing_returns(body: &mut Vec<TypedStmt>) {
                     unreachable!()
                 };
                 let name = format!("__malus_ret_{}", counter);
-                counter += 1;
+                *counter += 1;
                 let ret_ty = expr.ty.clone();
                 let span = expr.span;
                 let grad_tracked = expr.grad_tracked;
@@ -1510,7 +1524,10 @@ fn tensor_retain_names(expr: &TypedExpr) -> Vec<String> {
     crate::retain_sites::retain_sites(expr)
         .into_iter()
         .filter(|s| s.kind == crate::retain_sites::RetainKind::Tensor)
-        .map(|s| s.source)
+        .filter_map(|s| match s.target {
+            crate::retain_sites::RetainTarget::Source(name) => Some(name),
+            crate::retain_sites::RetainTarget::Binding => None,
+        })
         .collect()
 }
 
@@ -1568,9 +1585,105 @@ fn insert_list_retains(body: &mut Vec<TypedStmt>) {
 fn list_retain_names(expr: &TypedExpr) -> Vec<String> {
     crate::retain_sites::retain_sites(expr)
         .into_iter()
-        .filter(|s| s.kind == crate::retain_sites::RetainKind::ListAgg)
-        .map(|s| s.source)
+        .filter(|s| s.kind == crate::retain_sites::RetainKind::Agg)
+        .filter_map(|s| match s.target {
+            crate::retain_sites::RetainTarget::Source(name) => Some(name),
+            crate::retain_sites::RetainTarget::Binding => None,
+        })
         .collect()
+}
+
+/// M34 (done-when #0, bug (b)): a container-element read (`base[i]` on a
+/// `List` or `Array`) that gets BOUND to a name steals the container's
+/// reference — CTMM emits a static Drop (or RC Release) for the new binding,
+/// but the handle it loads is the one the container itself owns and will
+/// independently release when the container is dropped. Every such bind is
+/// given its own reference, bumped on the *new binding* right after the bind
+/// (there is no source name to retain before it — `retain_sites`'s
+/// `RetainTarget::Binding`).
+///
+/// Under the tape the theft is masked one-for-one by the tape's saved-operand
+/// retains until `backward()` auto-clears the tape, at which point the
+/// container's element is freed out from under it — the M32-addendum
+/// "loss.data reads a freed buffer" corruption. Untaped, it is a direct
+/// over-release (deterministic panic).
+///
+/// Handles the three statement shapes that bind or move an element read:
+///   - `let w = base[i]`            → Retain/RetainAgg{w} inserted after
+///   - `x = base[i]` (Ident target) → Retain/RetainAgg{x} inserted after
+///   - `return base[i]` and `a[j] = base[i]` (slot targets) → the read is
+///     hoisted to a fresh `__malus_tmp_N` Let (function-unique counter) with
+///     its retain, and the original statement consumes the temp.
+///
+/// Transient inline reads (operands, call args) are untouched — they borrow
+/// the container's reference for the duration of the enclosing statement,
+/// exactly the `model.params[IDX]` inline pattern the capstone uses.
+fn insert_container_read_retains(body: &mut Vec<TypedStmt>, tmp_counter: &mut u32) {
+    use crate::retain_sites::{retain_sites, RetainKind, RetainTarget};
+
+    fn binding_retain_kind(expr: &TypedExpr) -> Option<RetainKind> {
+        retain_sites(expr)
+            .into_iter()
+            .find(|s| s.target == RetainTarget::Binding)
+            .map(|s| s.kind)
+    }
+
+    fn retain_stmt(kind: RetainKind, name: String) -> TypedStmt {
+        match kind {
+            RetainKind::Tensor => TypedStmt::Retain { name },
+            RetainKind::Agg => TypedStmt::RetainAgg { name },
+        }
+    }
+
+    let mut i = 0;
+    while i < body.len() {
+        match &body[i] {
+            TypedStmt::Let { name, expr } => {
+                if let Some(kind) = binding_retain_kind(expr) {
+                    let name = name.clone();
+                    body.insert(i + 1, retain_stmt(kind, name));
+                    i += 1;
+                }
+            }
+            TypedStmt::Assign { target: crate::typed_ir::TypedAssignTarget::Ident(name), expr } => {
+                if let Some(kind) = binding_retain_kind(expr) {
+                    let name = name.clone();
+                    body.insert(i + 1, retain_stmt(kind, name));
+                    i += 1;
+                }
+            }
+            TypedStmt::Assign { expr, .. } | TypedStmt::Return { expr } => {
+                if let Some(kind) = binding_retain_kind(expr) {
+                    let tmp_name = format!("__malus_tmp_{}", tmp_counter);
+                    *tmp_counter += 1;
+                    let (stmt, expr_owned) = match body.remove(i) {
+                        TypedStmt::Assign { target, expr } => {
+                            (Some(target), expr)
+                        }
+                        TypedStmt::Return { expr } => (None, expr),
+                        _ => unreachable!(),
+                    };
+                    let ident = TypedExpr {
+                        kind: TypedExprKind::Ident(tmp_name.clone()),
+                        ty: expr_owned.ty.clone(),
+                        placement: expr_owned.placement,
+                        span: expr_owned.span,
+                        grad_tracked: expr_owned.grad_tracked,
+                    };
+                    body.insert(i, TypedStmt::Let { name: tmp_name.clone(), expr: expr_owned });
+                    body.insert(i + 1, retain_stmt(kind, tmp_name));
+                    let consumer = match stmt {
+                        Some(target) => TypedStmt::Assign { target, expr: ident },
+                        None => TypedStmt::Return { expr: ident },
+                    };
+                    body.insert(i + 2, consumer);
+                    i += 2;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
 }
 
 fn collect_idents_in_expr(expr: &crate::typed_ir::TypedExpr, out: &mut HashSet<String>) {

@@ -30,13 +30,10 @@ fn forward(model: GPT, toks: Tensor<i32>, B: i64, T: i64, C: i64) -> Tensor<f32>
     let WPE = 9
     let LN_F = 10
     let LM_HEAD = 11
-    # NOTE: every `model.params[IDX]` below is read inline, never bound to a
-    # persistent `let` name. Binding one (`let wq = model.params[WQ]`) would
-    # make CTMM treat `wq` as an owned local and RC-release it at its last use
-    # inside this call — decrementing (and, on a later `forward()` call with
-    # the same model, potentially freeing) the tensor `model.params` itself
-    # still owns. Inline reads are consumed transiently as operands and are
-    # never tracked as bindings, exactly like the pre-M28 `blk.wq` pattern.
+    # NOTE: every `model.params[IDX]` below is read inline. Binding one
+    # (`let wq = model.params[WQ]`) is SOUND since M34 (retain-on-bind for
+    # container-element reads, ADR-0040) — the inline style is kept here only
+    # because it avoids a retain/release pair per bind in the hot path.
     let mut pos_buf = buffer_i32(B * T)
     for b in range(B):
         for t in range(T):
